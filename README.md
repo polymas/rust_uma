@@ -25,4 +25,37 @@
 - 同一批数据只编码、压缩一次，供所有订阅客户端复用
 - 不启用 `permessage-deflate`
 
-当前仓库为项目骨架；服务实现将在后续协议与功能边界确认后加入。
+服务已包含 Polygon JSON-RPC 订阅与断线补偿、UMA ABI 解码、Gamma
+富化目录、内存事件/帧环、Protobuf + Zstd WSS 以及极简 HTTP 查询接口。
+
+## 快速启动
+
+需要 Rust 1.88 或更高版本，以及同一 Polygon 服务商的 WSS 地址；HTTP RPC
+未配置时会从 WSS 地址自动推导。
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少填写 POLYGON_WSS_URL
+set -a
+source .env
+set +a
+cargo run --release
+```
+
+默认监听 `127.0.0.1:8011`。首次启动默认先建立实时订阅，再从当前区块开始；
+如需历史补拉，设置 `START_BLOCK`。重启会从本地 checkpoint 补齐断线区间。
+
+## 查询与订阅
+
+```text
+GET /healthz
+GET /metrics
+GET /llms.txt
+GET /uma/v1/events?after_sequence=0&limit=100&event_type=propose
+GET /uma/v1/events/:transaction_hash/:log_index
+GET /uma/v1/markets/:market_id
+GET /uma/v1/ws?after_sequence=0
+```
+
+WSS 客户端必须声明子协议 `uma.pb.v1`。消息头、压缩阈值、重放语义和
+下游约束见 `internal/api/llms.txt`，Protobuf schema 见 `proto/uma.proto`。

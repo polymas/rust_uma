@@ -1,0 +1,475 @@
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
+
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{
+        Path, Query, State, WebSocketUpgrade,
+        ws::{CloseFrame, Message, WebSocket},
+    },
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+
+use crate::{
+    config::Config,
+    decode::decode_fixed,
+    enrichment::Catalog,
+    hub::{EventHub, FrameHub, FrameReadError},
+    model::{EventKind, EventRecord, MarketEnrichment, hex_prefixed, uint256_decimal},
+    stats::Stats,
+};
+
+const SUBPROTOCOL: &str = "uma.pb.v1";
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub events: Arc<EventHub>,
+    pub frames: Arc<FrameHub>,
+    pub catalog: Arc<Catalog>,
+    pub stats: Arc<Stats>,
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
+        .route("/llms.txt", get(llms))
+        .route("/uma/v1/events", get(events))
+        .route(
+            "/uma/v1/events/{transaction_hash}/{log_index}",
+            get(event_lookup),
+        )
+        .route("/uma/v1/markets/{market_id}", get(market_lookup))
+        .route("/uma/v1/ws", get(websocket))
+        .with_state(state)
+}
+
+pub async fn serve(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), std::io::Error> {
+    let listener = tokio::net::TcpListener::bind(state.config.api_addr).await?;
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    rpc_connected: bool,
+    rpc_reconnects_total: u64,
+    rpc_logs_received_total: u64,
+    events_decoded_total: u64,
+    decode_errors_total: u64,
+    duplicates_total: u64,
+    enrichment_hits_total: u64,
+    enrichment_misses_total: u64,
+    catalog_markets: u64,
+    last_upstream_received_at_us: u64,
+    last_broadcast_at_us: u64,
+    subscribers: u64,
+    slow_clients_dropped_total: u64,
+    storage_queue_dropped_total: u64,
+    latest_block: u64,
+    event_ring_oldest_sequence: u64,
+    event_ring_latest_sequence: u64,
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let rpc_connected = state.stats.rpc_connected.load(Ordering::Relaxed);
+    let (oldest, latest) = state.events.bounds();
+    Json(HealthResponse {
+        status: if rpc_connected { "ok" } else { "degraded" },
+        rpc_connected,
+        rpc_reconnects_total: state.stats.rpc_reconnects.load(Ordering::Relaxed),
+        rpc_logs_received_total: state.stats.rpc_logs_received.load(Ordering::Relaxed),
+        events_decoded_total: state.stats.events_decoded.load(Ordering::Relaxed),
+        decode_errors_total: state.stats.decode_errors.load(Ordering::Relaxed),
+        duplicates_total: state.stats.duplicates.load(Ordering::Relaxed),
+        enrichment_hits_total: state.stats.enrichment_hits.load(Ordering::Relaxed),
+        enrichment_misses_total: state.stats.enrichment_misses.load(Ordering::Relaxed),
+        catalog_markets: state.stats.catalog_markets.load(Ordering::Relaxed),
+        last_upstream_received_at_us: state
+            .stats
+            .last_upstream_received_at_us
+            .load(Ordering::Relaxed),
+        last_broadcast_at_us: state.stats.last_broadcast_at_us.load(Ordering::Relaxed),
+        subscribers: state.stats.subscribers.load(Ordering::Relaxed),
+        slow_clients_dropped_total: state.stats.slow_clients_dropped.load(Ordering::Relaxed),
+        storage_queue_dropped_total: state.stats.storage_queue_dropped.load(Ordering::Relaxed),
+        latest_block: state.stats.latest_block.load(Ordering::Relaxed),
+        event_ring_oldest_sequence: oldest,
+        event_ring_latest_sequence: latest,
+    })
+}
+
+async fn metrics(State(state): State<AppState>) -> Response {
+    let (oldest, latest) = state.events.bounds();
+    let values = [
+        (
+            "rust_uma_rpc_connected",
+            state.stats.rpc_connected.load(Ordering::Relaxed) as u64,
+        ),
+        (
+            "rust_uma_rpc_reconnects_total",
+            state.stats.rpc_reconnects.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_rpc_logs_received_total",
+            state.stats.rpc_logs_received.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_events_decoded_total",
+            state.stats.events_decoded.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_decode_errors_total",
+            state.stats.decode_errors.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_duplicates_total",
+            state.stats.duplicates.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_enrichment_hits_total",
+            state.stats.enrichment_hits.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_enrichment_misses_total",
+            state.stats.enrichment_misses.load(Ordering::Relaxed),
+        ),
+        ("rust_uma_catalog_markets", state.catalog.len() as u64),
+        (
+            "rust_uma_subscribers",
+            state.stats.subscribers.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_slow_clients_dropped_total",
+            state.stats.slow_clients_dropped.load(Ordering::Relaxed),
+        ),
+        ("rust_uma_event_ring_oldest_sequence", oldest),
+        ("rust_uma_event_ring_latest_sequence", latest),
+    ];
+    let body = values
+        .into_iter()
+        .map(|(name, value)| format!("{name} {value}\n"))
+        .collect::<String>();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .expect("metrics response")
+}
+
+async fn llms() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(include_str!("../internal/api/llms.txt")))
+        .expect("llms response")
+}
+
+#[derive(Deserialize)]
+struct EventQuery {
+    #[serde(default)]
+    after_sequence: u64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    event_type: Option<String>,
+}
+
+fn default_limit() -> usize {
+    100
+}
+
+#[derive(Serialize)]
+struct EventListResponse {
+    data: Vec<EventDto>,
+    count: usize,
+    oldest_sequence: u64,
+    latest_sequence: u64,
+    next_sequence: Option<u64>,
+}
+
+async fn events(
+    State(state): State<AppState>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<EventListResponse>, ApiError> {
+    let kind = parse_kind(query.event_type.as_deref())?;
+    let limit = query.limit.clamp(1, 500);
+    let records = state.events.query(query.after_sequence, limit, kind);
+    let data = records
+        .iter()
+        .map(|event| event_dto(event, &state.catalog))
+        .collect::<Vec<_>>();
+    let next_sequence = records.last().map(|event| event.sequence);
+    let (oldest_sequence, latest_sequence) = state.events.bounds();
+    Ok(Json(EventListResponse {
+        count: data.len(),
+        data,
+        oldest_sequence,
+        latest_sequence,
+        next_sequence,
+    }))
+}
+
+async fn event_lookup(
+    State(state): State<AppState>,
+    Path((transaction_hash, log_index)): Path<(String, u32)>,
+) -> Result<Json<EventDto>, ApiError> {
+    let hash = decode_fixed::<32>(&transaction_hash, "transaction_hash")
+        .map_err(|_| ApiError::bad_request("invalid transaction hash"))?;
+    let event = state
+        .events
+        .find(&hash, log_index)
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(event_dto(&event, &state.catalog)))
+}
+
+async fn market_lookup(
+    State(state): State<AppState>,
+    Path(market_id): Path<u64>,
+) -> Result<Json<MarketDto>, ApiError> {
+    let market = state
+        .catalog
+        .get(market_id)
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(market_dto(&market)))
+}
+
+#[derive(Serialize)]
+struct EventDto {
+    sequence: u64,
+    event_type: &'static str,
+    block_number: u64,
+    block_hash: String,
+    transaction_hash: String,
+    log_index: u32,
+    market_id: u64,
+    condition_id: Option<String>,
+    token_ids: Vec<String>,
+    tag_ids: Vec<u32>,
+    price_raw: String,
+    requester: String,
+    proposer: String,
+    disputer: Option<String>,
+    upstream_received_at_us: u64,
+    removed: bool,
+    enrichment_status: &'static str,
+}
+
+#[derive(Serialize)]
+struct MarketDto {
+    market_id: u64,
+    condition_id: String,
+    token_ids: Vec<String>,
+    tag_ids: Vec<u32>,
+}
+
+fn event_dto(event: &EventRecord, catalog: &Catalog) -> EventDto {
+    let enrichment = catalog
+        .get(event.event.market_id)
+        .or_else(|| event.enrichment.clone());
+    EventDto {
+        sequence: event.sequence,
+        event_type: event.event.kind.as_str(),
+        block_number: event.event.block_number,
+        block_hash: hex_prefixed(&event.event.block_hash),
+        transaction_hash: hex_prefixed(&event.event.transaction_hash),
+        log_index: event.event.log_index,
+        market_id: event.event.market_id,
+        condition_id: enrichment
+            .as_ref()
+            .map(|value| hex_prefixed(&value.condition_id)),
+        token_ids: enrichment
+            .as_ref()
+            .map(|value| value.token_ids.iter().map(uint256_decimal).collect())
+            .unwrap_or_default(),
+        tag_ids: enrichment
+            .as_ref()
+            .map(|value| value.tag_ids.clone())
+            .unwrap_or_default(),
+        price_raw: hex_prefixed(&event.event.price_raw),
+        requester: hex_prefixed(&event.event.requester),
+        proposer: hex_prefixed(&event.event.proposer),
+        disputer: event
+            .event
+            .disputer
+            .as_ref()
+            .map(|value| hex_prefixed(value)),
+        upstream_received_at_us: event.event.upstream_received_at_us,
+        removed: event.event.removed,
+        enrichment_status: if enrichment.is_some() { "hit" } else { "miss" },
+    }
+}
+
+fn market_dto(market: &MarketEnrichment) -> MarketDto {
+    MarketDto {
+        market_id: market.market_id,
+        condition_id: hex_prefixed(&market.condition_id),
+        token_ids: market.token_ids.iter().map(uint256_decimal).collect(),
+        tag_ids: market.tag_ids.clone(),
+    }
+}
+
+fn parse_kind(value: Option<&str>) -> Result<Option<EventKind>, ApiError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some("propose") => Ok(Some(EventKind::Propose)),
+        Some("dispute") => Ok(Some(EventKind::Dispute)),
+        Some(_) => Err(ApiError::bad_request(
+            "event_type must be propose or dispute",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct WsQuery {
+    after_sequence: Option<u64>,
+}
+
+async fn websocket(
+    State(state): State<AppState>,
+    Query(query): Query<WsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let offered = headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|item| item.trim() == SUBPROTOCOL));
+    if !offered {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Sec-WebSocket-Protocol: uma.pb.v1 is required",
+        )
+            .into_response();
+    }
+    ws.protocols([SUBPROTOCOL])
+        .on_upgrade(move |socket| websocket_session(socket, state, query.after_sequence))
+}
+
+async fn websocket_session(mut socket: WebSocket, state: AppState, requested_after: Option<u64>) {
+    state.stats.subscribers.fetch_add(1, Ordering::Relaxed);
+    let _guard = SubscriberGuard(state.stats.clone());
+    let mut notifications = state.frames.subscribe();
+    let mut after = requested_after.unwrap_or_else(|| state.frames.latest_sequence());
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        match send_available(&mut socket, &state, &mut after).await {
+            Ok(()) => {}
+            Err(FrameReadError::Lagged) => {
+                state
+                    .stats
+                    .slow_clients_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: 1013,
+                        reason: "cursor older than frame ring".into(),
+                    })))
+                    .await;
+                break;
+            }
+        }
+        tokio::select! {
+            changed = notifications.changed() => if changed.is_err() { break; },
+            _ = heartbeat.tick() => {
+                if timed_send(&mut socket, Message::Ping(Vec::new().into()), state.config.ws_write_timeout).await.is_err() {
+                    break;
+                }
+            }
+            message = socket.recv() => match message {
+                Some(Ok(Message::Ping(payload))) => {
+                    if timed_send(&mut socket, Message::Pong(payload), state.config.ws_write_timeout).await.is_err() { break; }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn send_available(
+    socket: &mut WebSocket,
+    state: &AppState,
+    after: &mut u64,
+) -> Result<(), FrameReadError> {
+    for frame in state.frames.after(*after)? {
+        if timed_send(
+            socket,
+            Message::Binary(frame.bytes.clone()),
+            state.config.ws_write_timeout,
+        )
+        .await
+        .is_err()
+        {
+            return Err(FrameReadError::Lagged);
+        }
+        *after = (*after).max(frame.last_sequence);
+    }
+    Ok(())
+}
+
+async fn timed_send(socket: &mut WebSocket, message: Message, timeout: Duration) -> Result<(), ()> {
+    tokio::time::timeout(timeout, socket.send(message))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+struct SubscriberGuard(Arc<Stats>);
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.0.subscribers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ApiError {
+    status: StatusCode,
+    message: &'static str,
+}
+
+impl ApiError {
+    fn bad_request(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: "not found",
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({"error": self.message})),
+        )
+            .into_response()
+    }
+}

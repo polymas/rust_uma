@@ -26,6 +26,9 @@ message UmaEvent {
   bytes proposer = 12;
   bytes disputer = 13;
   uint64 upstream_received_at_us = 14;
+  bytes block_hash = 15;
+  bool removed = 16;
+  EnrichmentStatus enrichment_status = 17;
 }
 
 enum EventType {
@@ -34,3 +37,8 @@ enum EventType {
   EVENT_TYPE_DISPUTE = 2;
 }
 
+enum EnrichmentStatus {
+  ENRICHMENT_STATUS_UNSPECIFIED = 0;
+  ENRICHMENT_STATUS_HIT = 1;
+  ENRICHMENT_STATUS_MISS = 2;
+}

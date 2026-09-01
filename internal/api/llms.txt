@@ -1,0 +1,118 @@
+# rust_uma API contract
+
+> Status: initial implementation contract. The service has not been deployed.
+
+## Scope
+
+`rust_uma` is a minimal Polygon UMA signal service. Its realtime hot path only:
+
+1. subscribes to `ProposePrice` and `DisputePrice` logs;
+2. validates the emitting contract and decodes the ABI payload;
+3. joins a memory-resident Polymarket identity catalog;
+4. publishes one pre-encoded binary batch to all WebSocket clients;
+5. appends replayable local state asynchronously.
+
+Gamma HTTP requests, catalog snapshots, filesystem I/O, JSON formatting and
+historical backfill never execute inline in the live WebSocket reader.
+
+## Enrichment contract
+
+The immutable/minimally changing enrichment projection is:
+
+- `market_id`: unsigned numeric Polymarket market ID;
+- `condition_id`: exactly 32 bytes;
+- `token_ids`: ordered list of 32-byte unsigned token identifiers;
+- `tag_ids`: sorted unique union of market tags and all attached event tags.
+
+Tag IDs are official Polymarket numeric IDs. Labels and slugs are not duplicated
+in each market record. `outcomes`, `outcome_prices` and `tick_size` are not
+stored or published. Dynamic CLOB state is outside this service.
+
+## WebSocket
+
+Endpoint:
+
+```text
+GET /uma/v1/ws?after_sequence=<u64>
+Sec-WebSocket-Protocol: uma.pb.v1
+```
+
+Every WebSocket data message is a BinaryMessage with this 12-byte header:
+
+```text
+offset  size  field
+0       4     ASCII "UMA1"
+4       1     flags; bit 0 means Zstd
+5       1     schema version (1)
+6       2     reserved, zero
+8       4     uncompressed protobuf size, big endian
+12      ...   protobuf UmaBatch payload, optionally Zstd level 1
+```
+
+The Protobuf schema is `proto/uma.proto`. Payloads below 4096 bytes are not
+compressed. Larger payloads use Zstd level 1. A batch contains at most 64
+events or 32 KiB before compression. These values are configurable.
+
+Frames are delivered at least once. A reconnect whose `after_sequence` falls
+inside a previously encoded batch may receive earlier events from that batch;
+clients must deduplicate by `sequence` or `(transaction_hash, log_index)`.
+If the requested cursor is older than the in-memory frame ring, the connection
+is closed and the client must use the HTTP catch-up endpoint.
+
+## HTTP query API
+
+```text
+GET /healthz
+GET /metrics
+GET /llms.txt
+GET /uma/v1/events?after_sequence=<u64>&limit=<1..500>&event_type=propose|dispute
+GET /uma/v1/events/:transaction_hash/:log_index
+GET /uma/v1/markets/:market_id
+```
+
+Event HTTP responses are JSON and join the latest catalog snapshot at read
+time. The WSS event records expose whether enrichment was a hit when the event
+was first broadcast.
+
+## Defaults and operational semantics
+
+- API bind: `127.0.0.1:8011`.
+- Default emitter allowlist: Polygon Optimistic Oracle
+  `0xCB1822859cEF82Cd2Eb4E6276C7916e692995130`.
+- First start without `START_BLOCK`: subscribe first, set the checkpoint to the
+  current head, and continue from live data without scanning chain history.
+- Restart: subscribe first, then backfill `(checkpoint, subscribed_head]` over
+  HTTP RPC while buffering live logs; duplicates are removed by tx hash/log.
+- Event and frame rings are bounded. Slow clients never block ingestion.
+- A catalog miss is broadcast immediately with empty enrichment and
+  `ENRICHMENT_STATUS_MISS`; an exact Gamma repair runs asynchronously.
+- Checkpoint lag is safe: replay may duplicate events but cannot skip events.
+- Removed/reorged logs are retained with `removed=true`.
+
+## Downstream requirements
+
+- Validate the fixed header, schema version, advertised uncompressed size and
+  a configured maximum decompressed size before allocating.
+- Treat 32-byte identifiers and 20-byte addresses as opaque bytes.
+- Treat `price_raw` as signed two's-complement `int256`.
+- Preserve token order but do not infer Yes/No meaning; outcomes are absent by
+  contract.
+- Deduplicate at least once delivery and reconnect with exponential backoff.
+
+## Health and verification metrics
+
+- `rpc_connected`
+- `rpc_reconnects_total`
+- `rpc_logs_received_total`
+- `events_decoded_total`
+- `decode_errors_total`
+- `duplicates_total`
+- `enrichment_hits_total`
+- `enrichment_misses_total`
+- `catalog_markets`
+- `last_upstream_received_at_us`
+- `last_broadcast_at_us`
+- `subscribers`
+- `slow_clients_dropped_total`
+- `event_ring_oldest_sequence` / `event_ring_latest_sequence`
+
