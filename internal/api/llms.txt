@@ -1,65 +1,64 @@
-# rust_uma API contract
+# rust_uma API 契约
 
-> Status: initial implementation contract. The service has not been deployed.
+> 状态：初始实现契约。服务尚未部署。
 
-## Scope
+## 范围
 
-`rust_uma` is a minimal Polygon UMA signal service. Its realtime hot path only:
+`rust_uma` 是一个极简的 Polygon UMA 信号服务。其实时热路径仅执行以下操作：
 
-1. subscribes to `ProposePrice` and `DisputePrice` logs;
-2. validates the emitting contract and decodes the ABI payload;
-3. joins a memory-resident Polymarket identity catalog;
-4. publishes one pre-encoded binary batch to all WebSocket clients;
-5. appends replayable local state asynchronously.
+1. 订阅 `ProposePrice` 和 `DisputePrice` 日志；
+2. 校验日志发送合约并解码 ABI 载荷；
+3. 关联驻留内存的 Polymarket 身份目录；
+4. 向所有 WebSocket 客户端发布同一份预编码二进制批次；
+5. 异步追加可重放的本地状态。
 
-Gamma HTTP requests, catalog snapshots, filesystem I/O, JSON formatting and
-historical backfill never execute inline in the live WebSocket reader.
+Gamma HTTP 请求、目录快照、文件系统 I/O、JSON 格式化和历史回补，均不会在
+实时 WebSocket 读取流程中同步执行。
 
-## Enrichment contract
+## 富化契约
 
-The immutable/minimally changing enrichment projection is:
+不可变或极少变化的富化投影包括：
 
-- `market_id`: unsigned numeric Polymarket market ID;
-- `condition_id`: exactly 32 bytes;
-- `token_ids`: ordered list of 32-byte unsigned token identifiers;
-- `tag_ids`: sorted unique union of market tags and all attached event tags.
+- `market_id`：无符号数值型 Polymarket 市场 ID；
+- `condition_id`：长度严格为 32 字节；
+- `token_ids`：有序的 32 字节无符号 token 标识符列表；
+- `tag_ids`：市场标签与所有关联事件标签的并集，排序并去重。
 
-Tag IDs are official Polymarket numeric IDs. Labels and slugs are not duplicated
-in each market record. `outcomes`, `outcome_prices` and `tick_size` are not
-stored or published. Dynamic CLOB state is outside this service.
+Tag ID 使用 Polymarket 官方数字 ID。每条市场记录中不重复保存 label 和 slug。
+不存储或发布 `outcomes`、`outcome_prices` 和 `tick_size`。动态 CLOB 状态不属于
+本服务范围。
 
 ## WebSocket
 
-Endpoint:
+端点：
 
 ```text
 GET /uma/v1/ws?after_sequence=<u64>
 Sec-WebSocket-Protocol: uma.pb.v1
 ```
 
-Every WebSocket data message is a BinaryMessage with this 12-byte header:
+每条 WebSocket 数据消息都是 BinaryMessage，并包含以下 12 字节消息头：
 
 ```text
-offset  size  field
+偏移量  大小  字段
 0       4     ASCII "UMA1"
-4       1     flags; bit 0 means Zstd
-5       1     schema version (1)
-6       2     reserved, zero
-8       4     uncompressed protobuf size, big endian
-12      ...   protobuf UmaBatch payload, optionally Zstd level 1
+4       1     flags；第 0 位表示使用 Zstd
+5       1     schema 版本（1）
+6       2     保留字段，值为零
+8       4     未压缩 Protobuf 大小，大端序
+12      ...   Protobuf UmaBatch 载荷，可选使用 Zstd level 1 压缩
 ```
 
-The Protobuf schema is `proto/uma.proto`. Payloads below 4096 bytes are not
-compressed. Larger payloads use Zstd level 1. A batch contains at most 64
-events or 32 KiB before compression. These values are configurable.
+Protobuf schema 位于 `proto/uma.proto`。小于 4096 字节的载荷不压缩；更大的载荷
+使用 Zstd level 1。每个批次最多包含 64 个事件，或压缩前不超过 32 KiB。这些值
+均可配置。
 
-Frames are delivered at least once. A reconnect whose `after_sequence` falls
-inside a previously encoded batch may receive earlier events from that batch;
-clients must deduplicate by `sequence` or `(transaction_hash, log_index)`.
-If the requested cursor is older than the in-memory frame ring, the connection
-is closed and the client must use the HTTP catch-up endpoint.
+消息帧采用至少一次投递。重连时，如果 `after_sequence` 落在之前编码的某个批次
+内，客户端可能收到该批次中序号更早的事件；客户端必须按 `sequence` 或
+`(transaction_hash, log_index)` 去重。如果请求的游标早于内存帧环中最旧的记录，
+连接将被关闭，客户端必须改用 HTTP 补拉端点。
 
-## HTTP query API
+## HTTP 查询 API
 
 ```text
 GET /healthz
@@ -70,36 +69,34 @@ GET /uma/v1/events/:transaction_hash/:log_index
 GET /uma/v1/markets/:market_id
 ```
 
-Event HTTP responses are JSON and join the latest catalog snapshot at read
-time. The WSS event records expose whether enrichment was a hit when the event
-was first broadcast.
+事件 HTTP 响应使用 JSON，并在读取时关联最新的目录快照。WSS 事件记录会标明事件
+首次广播时富化是否命中。
 
-## Defaults and operational semantics
+## 默认值与运行语义
 
-- API bind: `127.0.0.1:8011`.
-- Default emitter allowlist: Polygon Optimistic Oracle
-  `0xCB1822859cEF82Cd2Eb4E6276C7916e692995130`.
-- First start without `START_BLOCK`: subscribe first, set the checkpoint to the
-  current head, and continue from live data without scanning chain history.
-- Restart: subscribe first, then backfill `(checkpoint, subscribed_head]` over
-  HTTP RPC while buffering live logs; duplicates are removed by tx hash/log.
-- Event and frame rings are bounded. Slow clients never block ingestion.
-- A catalog miss is broadcast immediately with empty enrichment and
-  `ENRICHMENT_STATUS_MISS`; an exact Gamma repair runs asynchronously.
-- Checkpoint lag is safe: replay may duplicate events but cannot skip events.
-- Removed/reorged logs are retained with `removed=true`.
+- API 监听地址：`127.0.0.1:8011`。
+- 默认发送方白名单：Polygon Optimistic Oracle
+  `0xCB1822859cEF82Cd2Eb4E6276C7916e692995130`。
+- 首次启动且未设置 `START_BLOCK`：先建立订阅，将 checkpoint 设置为当前区块头，
+  然后只处理后续实时数据，不扫描链上历史。
+- 重启：先建立订阅，再通过 HTTP RPC 回补 `(checkpoint, subscribed_head]`，同时缓冲
+  实时日志；按交易哈希和日志索引去重。
+- 事件环和帧环都有容量上限。慢客户端绝不会阻塞数据摄取。
+- 目录未命中时，立即以空富化数据和 `ENRICHMENT_STATUS_MISS` 广播；精确的 Gamma
+  修复在后台异步执行。
+- checkpoint 落后是安全的：重放可能产生重复事件，但不会遗漏事件。
+- 被移除或发生链重组的日志仍会保留，并标记 `removed=true`。
 
-## Downstream requirements
+## 下游要求
 
-- Validate the fixed header, schema version, advertised uncompressed size and
-  a configured maximum decompressed size before allocating.
-- Treat 32-byte identifiers and 20-byte addresses as opaque bytes.
-- Treat `price_raw` as signed two's-complement `int256`.
-- Preserve token order but do not infer Yes/No meaning; outcomes are absent by
-  contract.
-- Deduplicate at least once delivery and reconnect with exponential backoff.
+- 分配内存前，校验固定消息头、schema 版本、声明的未压缩大小，以及配置的最大
+  解压大小。
+- 将 32 字节标识符和 20 字节地址视为不透明字节序列。
+- 将 `price_raw` 视为有符号二进制补码 `int256`。
+- 保持 token 顺序，但不要推断 Yes/No 含义；本契约不包含 outcomes。
+- 对至少一次投递进行去重，并使用指数退避策略重连。
 
-## Health and verification metrics
+## 健康与验证指标
 
 - `rpc_connected`
 - `rpc_reconnects_total`
@@ -115,4 +112,3 @@ was first broadcast.
 - `subscribers`
 - `slow_clients_dropped_total`
 - `event_ring_oldest_sequence` / `event_ring_latest_sequence`
-

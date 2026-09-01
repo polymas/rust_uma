@@ -2,4 +2,4 @@
 *.profraw
 .DS_Store
 .env
-
+AGENTS.md
