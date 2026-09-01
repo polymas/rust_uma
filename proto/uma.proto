@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package polyuma.wire.v1;
+
+message UmaBatch {
+  uint32 schema_version = 1;
+  uint64 batch_sequence = 2;
+  uint64 sent_at_us = 3;
+  repeated UmaEvent events = 4;
+}
+
+message UmaEvent {
+  uint64 sequence = 1;
+  EventType event_type = 2;
+  uint64 block_number = 3;
+  bytes transaction_hash = 4;
+  uint32 log_index = 5;
+
+  uint64 market_id = 6;
+  bytes condition_id = 7;
+  repeated bytes token_ids = 8;
+  repeated uint32 tag_ids = 9;
+
+  bytes price_raw = 10;
+  bytes requester = 11;
+  bytes proposer = 12;
+  bytes disputer = 13;
+  uint64 upstream_received_at_us = 14;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_PROPOSE = 1;
+  EVENT_TYPE_DISPUTE = 2;
+}
+
