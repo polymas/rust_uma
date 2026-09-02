@@ -119,18 +119,13 @@ GET /metrics
 GET /llms.txt
 GET /dashboard?token=<DASHBOARD_TOKEN>
 GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
-GET /uma/v1/tags?token=<DASHBOARD_TOKEN>
 ```
 
-`/dashboard`、`/uma/v1/dashboard-data` 和 `/uma/v1/tags` 是只读运维面板，展示
-RPC 收发、富化命中率、下游 WSS 消费等聚合计数器，以及 Polymarket tag id ->
-label 映射（用于把事件表里的 `tag_ids` 显示成人类可读名字），未配置
-`DASHBOARD_TOKEN` 时这三个路由直接拒绝访问。这些端点不提供业务事件数据（不
-返回单条事件或市场详情）——业务数据只通过 `/uma/v1/ws` 分发，任何消费者（含
-调试/回放脚本）都应该解 Protobuf，不应该依赖一条平行的 JSON 业务接口。
-`tag_ids` 到名字的映射只在进程启动时从 Gamma 的 `GET /tags` 拉取一次（详见
-`enrichment::load_tag_labels`），进程生命周期内不刷新——tag 分类表变化很慢，
-不值得为它加一条周期任务；拉取失败会降级为空表，不影响启动。
+`/dashboard` 和 `/uma/v1/dashboard-data` 是只读运维面板，展示 RPC 收发、富化
+命中率、下游 WSS 消费等聚合计数器，未配置 `DASHBOARD_TOKEN` 时这两个路由直接
+拒绝访问。这些端点不提供业务事件数据（不返回单条事件或市场详情）——业务数据
+只通过 `/uma/v1/ws` 分发，任何消费者（含调试/回放脚本）都应该解 Protobuf，
+不应该依赖一条平行的 JSON 业务接口。
 
 ## 默认值与运行语义
 

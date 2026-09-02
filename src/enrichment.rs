@@ -170,20 +170,6 @@ impl GammaClient {
         self.get_json(request).await
     }
 
-    /// Fetches Polymarket's full tag taxonomy (id -> human label), e.g.
-    /// `{"id":"1512","label":"caitlin clark",...}`. `limit=1000` comfortably
-    /// covers the full set (~150 tags as of this writing) in one page — Gamma
-    /// gives no pagination cursor on this endpoint to page through anyway.
-    /// Called once at startup only (see `load_tag_labels`), never on the hot
-    /// path.
-    async fn tags(&self) -> Result<Vec<GammaTagFull>, EnrichmentError> {
-        let request = self
-            .client
-            .get(format!("{}/tags", self.base_url))
-            .query(&[("limit", "1000")]);
-        self.get_json(request).await
-    }
-
     async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         request: reqwest::RequestBuilder,
@@ -525,35 +511,6 @@ struct GammaTag {
     id: String,
 }
 
-/// One row of `GET /tags` — the id/label pair, ignoring the slug/timestamp
-/// fields we have no use for.
-#[derive(Debug, Deserialize)]
-struct GammaTagFull {
-    id: String,
-    label: String,
-}
-
-/// Fetches the id -> label map once at startup for display purposes only
-/// (dashboard event table). Never fatal: a failure here must not block
-/// booting, so it logs and falls back to an empty map — UI then shows raw
-/// numeric ids, exactly like before this existed.
-pub async fn load_tag_labels(gamma: &GammaClient) -> HashMap<u32, String> {
-    match gamma.tags().await {
-        Ok(tags) => {
-            let map: HashMap<u32, String> = tags
-                .into_iter()
-                .filter_map(|tag| tag.id.parse::<u32>().ok().map(|id| (id, tag.label)))
-                .collect();
-            info!(tags = map.len(), "Gamma tag labels loaded");
-            map
-        }
-        Err(error) => {
-            warn!(%error, "Gamma tag label fetch failed; dashboard will show raw tag ids");
-            HashMap::new()
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct GammaEvent {
     #[serde(default)]
@@ -700,35 +657,6 @@ mod tests {
         // thing available for standard binary markets missing market_id.
         assert!(catalog.resolve(None, &wrong_derived_condition_id).is_none());
         assert!(catalog.resolve(None, &gamma_condition_id).is_some());
-    }
-
-    #[tokio::test]
-    async fn tag_labels_load_from_gamma_and_ignore_unparseable_ids() {
-        async fn list_tags() -> Json<Value> {
-            Json(json!([
-                {"id": "1512", "label": "caitlin clark"},
-                {"id": "100", "label": "politics"},
-                {"id": "not-a-number", "label": "should be skipped"},
-            ]))
-        }
-        let app = Router::new().route("/tags", get(list_tags));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let gamma = GammaClient::new(format!("http://{address}")).unwrap();
-        let labels = load_tag_labels(&gamma).await;
-        assert_eq!(labels.get(&1512).map(String::as_str), Some("caitlin clark"));
-        assert_eq!(labels.get(&100).map(String::as_str), Some("politics"));
-        assert_eq!(labels.len(), 2);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn tag_labels_degrade_to_empty_map_on_fetch_failure() {
-        // No server listening at all — connection refused, not a panic.
-        let gamma = GammaClient::new("http://127.0.0.1:1".into()).unwrap();
-        assert!(load_tag_labels(&gamma).await.is_empty());
     }
 
     #[test]

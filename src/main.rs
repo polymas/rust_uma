@@ -142,7 +142,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         frames,
         catalog,
         stats,
-        tag_labels,
     };
     info!(address=%config.api_addr, recovered_events=initial_sequence, "rust_uma API listening");
     tokio::select! {

@@ -308,15 +308,17 @@ timeToggle.addEventListener("click", () => {
 
 const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50", unspecified: "—" };
 
-// Polymarket tag id -> label（GET /tags，见 enrichment::load_tag_labels），
-// 启动时抓一次、进程生命周期内不变，这里也只在页面加载时拉一次。拉取失败就
-// 留空对象，渲染时退化回显示原始数字 id。
+// Polymarket tag id -> label. 纯客户端浏览器直接拉 Polymarket 自己的公开
+// Gamma API（不经过本服务端，本服务端不做任何 tag 映射相关的事）。页面加载
+// 时拉一次，浏览器生命周期内不变；limit=1000 一页拉全（目前约 150 个 tag，
+// 该接口不提供分页游标）。拉取失败就留空对象，渲染时退化回显示原始数字 id。
 let tagLabels = {};
 async function loadTagLabels() {
   try {
-    const res = await fetch(`/uma/v1/tags?token=${encodeURIComponent(token)}`, { cache: "no-store" });
+    const res = await fetch("https://gamma-api.polymarket.com/tags?limit=1000", { cache: "no-store" });
     if (!res.ok) return;
-    tagLabels = await res.json();
+    const list = await res.json();
+    for (const tag of list) tagLabels[tag.id] = tag.label;
     renderEvents();
   } catch (e) {
     console.error("tag label fetch failed", e);
