@@ -117,6 +117,15 @@ src/
   cursor 文件——它只负责查漏补缺，不参与、不干扰快路径的正常推进。
   `catalog_reconcile_gaps_closed_total`（`/healthz`、`/metrics`）应该趋向于
   0；如果长期非零，说明 Gamma 分页丢失是持续性的，不是偶发。
+- **任何 `tokio::time::interval` 的周期都不能来自未夹紧的用户配置**：验证这
+  条自愈任务时，临时把 `CATALOG_RECONCILE_INTERVAL_HOURS` 设成 `0` 想让它立
+  刻触发，结果 `tokio::time::interval(Duration::ZERO)` 直接 panic——而
+  `Cargo.toml` 的 `[profile.release] panic = "abort"` 让任何一个 tokio 任务
+  的 panic 直接终止整个进程，systemd `Restart=always` 又立刻拉起、再次读到
+  同一个 0 配置、再次 panic，生产服务在 43.131.1.194 上进了几十秒的重启死循
+  环。现在 `config.rs` 里所有喂给 `tokio::time::interval` 的时长都
+  `.max(1)`；新增任何周期性任务前，先确认它的间隔配置不会因为一个整数 0 就
+  让进程死循环崩溃，不要假设"运维不会填 0"。
 
 ## 2. 测试
 

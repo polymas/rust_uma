@@ -132,13 +132,18 @@ impl Config {
                 .unwrap_or_else(|| "https://gamma-api.polymarket.com".into())
                 .trim_end_matches('/')
                 .to_owned(),
-            gamma_refresh_interval: Duration::from_secs(parse(
-                "GAMMA_REFRESH_INTERVAL_SECONDS",
-                "60",
-            )?),
+            // `.max(1)`: these back `tokio::time::interval`, which panics
+            // outright on a zero period — a bad env value must degrade to
+            // "sync very often", never crash the process (production incident:
+            // a temporary CATALOG_RECONCILE_INTERVAL_HOURS=0 for testing
+            // aborted the whole service in a restart loop, panic=abort makes
+            // any panic anywhere fatal to the whole process, not just the task).
+            gamma_refresh_interval: Duration::from_secs(
+                parse::<u64>("GAMMA_REFRESH_INTERVAL_SECONDS", "60")?.max(1),
+            ),
             closed_market_lookback_days: parse("CLOSED_MARKET_LOOKBACK_DAYS", "3")?,
             catalog_reconcile_interval: Duration::from_secs(
-                parse::<u64>("CATALOG_RECONCILE_INTERVAL_HOURS", "6")? * 3600,
+                parse::<u64>("CATALOG_RECONCILE_INTERVAL_HOURS", "6")?.max(1) * 3600,
             ),
             require_market_id: parse_bool("REQUIRE_MARKET_ID", true)?,
             ws_write_timeout: Duration::from_millis(parse("WS_WRITE_TIMEOUT_MS", "5000")?),
