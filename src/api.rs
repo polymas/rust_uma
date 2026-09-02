@@ -49,6 +49,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/uma/v1/markets/{condition_id}", get(market_lookup))
         .route("/uma/v1/ws", get(websocket))
+        .route("/dashboard", get(dashboard_page))
+        .route("/uma/v1/dashboard-data", get(dashboard_data))
         .with_state(state)
 }
 
@@ -210,6 +212,111 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Body::from(body))
         .expect("metrics response")
+}
+
+/// Static shell for the read-only ops dashboard. Not gated on its own — it
+/// contains no data, only JS that calls `dashboard_data` with the token from
+/// its own query string, so an unauthorized visitor sees an empty page that
+/// fails to load, not a leak.
+async fn dashboard_page() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(include_str!("../internal/api/dashboard.html")))
+        .expect("dashboard response")
+}
+
+#[derive(Deserialize)]
+struct DashboardQuery {
+    token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DashboardData {
+    server_time_us: u64,
+    rpc_connected: bool,
+    rpc_sources_connected: u64,
+    rpc_sources_configured: usize,
+    rpc_reconnects_total: u64,
+    rpc_logs_received_total: u64,
+    rpc_bytes_received_total: u64,
+    rpc_bytes_sent_total: u64,
+    events_decoded_total: u64,
+    decode_errors_total: u64,
+    duplicates_total: u64,
+    enrichment_hits_total: u64,
+    enrichment_hits_via_market_id_total: u64,
+    enrichment_misses_total: u64,
+    catalog_markets: u64,
+    catalog_reconcile_gaps_closed_total: u64,
+    last_upstream_received_at_us: u64,
+    last_broadcast_at_us: u64,
+    subscribers: u64,
+    ws_frames_sent_total: u64,
+    ws_bytes_sent_total: u64,
+    slow_clients_dropped_total: u64,
+    storage_queue_dropped_total: u64,
+    latest_block: u64,
+    event_ring_oldest_sequence: u64,
+    event_ring_latest_sequence: u64,
+}
+
+/// Requires `?token=` to exactly match `DASHBOARD_TOKEN`. An unset
+/// `DASHBOARD_TOKEN` closes this route entirely rather than defaulting open.
+fn check_dashboard_token(state: &AppState, provided: Option<&str>) -> Result<(), ApiError> {
+    let expected = state.config.dashboard_token.as_deref();
+    match (expected, provided) {
+        (Some(expected), Some(provided)) if !expected.is_empty() && expected == provided => Ok(()),
+        _ => Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "invalid or missing token",
+        }),
+    }
+}
+
+async fn dashboard_data(
+    State(state): State<AppState>,
+    Query(query): Query<DashboardQuery>,
+) -> Result<Json<DashboardData>, ApiError> {
+    check_dashboard_token(&state, query.token.as_deref())?;
+    let (oldest, latest) = state.events.bounds();
+    Ok(Json(DashboardData {
+        server_time_us: crate::wire::now_us(),
+        rpc_connected: state.stats.rpc_connected.load(Ordering::Relaxed),
+        rpc_sources_connected: state.stats.rpc_sources_connected.load(Ordering::Relaxed),
+        rpc_sources_configured: state.config.wss_rpc_urls.len(),
+        rpc_reconnects_total: state.stats.rpc_reconnects.load(Ordering::Relaxed),
+        rpc_logs_received_total: state.stats.rpc_logs_received.load(Ordering::Relaxed),
+        rpc_bytes_received_total: state.stats.rpc_bytes_received.load(Ordering::Relaxed),
+        rpc_bytes_sent_total: state.stats.rpc_bytes_sent.load(Ordering::Relaxed),
+        events_decoded_total: state.stats.events_decoded.load(Ordering::Relaxed),
+        decode_errors_total: state.stats.decode_errors.load(Ordering::Relaxed),
+        duplicates_total: state.stats.duplicates.load(Ordering::Relaxed),
+        enrichment_hits_total: state.stats.enrichment_hits.load(Ordering::Relaxed),
+        enrichment_hits_via_market_id_total: state
+            .stats
+            .enrichment_hits_via_market_id
+            .load(Ordering::Relaxed),
+        enrichment_misses_total: state.stats.enrichment_misses.load(Ordering::Relaxed),
+        catalog_markets: state.catalog.len() as u64,
+        catalog_reconcile_gaps_closed_total: state
+            .stats
+            .catalog_reconcile_gaps_closed
+            .load(Ordering::Relaxed),
+        last_upstream_received_at_us: state
+            .stats
+            .last_upstream_received_at_us
+            .load(Ordering::Relaxed),
+        last_broadcast_at_us: state.stats.last_broadcast_at_us.load(Ordering::Relaxed),
+        subscribers: state.stats.subscribers.load(Ordering::Relaxed),
+        ws_frames_sent_total: state.stats.ws_frames_sent.load(Ordering::Relaxed),
+        ws_bytes_sent_total: state.stats.ws_bytes_sent.load(Ordering::Relaxed),
+        slow_clients_dropped_total: state.stats.slow_clients_dropped.load(Ordering::Relaxed),
+        storage_queue_dropped_total: state.stats.storage_queue_dropped.load(Ordering::Relaxed),
+        latest_block: state.stats.latest_block.load(Ordering::Relaxed),
+        event_ring_oldest_sequence: oldest,
+        event_ring_latest_sequence: latest,
+    }))
 }
 
 async fn llms() -> Response {
@@ -498,6 +605,7 @@ async fn send_available(
     after: &mut u64,
 ) -> Result<(), FrameReadError> {
     for frame in state.frames.after(*after)? {
+        let frame_len = frame.bytes.len() as u64;
         if timed_send(
             socket,
             Message::Binary(frame.bytes.clone()),
@@ -508,6 +616,11 @@ async fn send_available(
         {
             return Err(FrameReadError::Lagged);
         }
+        state.stats.ws_frames_sent.fetch_add(1, Ordering::Relaxed);
+        state
+            .stats
+            .ws_bytes_sent
+            .fetch_add(frame_len, Ordering::Relaxed);
         *after = (*after).max(frame.last_sequence);
     }
     Ok(())

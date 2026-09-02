@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rust-uma monitor</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --panel: #121821;
+    --border: #1f2733;
+    --text: #d8e1ea;
+    --dim: #7c8a9a;
+    --ok: #3ecf8e;
+    --warn: #e8b339;
+    --bad: #e5534b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 20px;
+  }
+  h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    color: var(--text);
+  }
+  #meta { color: var(--dim); margin-bottom: 18px; font-size: 12px; }
+  #meta.err { color: var(--bad); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--dim);
+    margin: 0 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex-shrink: 0; }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--bad); }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+    border-bottom: 1px dashed var(--border);
+  }
+  .row:last-child { border-bottom: none; }
+  .row .k { color: var(--dim); }
+  .row .v { font-variant-numeric: tabular-nums; }
+  .v.ok { color: var(--ok); }
+  .v.warn { color: var(--warn); }
+  .v.bad { color: var(--bad); }
+  .events-card {
+    margin-top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .events-card h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--dim);
+    margin: 0 0 10px;
+  }
+  .tablewrap { overflow-x: auto; max-height: 480px; overflow-y: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px dashed var(--border); }
+  th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  td.q { white-space: normal; min-width: 260px; color: var(--dim); }
+</style>
+</head>
+<body>
+<h1>rust-uma 运行监控</h1>
+<div id="meta">加载中…</div>
+<div class="grid" id="grid"></div>
+
+<div class="events-card">
+  <h2>实时推送（WSS /uma/v1/ws 下发的事件，从打开面板起开始记录）</h2>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>序号</th><th>收到于</th><th>类型</th><th>Market ID</th>
+          <th>Condition ID</th><th>富化</th><th>问题</th>
+        </tr>
+      </thead>
+      <tbody id="eventsBody">
+        <tr><td colspan="7" style="color:var(--dim)">等待新事件…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const token = params.get("token") || "";
+const meta = document.getElementById("meta");
+const grid = document.getElementById("grid");
+
+let prev = null; // previous sample, for rate computation
+let prevAt = 0;  // Date.now() of previous sample
+
+function fmtBytes(n) {
+  if (n < 1024) return n.toFixed(0) + " B";
+  if (n < 1024*1024) return (n/1024).toFixed(1) + " KB";
+  return (n/1024/1024).toFixed(2) + " MB";
+}
+function fmtRate(bytesPerSec) { return fmtBytes(bytesPerSec) + "/s"; }
+function fmtAgo(us) {
+  if (!us) return "从未";
+  const ms = Date.now() - us / 1000;
+  if (ms < 0) return "刚刚";
+  if (ms < 1000) return ms.toFixed(0) + "ms 前";
+  if (ms < 60000) return (ms/1000).toFixed(1) + "s 前";
+  return (ms/60000).toFixed(1) + "min 前";
+}
+function rate(curr, key, seconds) {
+  if (!prev) return 0;
+  const d = curr[key] - prev[key];
+  return d > 0 ? d / seconds : 0;
+}
+
+function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + "…" : (s || ""); }
+function short(hex) { return hex && hex.length > 14 ? hex.slice(0, 8) + "…" + hex.slice(-6) : hex; }
+
+let lastEventSeq = null; // seeded from the first dashboard-data sample
+const events = []; // newest-first, capped
+const MAX_EVENTS = 60;
+const eventsBody = document.getElementById("eventsBody");
+
+function renderEvents() {
+  if (!events.length) return;
+  eventsBody.innerHTML = events.map(ev => `
+    <tr>
+      <td>#${ev.sequence}</td>
+      <td>${fmtAgo(ev.upstream_received_at_us)}</td>
+      <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${ev.event_type}</td>
+      <td>${ev.market_id}</td>
+      <td title="${ev.condition_id}">${short(ev.condition_id)}</td>
+      <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ev.enrichment_status}</td>
+      <td class="q" title="${(ev.question || '').replace(/"/g, '&quot;')}">${truncate(ev.question, 90)}</td>
+    </tr>
+  `).join("");
+}
+
+async function fetchNewEvents() {
+  if (lastEventSeq === null) return;
+  try {
+    const res = await fetch(`/uma/v1/events?after_sequence=${lastEventSeq}&limit=50`, { cache: "no-store" });
+    if (!res.ok) return;
+    const payload = await res.json();
+    if (payload.data && payload.data.length) {
+      for (const ev of payload.data) events.unshift(ev);
+      events.length = Math.min(events.length, MAX_EVENTS);
+      lastEventSeq = payload.latest_sequence;
+      renderEvents();
+    }
+  } catch (e) {
+    // transient — next tick retries
+  }
+}
+
+function card(title, dotClass, rows) {
+  const el = document.createElement("div");
+  el.className = "card";
+  const rowsHtml = rows.map(([k, v, cls]) =>
+    `<div class="row"><span class="k">${k}</span><span class="v ${cls||''}">${v}</span></div>`
+  ).join("");
+  el.innerHTML = `<h2><span class="dot ${dotClass||''}"></span>${title}</h2>${rowsHtml}`;
+  return el;
+}
+
+async function tick() {
+  let data;
+  try {
+    const res = await fetch(`/uma/v1/dashboard-data?token=${encodeURIComponent(token)}`, { cache: "no-store" });
+    if (res.status === 403) {
+      meta.textContent = "token 无效或缺失 —— 在链接末尾加 ?token=xxx";
+      meta.className = "err";
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    data = await res.json();
+  } catch (e) {
+    meta.textContent = "拉取失败：" + e.message + "（将自动重试）";
+    meta.className = "err";
+    return;
+  }
+
+  const now = Date.now();
+  const seconds = prevAt ? (now - prevAt) / 1000 : 2;
+
+  const rpcOk = data.rpc_connected;
+  const wsBytesRate = rate(data, "rpc_bytes_received_total", seconds);
+  const wsSendRate = rate(data, "ws_bytes_sent_total", seconds);
+  const framesRate = rate(data, "ws_frames_sent_total", seconds);
+  const logsRate = rate(data, "rpc_logs_received_total", seconds);
+  const hitTotal = data.enrichment_hits_total + data.enrichment_misses_total;
+  const hitPct = hitTotal ? (data.enrichment_hits_total / hitTotal * 100) : 100;
+
+  meta.className = "";
+  meta.textContent = `服务端时间 ${new Date(data.server_time_us/1000).toLocaleTimeString()} · 每 2s 刷新一次`;
+
+  grid.innerHTML = "";
+  grid.appendChild(card("RPC 上游收发", rpcOk ? "ok" : "bad", [
+    ["连接状态", rpcOk ? "已连接" : "断开", rpcOk ? "ok" : "bad"],
+    ["活跃源 / 配置源", `${data.rpc_sources_connected} / ${data.rpc_sources_configured}`],
+    ["累计重连", data.rpc_reconnects_total, data.rpc_reconnects_total > 0 ? "warn" : ""],
+    ["接收速率", fmtRate(wsBytesRate)],
+    ["累计接收", fmtBytes(data.rpc_bytes_received_total)],
+    ["累计发送", fmtBytes(data.rpc_bytes_sent_total)],
+    ["日志接收速率", logsRate.toFixed(2) + " 条/s"],
+    ["日志接收总数", data.rpc_logs_received_total],
+    ["最新区块", data.latest_block],
+  ]));
+
+  grid.appendChild(card("富化 (Catalog)", hitPct > 95 ? "ok" : (hitPct > 80 ? "" : "bad"), [
+    ["缓存市场数", data.catalog_markets],
+    ["命中总数", data.enrichment_hits_total],
+    ["其中 via market_id", data.enrichment_hits_via_market_id_total],
+    ["未命中总数", data.enrichment_misses_total, data.enrichment_misses_total > 0 ? "warn" : ""],
+    ["命中率", hitPct.toFixed(2) + "%", hitPct > 95 ? "ok" : (hitPct > 80 ? "warn" : "bad")],
+    ["自愈补齐总数", data.catalog_reconcile_gaps_closed_total, data.catalog_reconcile_gaps_closed_total > 0 ? "warn" : ""],
+  ]));
+
+  grid.appendChild(card("热路径 / 事件处理", "", [
+    ["已解码事件总数", data.events_decoded_total],
+    ["解码错误总数", data.decode_errors_total, data.decode_errors_total > 0 ? "bad" : ""],
+    ["去重丢弃总数", data.duplicates_total],
+    ["事件环 (oldest→latest)", `#${data.event_ring_oldest_sequence} → #${data.event_ring_latest_sequence}`],
+    ["最近一次上游收到", fmtAgo(data.last_upstream_received_at_us)],
+    ["最近一次广播", fmtAgo(data.last_broadcast_at_us)],
+    ["存储队列丢弃总数", data.storage_queue_dropped_total, data.storage_queue_dropped_total > 0 ? "warn" : ""],
+  ]));
+
+  grid.appendChild(card("下游 WSS 消费", data.subscribers > 0 ? "ok" : "", [
+    ["当前连接数", data.subscribers],
+    ["慢客户端断开总数", data.slow_clients_dropped_total, data.slow_clients_dropped_total > 0 ? "warn" : ""],
+    ["下发速率", fmtRate(wsSendRate)],
+    ["下发帧速率", framesRate.toFixed(2) + " 帧/s"],
+    ["累计下发字节", fmtBytes(data.ws_bytes_sent_total)],
+    ["累计下发帧数", data.ws_frames_sent_total],
+  ]));
+
+  if (lastEventSeq === null) lastEventSeq = data.event_ring_latest_sequence;
+  await fetchNewEvents();
+
+  prev = data;
+  prevAt = now;
+}
+
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
