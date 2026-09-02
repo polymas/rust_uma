@@ -170,7 +170,8 @@ async fn run_live_session(
     any_connected: &watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), RpcError> {
-    let (mut live, reader) = subscribe_live(url, live_buffer, shutdown.clone()).await?;
+    let (mut live, reader) =
+        subscribe_live(url, live_buffer, stats.clone(), shutdown.clone()).await?;
     mark_source_connected(stats);
     any_connected.send_replace(true);
     info!(source, "Polygon signal subscription connected");
@@ -268,6 +269,7 @@ async fn run_backfill(
 async fn subscribe_live(
     url: &str,
     live_buffer: usize,
+    stats: Arc<Stats>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(mpsc::Receiver<RpcLog>, JoinHandle<()>), RpcError> {
     let (mut socket, _) = connect_async(url).await?;
@@ -279,13 +281,18 @@ async fn subscribe_live(
             "topics": [[TOPIC_PROPOSE_PRICE, TOPIC_DISPUTE_PRICE]]
         }]
     });
-    socket
-        .send(Message::Text(request.to_string().into()))
-        .await?;
+    let request_text = request.to_string();
+    stats
+        .rpc_bytes_sent
+        .fetch_add(request_text.len() as u64, Ordering::Relaxed);
+    socket.send(Message::Text(request_text.into())).await?;
     loop {
         let message = socket.next().await.ok_or(RpcError::Closed)??;
         match message {
             Message::Text(text) => {
+                stats
+                    .rpc_bytes_received
+                    .fetch_add(text.len() as u64, Ordering::Relaxed);
                 let response: WsResponse = serde_json::from_str(text.as_ref())?;
                 if let Some(error) = response.error {
                     return Err(RpcError::Remote {
@@ -312,6 +319,9 @@ async fn subscribe_live(
                     let Some(message) = message else { break; };
                     match message {
                         Ok(Message::Text(text)) => {
+                            stats
+                                .rpc_bytes_received
+                                .fetch_add(text.len() as u64, Ordering::Relaxed);
                             match serde_json::from_str::<SubscriptionNotification>(text.as_ref()) {
                                 Ok(notification) if notification.method == "eth_subscription" => {
                                     if tx.send(notification.params.result).await.is_err() { break; }

@@ -31,6 +31,17 @@ pub struct Stats {
     pub slow_clients_dropped: AtomicU64,
     pub storage_queue_dropped: AtomicU64,
     pub latest_block: AtomicU64,
+    /// Raw bytes read off the upstream WSS RPC socket(s) (subscribe request's
+    /// response frames plus every eth_subscription notification). Dashboard-only
+    /// counter, not used by any hot-path decision.
+    pub rpc_bytes_received: AtomicU64,
+    /// Raw bytes written to the upstream WSS RPC socket(s) (essentially just
+    /// the one-shot eth_subscribe request per (re)connect). Dashboard-only.
+    pub rpc_bytes_sent: AtomicU64,
+    /// Frames written to downstream `/uma/v1/ws` subscribers, summed across
+    /// all connections. Dashboard-only counter for consumption throughput.
+    pub ws_frames_sent: AtomicU64,
+    pub ws_bytes_sent: AtomicU64,
 }
 
 impl Stats {

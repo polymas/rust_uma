@@ -53,6 +53,10 @@ pub struct Config {
     pub catalog_reconcile_interval: Duration,
     pub require_market_id: bool,
     pub ws_write_timeout: Duration,
+    /// Shared-secret query token gating `/dashboard` and `/uma/v1/dashboard-data`.
+    /// `None` (unset) leaves those routes closed — the monitoring panel refuses
+    /// to serve rather than default to open on a fresh deploy.
+    pub dashboard_token: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -151,6 +155,7 @@ impl Config {
             ),
             require_market_id: parse_bool("REQUIRE_MARKET_ID", true)?,
             ws_write_timeout: Duration::from_millis(parse("WS_WRITE_TIMEOUT_MS", "5000")?),
+            dashboard_token: nonempty("DASHBOARD_TOKEN"),
         })
     }
 }
