@@ -100,12 +100,13 @@
     <table>
       <thead>
         <tr>
-          <th>序号</th><th>收到于</th><th>类型</th><th>Market ID</th>
-          <th>Condition ID</th><th>富化</th><th>问题</th>
+          <th>序号</th><th>收到于</th><th>广播延迟</th><th>类型</th><th>方向</th>
+          <th>Market ID</th><th>Condition ID</th><th>Token IDs</th>
+          <th>Tags</th><th>富化</th><th>问题</th>
         </tr>
       </thead>
       <tbody id="eventsBody">
-        <tr><td colspan="7" style="color:var(--dim)">等待新事件…</td></tr>
+        <tr><td colspan="11" style="color:var(--dim)">等待新事件…</td></tr>
       </tbody>
     </table>
   </div>
@@ -142,6 +143,28 @@ function rate(curr, key, seconds) {
 
 function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + "…" : (s || ""); }
 function short(hex) { return hex && hex.length > 14 ? hex.slice(0, 8) + "…" + hex.slice(-6) : hex; }
+function fmtDuration(us) {
+  if (us < 1000) return us.toFixed(0) + "µs";
+  if (us < 1_000_000) return (us / 1000).toFixed(1) + "ms";
+  return (us / 1_000_000).toFixed(2) + "s";
+}
+// UMA binary markets propose 0 (NO), 1e18 (YES) or 0.5e18 (50/50 — an early
+// or unresolvable request); anything else is a non-binary/custom price, shown
+// as its raw 1e18-scaled decimal instead of guessing a label.
+const PRICE_YES = 10n ** 18n;
+const PRICE_5050 = 5n * 10n ** 17n;
+function priceDirection(priceRawHex) {
+  let value;
+  try {
+    value = BigInt(priceRawHex);
+  } catch {
+    return "?";
+  }
+  if (value === 0n) return "NO";
+  if (value === PRICE_YES) return "YES";
+  if (value === PRICE_5050) return "50/50";
+  return (Number(value) / 1e18).toString();
+}
 
 let lastEventSeq = null; // seeded from the first dashboard-data sample
 const events = []; // newest-first, capped
@@ -150,17 +173,28 @@ const eventsBody = document.getElementById("eventsBody");
 
 function renderEvents() {
   if (!events.length) return;
-  eventsBody.innerHTML = events.map(ev => `
+  eventsBody.innerHTML = events.map(ev => {
+    const latency = ev.broadcast_at_us > 0
+      ? fmtDuration(ev.broadcast_at_us - ev.upstream_received_at_us)
+      : "待广播";
+    const tokenIds = (ev.token_ids || []).map(short).join("<br>") || "—";
+    const tags = (ev.tag_ids || []).join(", ") || "—";
+    return `
     <tr>
       <td>#${ev.sequence}</td>
       <td>${fmtAgo(ev.upstream_received_at_us)}</td>
+      <td>${latency}</td>
       <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${ev.event_type}</td>
+      <td>${priceDirection(ev.price_raw)}</td>
       <td>${ev.market_id}</td>
       <td title="${ev.condition_id}">${short(ev.condition_id)}</td>
+      <td title="${(ev.token_ids || []).join(', ')}">${tokenIds}</td>
+      <td>${tags}</td>
       <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ev.enrichment_status}</td>
       <td class="q" title="${(ev.question || '').replace(/"/g, '&quot;')}">${truncate(ev.question, 90)}</td>
     </tr>
-  `).join("");
+  `;
+  }).join("");
 }
 
 async function fetchNewEvents() {

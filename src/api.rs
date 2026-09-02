@@ -415,6 +415,10 @@ struct EventDto {
     proposer: String,
     disputer: Option<String>,
     upstream_received_at_us: u64,
+    /// 0 if this event hasn't been through a broadcast batch yet (e.g. a
+    /// storage-replayed record from before this field existed). Dashboard-only,
+    /// not part of the WSS wire schema — see `EventRecord::broadcast_at_us`.
+    broadcast_at_us: u64,
     removed: bool,
     enrichment_status: &'static str,
     contract_address: String,
@@ -488,6 +492,7 @@ fn event_dto(event: &EventRecord, catalog: &Catalog) -> EventDto {
         proposer: hex_prefixed(&request.proposer),
         disputer: event.event.disputer().map(|value| hex_prefixed(value)),
         upstream_received_at_us: chain.upstream_received_at_us,
+        broadcast_at_us: event.broadcast_at_us(),
         removed: chain.removed,
         enrichment_status: if enrichment.is_some() { "hit" } else { "miss" },
         contract_address: hex_prefixed(&chain.contract_address),

@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use serde::Serialize;
 
@@ -56,14 +59,29 @@ pub struct EventKey {
     pub removed: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct EventRecord {
     pub sequence: u64,
     pub event: UmaEvent,
     pub enrichment: Option<Arc<MarketEnrichment>>,
+    /// When this event's frame was handed to `FrameHub::publish` (`run_batcher`,
+    /// `wire::now_us()`), 0 until then. Dashboard-only: never leaves the
+    /// process (not part of the protobuf wire schema downstream consumers
+    /// depend on), just an interior-mutable stamp on the same `Arc` shared
+    /// between `EventHub` and the batcher so `/uma/v1/events` can report
+    /// upstream-receive-to-broadcast latency after the fact.
+    pub broadcast_at_us: AtomicU64,
 }
 
 impl EventRecord {
+    pub fn mark_broadcast(&self, at_us: u64) {
+        self.broadcast_at_us.store(at_us, Ordering::Relaxed);
+    }
+
+    pub fn broadcast_at_us(&self) -> u64 {
+        self.broadcast_at_us.load(Ordering::Relaxed)
+    }
+
     pub fn key(&self) -> EventKey {
         EventKey {
             transaction_hash: self.event.chain().transaction_hash,
@@ -211,6 +229,7 @@ impl EventRecord {
             sequence: value.sequence,
             event,
             enrichment,
+            broadcast_at_us: AtomicU64::new(0),
         })
     }
 }
@@ -304,6 +323,7 @@ mod tests {
             sequence: 7,
             event: test_uma_event(2, 42),
             enrichment: None,
+            broadcast_at_us: Default::default(),
         };
         let decoded = EventRecord::from_proto(record.to_proto()).unwrap();
         assert_eq!(decoded.sequence, 7);
@@ -365,6 +385,7 @@ mod tests {
             sequence: 1,
             event,
             enrichment,
+            broadcast_at_us: Default::default(),
         };
         assert_eq!(record.resolved_condition_id(), gamma_condition_id);
 

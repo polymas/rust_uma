@@ -196,6 +196,7 @@ mod tests {
             sequence,
             event: test_uma_event(tx, 1),
             enrichment: None,
+            broadcast_at_us: Default::default(),
         })
     }
 
