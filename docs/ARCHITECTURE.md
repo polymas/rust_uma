@@ -9,81 +9,90 @@
 做本地内存查询（不进入热路径）。
 
 ```mermaid
-flowchart LR
-    subgraph chain["Polygon 链"]
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 58}} }%%
+flowchart TD
+    subgraph SRC[" 数据源 "]
+        direction LR
         WSS1["WSS 端点 #0"]
-        WSS2["WSS 端点 #N\n(WSS_RPC_LIST)"]
-        HTTP["HTTP RPC\n(eth_getLogs 补拉)"]
-    end
-
-    subgraph gamma_src["Gamma / Polymarket"]
+        WSSN["WSS 端点 #N\n(WSS_RPC_LIST)"]
+        HTTP["HTTP RPC"]
         GAPI["Gamma API\n/markets/keyset"]
     end
 
-    subgraph rpc["uma/rpc.rs"]
-        LW0["live_worker #0"]
-        LWN["live_worker #N"]
+    subgraph INGEST["uma/rpc.rs · 采集"]
+        direction LR
+        LW["live_worker × N\n(每路独立永久重连)"]
         BF["run_backfill\n(一次性, 仅 HTTP)"]
     end
 
-    subgraph decode["uma/events/"]
-        DEC["decode_signal_log\nProposePrice / DisputePrice\nancillary 强类型解析"]
-    end
+    DEC["uma/events/\ndecode_signal_log\nProposePrice / DisputePrice"]
+    DROP["丢弃\n(+ duplicates 计数)"]
 
-    subgraph enrich["enrichment.rs"]
-        CAT[("Catalog\nby_condition_id\nmarket_to_condition")]
-        SYNC["sync_catalog_before_uma\nrun_catalog_sync (周期增量)"]
-    end
-
-    subgraph pipe["pipeline.rs :: Processor"]
-        DEDUP{"EventHub\n(tx_hash, log_index)\n去重"}
-        RESOLVE["Catalog::resolve\nmarket_id 优先\n→ 链上推导兜底"]
-    end
-
-    subgraph broadcast["hub.rs + wire.rs"]
+    subgraph HOT[" 热路径 — 禁止同步网络请求 "]
+        direction TB
+        DEDUP{"EventHub 去重\n(tx_hash, log_index)"}
+        RESOLVE["Catalog::resolve\nmarket_id 优先 → 链上推导兜底"]
         ERING[("EventHub\n事件环")]
-        BATCH["run_batcher\n(先阻塞等第一条,\n非阻塞捎带, 无定时窗口)"]
-        ENC["encode_frame\nProtobuf + Zstd(阈值触发)"]
+        BATCH["run_batcher\n阻塞等第一条 · 非阻塞捎带\n(无定时窗口)"]
+        ENC["encode_frame\nProtobuf +（超阈值）Zstd"]
         FRING[("FrameHub\n预编码帧环")]
+
+        DEDUP -->|新事件| RESOLVE --> ERING
+        ERING --> BATCH --> ENC --> FRING
     end
 
-    subgraph store["storage.rs"]
+    subgraph ENRICH["enrichment.rs · 启动前预热"]
+        direction LR
+        SYNC["sync_catalog_before_uma\n+ 周期增量 run_catalog_sync"]
+        CAT[("Catalog\nby_condition_id\nmarket_to_condition")]
+        SYNC --> CAT
+    end
+
+    subgraph STORE["storage.rs"]
+        direction LR
         WAL["events.wal"]
         SNAP["catalog.bin"]
         CUR["enrichment.cursor\numa.cursor"]
     end
 
-    subgraph api["api.rs"]
-        WSAPI["/uma/v1/ws\n(watch 推送, after_sequence 续传)"]
+    subgraph API["api.rs · 对外接口"]
+        direction LR
+        WSAPI["/uma/v1/ws\nafter_sequence 续传"]
         HTTPAPI["/uma/v1/events\n/uma/v1/markets/:id\n/healthz /metrics"]
     end
 
-    WSS1 -->|eth_subscribe logs| LW0
-    WSS2 -->|eth_subscribe logs| LWN
-    HTTP -->|eth_getLogs 分批| BF
-
-    LW0 --> DEC
-    LWN --> DEC
+    WSS1 & WSSN -->|eth_subscribe logs| LW
+    HTTP -->|"eth_getLogs 分批"| BF
+    LW --> DEC
     BF --> DEC
+    DEC --> DEDUP
+    DEDUP -->|重复| DROP
 
-    GAPI --> SYNC --> CAT
+    GAPI --> SYNC
     SYNC -.->|落盘后才推进 cursor| SNAP
     SYNC -.-> CUR
-
-    DEC --> DEDUP
-    DEDUP -->|重复| DROP["丢弃 + duplicates 计数"]
-    DEDUP -->|新事件| RESOLVE
-    CAT -.->|O(1) 内存查询, 零网络请求| RESOLVE
-    RESOLVE --> ERING
-    ERING --> WAL
-    ERING --> BATCH
-    BATCH --> ENC --> FRING
-    FRING --> WSAPI
-    ERING --> HTTPAPI
+    CAT -.->|"O(1) 内存查询\n零网络请求"| RESOLVE
     CAT --> HTTPAPI
 
-    classDef hot fill:#2f7d6c22,stroke:#2f7d6c,stroke-width:2px;
-    class DEC,DEDUP,RESOLVE,ERING,BATCH,ENC,FRING hot;
+    ERING --> WAL
+    FRING --> WSAPI
+    ERING --> HTTPAPI
+
+    classDef src fill:#e9eef2,stroke:#7d8b96,color:#26313a;
+    classDef hot fill:#e4efe9,stroke:#2f7d6c,stroke-width:2px,color:#1c3a32;
+    classDef warm fill:#f5e9da,stroke:#a8632a,color:#4a3016;
+    classDef sink fill:#efe7f5,stroke:#7c5ba8,color:#33234a;
+    classDef void fill:#f0f0ee,stroke:#adaa9e,color:#6b6a5c,stroke-dasharray: 3 2;
+    class WSS1,WSSN,HTTP,GAPI,LW,BF,DEC src;
+    class DEDUP,RESOLVE,ERING,BATCH,ENC,FRING hot;
+    class SYNC,CAT,WAL,SNAP,CUR warm;
+    class WSAPI,HTTPAPI sink;
+    class DROP void;
+
+    classDef group fill:#ffffff,stroke:#c9c6b8,stroke-width:1px,color:#6b6a5c;
+    classDef hotgroup fill:#f3f8f6,stroke:#2f7d6c,stroke-width:1.5px,color:#2f7d6c;
+    class SRC,INGEST,ENRICH,STORE,API group;
+    class HOT hotgroup;
 ```
 
 阴影部分（`decode` → `EventHub` → `run_batcher` → `FrameHub`）是延迟敏感的
@@ -96,6 +105,14 @@ flowchart LR
 存，链上事件才开始进入热路径。
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {
+    "primaryColor": "#e9eef2", "primaryBorderColor": "#7d8b96", "primaryTextColor": "#26313a",
+    "actorBkg": "#e9eef2", "actorBorder": "#7d8b96", "actorTextColor": "#26313a",
+    "activationBkgColor": "#e4efe9", "activationBorderColor": "#2f7d6c",
+    "noteBkgColor": "#f5e9da", "noteBorderColor": "#a8632a", "noteTextColor": "#4a3016",
+    "lineColor": "#8a8878", "signalColor": "#33231a", "signalTextColor": "#1c1e1a",
+    "sequenceNumberColor": "#ffffff"
+}}}%%
 sequenceDiagram
     participant Main as main.rs
     participant Storage as storage.rs
@@ -123,28 +140,43 @@ sequenceDiagram
 ## 3. 部署拓扑
 
 ```mermaid
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 56}} }%%
 flowchart TD
-    subgraph mac["macOS (本机)"]
-        SRC["rust_uma 源码"]
+    subgraph MAC[" macOS（本机） "]
+        direction TB
+        CODE["rust_uma 源码"]
         BUILD["cargo build --release\n--target x86_64-unknown-linux-musl\n(musl-cross linker, 无 Docker)"]
         BIN["静态二进制 rust-uma\n(~7MB, stripped)"]
-        SRC --> BUILD --> BIN
+        CODE --> BUILD --> BIN
     end
 
-    subgraph server["43.131.1.194 (ubuntu, systemd)"]
-        SVC["rust-uma.service\nUser=ubuntu, ProtectSystem=strict"]
+    subgraph SERVER[" 43.131.1.194（ubuntu, systemd） "]
+        direction TB
         ENV["/etc/rust-uma/rust-uma.env\n(首次部署派生, 之后手改)"]
-        STATE[("/var/lib/rust-uma\ncatalog.bin / events.wal\nenrichment.cursor / uma.cursor")]
-        PORT["0.0.0.0:8011\n(云安全组放行 TCP:8000-8100)"]
-        SVC --> PORT
+        SVC["rust-uma.service\nUser=ubuntu · ProtectSystem=strict"]
+        STATE[("/var/lib/rust-uma\ncatalog.bin · events.wal\nenrichment.cursor · uma.cursor")]
+        PORT(["0.0.0.0:8011\n云安全组放行 TCP:8000-8100"])
         ENV -.-> SVC
         SVC <--> STATE
+        SVC --> PORT
     end
 
-    subgraph downstream["下游"]
+    subgraph DOWN[" 下游 "]
         BOT["下单 / 交易系统\nWSS 订阅 + after_sequence 续传"]
     end
 
-    BIN -- "deploy/deploy.sh\nscp + systemctl restart" --> SVC
-    PORT -->|"/uma/v1/ws\nProtobuf + Zstd"| BOT
+    BIN ==>|"deploy/deploy.sh\nscp + systemctl restart"| SVC
+    PORT ==>|"/uma/v1/ws\nProtobuf + Zstd"| BOT
+
+    classDef src fill:#e9eef2,stroke:#7d8b96,color:#26313a;
+    classDef hot fill:#e4efe9,stroke:#2f7d6c,stroke-width:2px,color:#1c3a32;
+    classDef warm fill:#f5e9da,stroke:#a8632a,color:#4a3016;
+    classDef sink fill:#efe7f5,stroke:#7c5ba8,color:#33234a;
+    class CODE,BUILD,BIN src;
+    class SVC,PORT hot;
+    class ENV,STATE warm;
+    class BOT sink;
+
+    classDef group fill:#ffffff,stroke:#c9c6b8,stroke-width:1px,color:#6b6a5c;
+    class MAC,SERVER,DOWN group;
 ```
