@@ -156,13 +156,14 @@ impl FrameHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::test_uma_event;
+    use crate::model::{PriceOutcome, test_uma_event};
 
     fn record(sequence: u64, tx: u8) -> Arc<EventRecord> {
         Arc::new(EventRecord {
             sequence,
             event: test_uma_event(tx, 1),
             enrichment: None,
+            price_outcome: PriceOutcome::Unspecified,
         })
     }
 

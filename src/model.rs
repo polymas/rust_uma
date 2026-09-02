@@ -41,6 +41,62 @@ impl EventKind {
     }
 }
 
+/// Which of a binary condition's two outcome tokens this event's on-chain
+/// price resolves to — see the doc comment on `UmaEvent.price_outcome` in
+/// `proto/uma.proto` for the derivation and why it's only meaningful for
+/// Propose events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriceOutcome {
+    Unspecified,
+    Token0,
+    Token1,
+    Tie,
+}
+
+impl PriceOutcome {
+    /// `proposed_price` must come from a ProposePrice event; a DisputePrice's
+    /// price is the value under dispute, not a fresh answer — callers must
+    /// pass `Unspecified` for dispute events rather than calling this.
+    pub fn from_propose_price(proposed_price: &[u8; 32]) -> Self {
+        let mut token0 = [0u8; 32];
+        token0[24..].copy_from_slice(&1_000_000_000_000_000_000u64.to_be_bytes());
+        let mut tie = [0u8; 32];
+        tie[24..].copy_from_slice(&500_000_000_000_000_000u64.to_be_bytes());
+        if proposed_price.iter().all(|byte| *byte == 0) {
+            Self::Token1
+        } else if proposed_price == &token0 {
+            Self::Token0
+        } else if proposed_price == &tie {
+            Self::Tie
+        } else {
+            // The adapter contract itself reverts any propose whose price
+            // isn't one of the three canonical values, so a successfully
+            // proposed price landing here would mean either a future/unknown
+            // adapter with different semantics, or a decode bug — either way,
+            // "no signal" is the only safe answer, not a guess.
+            Self::Unspecified
+        }
+    }
+
+    pub fn to_proto(self) -> i32 {
+        match self {
+            Self::Unspecified => pb::PriceOutcome::Unspecified as i32,
+            Self::Token0 => pb::PriceOutcome::Token0 as i32,
+            Self::Token1 => pb::PriceOutcome::Token1 as i32,
+            Self::Tie => pb::PriceOutcome::Tie as i32,
+        }
+    }
+
+    pub fn from_proto(value: i32) -> Self {
+        match pb::PriceOutcome::try_from(value).unwrap_or(pb::PriceOutcome::Unspecified) {
+            pb::PriceOutcome::Token0 => Self::Token0,
+            pb::PriceOutcome::Token1 => Self::Token1,
+            pb::PriceOutcome::Tie => Self::Tie,
+            pb::PriceOutcome::Unspecified => Self::Unspecified,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketEnrichment {
     pub market_id: u64,
@@ -61,6 +117,11 @@ pub struct EventRecord {
     pub sequence: u64,
     pub event: UmaEvent,
     pub enrichment: Option<Arc<MarketEnrichment>>,
+    /// Computed once at decode time (`PriceOutcome::from_propose_price` for
+    /// Propose, `Unspecified` for Dispute) and carried on the record rather
+    /// than re-derived from a raw price at serialize time, since the raw
+    /// price itself isn't part of this wire schema.
+    pub price_outcome: PriceOutcome,
 }
 
 impl EventRecord {
@@ -86,17 +147,10 @@ impl EventRecord {
     pub fn to_proto(&self) -> pb::UmaEvent {
         let enrichment = self.enrichment.as_deref();
         let chain = self.event.chain();
-        let request = self.event.request();
-        let ancillary = &request.ancillary;
         let condition_id = self.resolved_condition_id();
-        let (expiration_timestamp, currency) = match &self.event {
-            UmaEvent::ProposePrice(event) => (event.expiration_timestamp, event.currency.to_vec()),
-            UmaEvent::DisputePrice(_) => (0, Vec::new()),
-        };
         pb::UmaEvent {
             sequence: self.sequence,
             event_type: self.event.kind().to_proto(),
-            block_number: chain.block_number,
             transaction_hash: chain.transaction_hash.to_vec(),
             log_index: chain.log_index,
             market_id: self.event.market_id(),
@@ -105,48 +159,24 @@ impl EventRecord {
                 .map(|v| v.token_ids.iter().map(|id| id.to_vec()).collect())
                 .unwrap_or_default(),
             tag_ids: enrichment.map(|v| v.tag_ids.clone()).unwrap_or_default(),
-            price_raw: request.proposed_price.to_vec(),
-            requester: request.requester.to_vec(),
-            proposer: request.proposer.to_vec(),
-            disputer: self
-                .event
-                .disputer()
-                .map(|v| v.to_vec())
-                .unwrap_or_default(),
             upstream_received_at_us: chain.upstream_received_at_us,
-            block_hash: chain.block_hash.to_vec(),
             removed: chain.removed,
             enrichment_status: if enrichment.is_some() {
                 pb::EnrichmentStatus::Hit as i32
             } else {
                 pb::EnrichmentStatus::Miss as i32
             },
-            contract_address: chain.contract_address.to_vec(),
-            identifier: request.identifier.to_vec(),
-            request_timestamp: request.timestamp,
-            question_id: ancillary.question_id.to_vec(),
-            question: ancillary.question.clone(),
-            resolution_p1: ancillary.resolution.p1.clone().unwrap_or_default(),
-            resolution_p2: ancillary.resolution.p2.clone().unwrap_or_default(),
-            resolution_p3: ancillary.resolution.p3.clone().unwrap_or_default(),
-            resolution_p4: ancillary.resolution.p4.clone().unwrap_or_default(),
-            initializer: ancillary
-                .initializer
-                .map(|v| v.to_vec())
-                .unwrap_or_default(),
-            expiration_timestamp,
-            currency,
-            transaction_index: chain.transaction_index,
+            price_outcome: self.price_outcome.to_proto(),
         }
     }
 
+    /// Reconstructs a record from a persisted/wire `pb::UmaEvent`. Fields
+    /// retired from the wire schema (see `proto/uma.proto`) aren't
+    /// recoverable here — this only backs `EventHub` replay (dedup key,
+    /// re-broadcast), which never reads them; it doesn't reconstruct the rich
+    /// on-chain view that only exists transiently during live decode.
     pub fn from_proto(value: pb::UmaEvent) -> Option<Self> {
-        let condition_id = fixed::<32>(&value.condition_id).unwrap_or_else(|| {
-            crate::uma::events::derive_binary_condition_id(
-                &fixed::<20>(&value.requester).unwrap_or_default(),
-                &fixed::<32>(&value.question_id).unwrap_or_default(),
-            )
-        });
+        let condition_id = fixed::<32>(&value.condition_id)?;
         let enrichment = (value.enrichment_status == pb::EnrichmentStatus::Hit as i32).then(|| {
             Arc::new(MarketEnrichment {
                 market_id: value.market_id,
@@ -161,62 +191,50 @@ impl EventRecord {
         });
         let kind = EventKind::from_proto(value.event_type)?;
         let chain = ChainLog {
-            contract_address: fixed::<20>(&value.contract_address)?,
-            block_number: value.block_number,
-            block_hash: fixed::<32>(&value.block_hash)?,
+            contract_address: [0; 20],
+            block_number: 0,
+            block_hash: [0; 32],
             transaction_hash: fixed::<32>(&value.transaction_hash)?,
-            transaction_index: value.transaction_index,
+            transaction_index: None,
             log_index: value.log_index,
             upstream_received_at_us: value.upstream_received_at_us,
             removed: value.removed,
         };
         let request = PriceRequest {
-            requester: fixed::<20>(&value.requester)?,
-            proposer: fixed::<20>(&value.proposer)?,
+            requester: [0; 20],
+            proposer: [0; 20],
             condition_id,
-            identifier: fixed::<32>(&value.identifier)?,
-            timestamp: value.request_timestamp,
+            identifier: [0; 32],
+            timestamp: 0,
             ancillary: PolymarketAncillary {
-                question_id: fixed::<32>(&value.question_id)?,
-                question: value.question,
-                resolution: ResolutionValues {
-                    p1: nonempty(value.resolution_p1),
-                    p2: nonempty(value.resolution_p2),
-                    p3: nonempty(value.resolution_p3),
-                    p4: nonempty(value.resolution_p4),
-                },
-                initializer: if value.initializer.is_empty() {
-                    None
-                } else {
-                    fixed::<20>(&value.initializer)
-                },
+                question_id: [0; 32],
+                question: String::new(),
+                resolution: ResolutionValues::default(),
+                initializer: None,
                 market_id: (value.market_id != 0).then_some(value.market_id),
             },
-            proposed_price: fixed::<32>(&value.price_raw)?,
+            proposed_price: [0; 32],
         };
         let event = match kind {
             EventKind::Propose => UmaEvent::ProposePrice(ProposePrice {
                 chain,
                 request,
-                expiration_timestamp: value.expiration_timestamp,
-                currency: fixed::<20>(&value.currency)?,
+                expiration_timestamp: 0,
+                currency: [0; 20],
             }),
             EventKind::Dispute => UmaEvent::DisputePrice(DisputePrice {
                 chain,
                 request,
-                disputer: fixed::<20>(&value.disputer)?,
+                disputer: [0; 20],
             }),
         };
         Some(Self {
             sequence: value.sequence,
             event,
             enrichment,
+            price_outcome: PriceOutcome::from_proto(value.price_outcome),
         })
     }
-}
-
-fn nonempty(value: String) -> Option<String> {
-    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(test)]
@@ -289,7 +307,7 @@ pub fn uint256_decimal(value: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventRecord, MarketEnrichment, pb, test_uma_event, uint256_decimal};
+    use super::{EventRecord, MarketEnrichment, PriceOutcome, pb, test_uma_event, uint256_decimal};
 
     #[test]
     fn formats_uint256_decimal() {
@@ -299,15 +317,54 @@ mod tests {
     }
 
     #[test]
-    fn complete_business_event_round_trips_through_protobuf() {
+    fn price_outcome_matches_the_ctf_adapters_payout_convention() {
+        // UmaCtfAdapter.sol::_constructPayouts, verified against the deployed
+        // source on Polygon (both the standard and the "Neg Risk" requester
+        // addresses run this exact contract): "Payouts: [YES, NO]" —
+        // price==1e18 -> payouts[0] -> token_ids[0]; price==0 -> payouts[1]
+        // -> token_ids[1]; price==0.5e18 is a tie, no token wins.
+        let mut yes = [0u8; 32];
+        yes[24..].copy_from_slice(&1_000_000_000_000_000_000u64.to_be_bytes());
+        let mut tie = [0u8; 32];
+        tie[24..].copy_from_slice(&500_000_000_000_000_000u64.to_be_bytes());
+        let no = [0u8; 32];
+        let neither_canonical = [7u8; 32];
+
+        assert_eq!(PriceOutcome::from_propose_price(&yes), PriceOutcome::Token0);
+        assert_eq!(PriceOutcome::from_propose_price(&no), PriceOutcome::Token1);
+        assert_eq!(PriceOutcome::from_propose_price(&tie), PriceOutcome::Tie);
+        assert_eq!(
+            PriceOutcome::from_propose_price(&neither_canonical),
+            PriceOutcome::Unspecified
+        );
+    }
+
+    #[test]
+    fn wire_fields_round_trip_through_protobuf() {
+        // Only asserts on what's actually part of the wire schema — most
+        // on-chain fields (block metadata, participant addresses, ancillary
+        // text, ...) are intentionally not on the wire (see proto/uma.proto)
+        // and `from_proto` fills them with placeholders, so a full
+        // `decoded.event == record.event` equality no longer holds.
         let record = EventRecord {
             sequence: 7,
             event: test_uma_event(2, 42),
             enrichment: None,
+            price_outcome: PriceOutcome::Token0,
         };
         let decoded = EventRecord::from_proto(record.to_proto()).unwrap();
         assert_eq!(decoded.sequence, 7);
-        assert_eq!(decoded.event, record.event);
+        assert_eq!(decoded.event.kind(), record.event.kind());
+        assert_eq!(
+            decoded.event.chain().transaction_hash,
+            record.event.chain().transaction_hash
+        );
+        assert_eq!(
+            decoded.event.chain().log_index,
+            record.event.chain().log_index
+        );
+        assert_eq!(decoded.event.market_id(), record.event.market_id());
+        assert_eq!(decoded.price_outcome, PriceOutcome::Token0);
     }
 
     /// End-to-end proof, using the real Neg Risk event captured on Polygon
@@ -360,11 +417,13 @@ mod tests {
         }]);
         let enrichment =
             catalog.resolve(event.request().ancillary.market_id, &derived_condition_id);
+        let price_outcome = PriceOutcome::from_propose_price(&event.request().proposed_price);
 
         let record = EventRecord {
             sequence: 1,
             event,
             enrichment,
+            price_outcome,
         };
         assert_eq!(record.resolved_condition_id(), gamma_condition_id);
 
@@ -372,5 +431,8 @@ mod tests {
         assert_eq!(proto.condition_id, gamma_condition_id.to_vec());
         assert_eq!(proto.enrichment_status, pb::EnrichmentStatus::Hit as i32);
         assert_eq!(proto.token_ids, vec![[0x22; 32].to_vec()]);
+        // Real captured price for this tx was 0 (word 3 of the log data is
+        // all zeros) -> per UmaCtfAdapter's payout convention that's token_ids[1].
+        assert_eq!(proto.price_outcome, pb::PriceOutcome::Token1 as i32);
     }
 }

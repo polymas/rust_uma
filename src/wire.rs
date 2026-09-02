@@ -97,13 +97,14 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::model::{EventRecord, test_uma_event};
+    use crate::model::{EventRecord, PriceOutcome, test_uma_event};
 
     fn event(sequence: u64) -> Arc<EventRecord> {
         Arc::new(EventRecord {
             sequence,
             event: test_uma_event(2, 4),
             enrichment: None,
+            price_outcome: PriceOutcome::Unspecified,
         })
     }
 
@@ -123,8 +124,7 @@ mod tests {
         let batch = pb::UmaBatch::decode(&frame.bytes[HEADER_LEN..]).unwrap();
         assert_eq!(batch.batch_sequence, 7);
         assert_eq!(batch.events[0].sequence, 11);
-        assert_eq!(batch.events[0].question, "test question");
-        assert_eq!(batch.events[0].expiration_timestamp, 12);
+        assert_eq!(batch.events[0].market_id, 4);
     }
 
     #[test]

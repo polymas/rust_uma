@@ -28,11 +28,14 @@ Protobuf 路径，避免两套格式并存。其实时热路径仅执行以下�
 `condition_id` 查询。Gamma HTTP 请求、目录快照、文件系统 I/O、JSON 格式化和历
 史回补，均不会在实时 WebSocket 读取流程中同步执行。
 
-`ProposePrice` 和 `DisputePrice` 分别由独立业务解析器处理。输出通过组合结构共享链上
-日志元数据和价格请求字段。`ancillaryData` 不以原始字节数组发布，而是解析为
-`question_id`、`question`、`resolution_p1` 至 `resolution_p4`、`initializer` 和可选
-`market_id`；其中 `question_id` 为原始 ancillary bytes 的 Keccak-256。`condition_id`
-在解析阶段也会按标准二元 Adapter 公式
+`ProposePrice` 和 `DisputePrice` 分别由独立业务解析器处理，内部解析出完整的链上
+字段（区块元数据、参与方地址、`ancillaryData` 解出的 `question_id`/`question`/
+`resolution_p1..p4`/`initializer`/可选 `market_id` 等）。但这些字段绝大多数**不会
+出现在对外的 wire schema 里**——凡是能通过 `transaction_hash` 反查到（链上原始
+日志、Gamma API）的信息，一律不重复广播，只发下单决策直接需要、且无法/不该
+反查的字段。具体删减范围和理由见 `proto/uma.proto` 里 `UmaEvent` 的注释。
+
+`condition_id` 在解析阶段会按标准二元 Adapter 公式
 `keccak256(requester || question_id || uint256(2))` 推导一份，但这个公式仅对标准
 UmaCtfAdapter 成立（对 Neg Risk 等非标准 Adapter 会得到错误值），因此对外广播的
 `condition_id` 以 `market_id` 命中 Gamma 缓存后的权威值为准，链上推导值只在
@@ -50,6 +53,28 @@ UmaCtfAdapter 成立（对 Neg Risk 等非标准 Adapter 会得到错误值）�
 Tag ID 使用 Polymarket 官方数字 ID。每条市场记录中不重复保存 label 和 slug。
 不存储或发布 `outcomes`、`outcome_prices` 和 `tick_size`。动态 CLOB 状态不属于
 本服务范围。
+
+## price_outcome：该买哪个 token
+
+`UmaEvent.price_outcome` 直接给出这条事件的链上价格对应 `token_ids` 里的哪一个，
+不需要下游解析任何文字或自己记协议规则：
+
+- `PRICE_OUTCOME_TOKEN0`：买 `token_ids[0]`
+- `PRICE_OUTCOME_TOKEN1`：买 `token_ids[1]`
+- `PRICE_OUTCOME_TIE`：平局/无法判定（对应链上 price=0.5e18），不应有明确买卖动作
+- `PRICE_OUTCOME_UNSPECIFIED`：无信号——**所有 `event_type=dispute` 的事件恒为此值**
+
+推导依据是 `UmaCtfAdapter.sol::_constructPayouts` 的真实已验证合约逻辑
+（`// Payouts: [YES, NO]`）：price==1e18 时 `payouts[0]=1`，price==0 时
+`payouts[1]=1`——这是协议级不变量，跟这个市场的问题内容、`outcomes` 标签叫
+"Yes/No" 还是"Over/Under"完全无关，两种 Adapter（标准 UmaCtfAdapter 与文档里
+俗称"Neg Risk"的那个 requester，链上实测跑的是同一份合约代码）遵循同一套规则。
+
+**关键约束：`price_outcome` 只在 `event_type=propose` 时代表新答案。**
+`DisputePrice` 事件里被 dispute 掉的价格是"正在被挑战的值"，不是新的裁决结果，
+所以永远编码成 `PRICE_OUTCOME_UNSPECIFIED`；下游看到某个 `condition_id` 上来了
+一条 `dispute` 事件，就应该知道"之前那条 propose 事件给出的方向现在存疑"，而不
+是尝试从这条 dispute 事件本身再算出一个新的买入目标。
 
 ## WebSocket
 
@@ -125,9 +150,13 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 
 - 分配内存前，校验固定消息头、schema 版本、声明的未压缩大小，以及配置的最大
   解压大小。
-- 将 32 字节标识符和 20 字节地址视为不透明字节序列。
-- 将 `price_raw` 视为有符号二进制补码 `int256`。
-- 保持 token 顺序，但不要推断 Yes/No 含义；本契约不包含 outcomes。
+- 将 32 字节标识符视为不透明字节序列。
+- 用 `price_outcome` 判断该买 `token_ids` 里的哪一个，不要自己解析文字或重新
+  实现价格→outcome 的映射（见上一节）；只在 `event_type=propose` 时把它当作
+  新答案。
+- 需要区块号、参与方地址、市场问题原文这类已从 wire 移除的字段时，用
+  `transaction_hash`（+ `log_index`）反查链上日志或 Gamma API，不要假设这个
+  服务会补发。
 - 对至少一次投递进行去重，并使用指数退避策略重连。
 
 ## 健康与验证指标

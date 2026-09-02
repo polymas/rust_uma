@@ -114,7 +114,6 @@
   table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
   th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px dashed var(--border); }
   th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
-  td.q { white-space: normal; min-width: 260px; color: var(--dim); }
   td.mono { font-variant-numeric: tabular-nums; }
 </style>
 </head>
@@ -133,12 +132,12 @@
       <thead>
         <tr>
           <th>序号</th><th>收到于</th><th>端到端延迟</th><th>类型</th><th>方向</th>
-          <th>Market ID</th><th>Condition ID</th><th>Token IDs</th>
-          <th>Tags</th><th>富化</th><th>问题</th>
+          <th>Market ID</th><th>Condition ID</th><th>Token IDs（粗体=方向指向）</th>
+          <th>Tags</th><th>富化</th>
         </tr>
       </thead>
       <tbody id="eventsBody">
-        <tr><td colspan="11" style="color:var(--dim)">等待新事件…</td></tr>
+        <tr><td colspan="10" style="color:var(--dim)">等待新事件…</td></tr>
       </tbody>
     </table>
   </div>
@@ -189,10 +188,13 @@ function toHex(bytes) {
   for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, "0");
   return s;
 }
-function textDecode(bytes) { return new TextDecoder().decode(bytes); }
 
 const EVENT_TYPE = { 0: "unspecified", 1: "propose", 2: "dispute" };
 const ENRICHMENT_STATUS = { 0: "unspecified", 1: "hit", 2: "miss" };
+// PRICE_OUTCOME_TOKEN0/1 map straight to token_ids[0]/[1] — see
+// proto/uma.proto's UmaEvent.price_outcome doc comment for the derivation
+// (UmaCtfAdapter.sol's payout formula) and why dispute events never carry one.
+const PRICE_OUTCOME = { 0: "unspecified", 1: "token0", 2: "token1", 3: "tie" };
 
 function decodeUmaEvent(buf) {
   const f = decodeFields(buf);
@@ -200,7 +202,6 @@ function decodeUmaEvent(buf) {
   const val = (n, d) => (one(n) ? one(n).val : d);
   const bytes = (n) => (one(n) ? one(n).bytes : new Uint8Array(0));
   const hex = (n) => toHex(bytes(n));
-  const str = (n) => (one(n) ? textDecode(one(n).bytes) : "");
   const repeatedBytes = (n) => (f[n] || []).map((e) => toHex(e.bytes));
   // proto3 packs repeated scalar numeric fields by default (tag_ids here) —
   // prost sends one length-delimited entry containing back-to-back varints,
@@ -221,21 +222,16 @@ function decodeUmaEvent(buf) {
   return {
     sequence: val(1, 0),
     event_type: EVENT_TYPE[val(2, 0)] || "unspecified",
-    block_number: val(3, 0),
     transaction_hash: hex(4),
     log_index: val(5, 0),
     market_id: val(6, 0),
     condition_id: hex(7),
     token_ids: repeatedBytes(8),
     tag_ids: repeatedVal(9),
-    price_raw: hex(10),
-    requester: hex(11),
-    proposer: hex(12),
-    disputer: bytes(13).length ? hex(13) : null,
     upstream_received_at_us: val(14, 0),
     removed: !!val(16, 0),
     enrichment_status: ENRICHMENT_STATUS[val(17, 0)] || "unspecified",
-    question: str(22),
+    price_outcome: PRICE_OUTCOME[val(31, 0)] || "unspecified",
   };
 }
 function decodeUmaBatch(buf) {
@@ -290,29 +286,11 @@ function rate(curr, key, seconds) {
   return d > 0 ? d / seconds : 0;
 }
 
-function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + "…" : (s || ""); }
 function short(hex) { return hex && hex.length > 14 ? hex.slice(0, 8) + "…" + hex.slice(-6) : hex; }
 function fmtDuration(us) {
   if (us < 1000) return us.toFixed(0) + "µs";
   if (us < 1_000_000) return (us / 1000).toFixed(1) + "ms";
   return (us / 1_000_000).toFixed(2) + "s";
-}
-// UMA binary markets propose 0 (NO), 1e18 (YES) or 0.5e18 (50/50 — an early
-// or unresolvable request); anything else is a non-binary/custom price, shown
-// as its raw 1e18-scaled decimal instead of guessing a label.
-const PRICE_YES = 10n ** 18n;
-const PRICE_5050 = 5n * 10n ** 17n;
-function priceDirection(priceRawHex) {
-  let value;
-  try {
-    value = BigInt(priceRawHex);
-  } catch {
-    return "?";
-  }
-  if (value === 0n) return "NO";
-  if (value === PRICE_YES) return "YES";
-  if (value === PRICE_5050) return "50/50";
-  return (Number(value) / 1e18).toString();
 }
 
 const events = []; // newest-first, capped
@@ -328,13 +306,18 @@ timeToggle.addEventListener("click", () => {
   renderEvents();
 });
 
+const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50", unspecified: "—" };
+
 function renderEvents() {
   if (!events.length) return;
   const fmtTime = useAbsoluteTime ? fmtAbsolute : fmtAgo;
   eventsBody.innerHTML = events.map(ev => {
     const latencyUs = ev.received_at_client_us - ev.upstream_received_at_us;
     const latency = useAbsoluteTime ? fmtAbsolute(ev.received_at_client_us) : fmtDuration(latencyUs);
-    const tokenIds = (ev.token_ids || []).map(short).join("<br>") || "—";
+    const winnerIdx = ev.price_outcome === "token0" ? 0 : ev.price_outcome === "token1" ? 1 : -1;
+    const tokenIds = (ev.token_ids || []).map((id, i) =>
+      i === winnerIdx ? `<b>${short(id)}</b>` : short(id)
+    ).join("<br>") || "—";
     const tags = (ev.tag_ids || []).join(", ") || "—";
     return `
     <tr>
@@ -342,13 +325,12 @@ function renderEvents() {
       <td class="mono">${fmtTime(ev.upstream_received_at_us)}</td>
       <td class="mono" title="端到端：从上游收到日志到这个浏览器收到 WSS 帧，含服务器处理和网络传输">${latency}</td>
       <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${ev.event_type}</td>
-      <td>${priceDirection(ev.price_raw)}</td>
+      <td>${OUTCOME_LABEL[ev.price_outcome] || "—"}</td>
       <td>${ev.market_id}</td>
       <td title="${ev.condition_id}">${short(ev.condition_id)}</td>
       <td title="${(ev.token_ids || []).join(', ')}">${tokenIds}</td>
       <td>${tags}</td>
       <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ev.enrichment_status}</td>
-      <td class="q" title="${(ev.question || '').replace(/"/g, '&quot;')}">${truncate(ev.question, 90)}</td>
     </tr>
   `;
   }).join("");

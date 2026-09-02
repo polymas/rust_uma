@@ -10,7 +10,7 @@ use crate::{
     config::Config,
     enrichment::Catalog,
     hub::{EventHub, FrameHub},
-    model::{EventKey, EventRecord, hex_prefixed},
+    model::{EventKey, EventKind, EventRecord, PriceOutcome, hex_prefixed},
     stats::Stats,
     storage::StorageCommand,
     uma::events::{RpcLog, decode_signal_log},
@@ -127,10 +127,20 @@ impl Processor {
         );
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let block_number = decoded.chain().block_number;
+        // A DisputePrice's price is the value under dispute, not a fresh
+        // answer — only a Propose's own price is a real signal (see
+        // proto/uma.proto's UmaEvent.price_outcome doc comment).
+        let price_outcome = match decoded.kind() {
+            EventKind::Propose => {
+                PriceOutcome::from_propose_price(&decoded.request().proposed_price)
+            }
+            EventKind::Dispute => PriceOutcome::Unspecified,
+        };
         let record = Arc::new(EventRecord {
             sequence,
             event: decoded,
             enrichment,
+            price_outcome,
         });
         if !self.events.insert(record.clone()) {
             Stats::increment(&self.stats.duplicates);
