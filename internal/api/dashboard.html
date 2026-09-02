@@ -311,16 +311,37 @@ const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50"
 // Polymarket tag id -> label. 纯客户端浏览器直接拉 Polymarket 自己的公开
 // Gamma API（不经过本服务端，本服务端不做任何 tag 映射相关的事）。
 //
-// `GET /tags?limit=...` 这个批量接口实测不可靠：不管传多大的 limit/ids，
-// 它都只返回同一批固定的~100条"精选"标签，像 id=2（Politics）这种真实市场
-// 常见的 tag 根本不在里面——批量拉全量、启动时缓存一份的思路在这个接口上
-// 行不通。能查到任意 id 的只有单个查询 `GET /tags/{id}`（例如 `/tags/2` ->
-// {"label":"Politics",...}），所以改成按事件里实际出现的 id 懒加载 + 缓存：
-// 第一次见到某个 id 才查一次，查到后写进 tagLabels 永久复用，查不到（404 或
-// 网络失败）就记入 tagFetchFailed，同样不再重试，避免同一个坏 id 反复打请求。
+// `GET /tags` 单页固定最多 100 条，但 `offset` 分页是真实有效的——实测目前
+// 全量约 7300+ 条、还在持续增加，翻到底需要约 73 次请求。页面加载时后台翻
+// 全量分页填充 tagLabels，每翻完一页就重渲染一次，新事件不用等全量翻完就能
+// 陆续显示名字。`ensureTagLabel` 是兜底：翻页快照是加载那一刻的全量，之后
+// 新建的 tag（用户说了"还在增加"）翻页里不会有，事件表渲染时按需单独查
+// `GET /tags/{id}` 补一次，查到写入缓存，查不到（404/网络失败）记入
+// tagFetchFailed 不再重试。
 const tagLabels = {};
 const tagFetchInflight = new Set();
 const tagFetchFailed = new Set();
+
+async function loadAllTagLabels() {
+  const pageSize = 100;
+  for (let offset = 0; ; offset += pageSize) {
+    let page;
+    try {
+      const res = await fetch(`https://gamma-api.polymarket.com/tags?limit=${pageSize}&offset=${offset}`, { cache: "no-store" });
+      if (!res.ok) break;
+      page = await res.json();
+    } catch (e) {
+      console.error("tag page fetch failed", e);
+      break;
+    }
+    if (!Array.isArray(page) || page.length === 0) break;
+    for (const tag of page) tagLabels[tag.id] = tag.label;
+    renderEvents();
+    if (page.length < pageSize) break; // last page
+  }
+}
+loadAllTagLabels();
+
 async function ensureTagLabel(id) {
   if (id in tagLabels || tagFetchInflight.has(id) || tagFetchFailed.has(id)) return;
   tagFetchInflight.add(id);
