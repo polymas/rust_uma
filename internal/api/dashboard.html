@@ -68,12 +68,48 @@
   .v.ok { color: var(--ok); }
   .v.warn { color: var(--warn); }
   .v.bad { color: var(--bad); }
+  .events-card {
+    margin-top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .events-card h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--dim);
+    margin: 0 0 10px;
+  }
+  .tablewrap { overflow-x: auto; max-height: 480px; overflow-y: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px dashed var(--border); }
+  th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  td.q { white-space: normal; min-width: 260px; color: var(--dim); }
 </style>
 </head>
 <body>
 <h1>rust-uma 运行监控</h1>
 <div id="meta">加载中…</div>
 <div class="grid" id="grid"></div>
+
+<div class="events-card">
+  <h2>实时推送（WSS /uma/v1/ws 下发的事件，从打开面板起开始记录）</h2>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>序号</th><th>收到于</th><th>类型</th><th>Market ID</th>
+          <th>Condition ID</th><th>富化</th><th>问题</th>
+        </tr>
+      </thead>
+      <tbody id="eventsBody">
+        <tr><td colspan="7" style="color:var(--dim)">等待新事件…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
 
 <script>
 const params = new URLSearchParams(location.search);
@@ -102,6 +138,46 @@ function rate(curr, key, seconds) {
   if (!prev) return 0;
   const d = curr[key] - prev[key];
   return d > 0 ? d / seconds : 0;
+}
+
+function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + "…" : (s || ""); }
+function short(hex) { return hex && hex.length > 14 ? hex.slice(0, 8) + "…" + hex.slice(-6) : hex; }
+
+let lastEventSeq = null; // seeded from the first dashboard-data sample
+const events = []; // newest-first, capped
+const MAX_EVENTS = 60;
+const eventsBody = document.getElementById("eventsBody");
+
+function renderEvents() {
+  if (!events.length) return;
+  eventsBody.innerHTML = events.map(ev => `
+    <tr>
+      <td>#${ev.sequence}</td>
+      <td>${fmtAgo(ev.upstream_received_at_us)}</td>
+      <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${ev.event_type}</td>
+      <td>${ev.market_id}</td>
+      <td title="${ev.condition_id}">${short(ev.condition_id)}</td>
+      <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ev.enrichment_status}</td>
+      <td class="q" title="${(ev.question || '').replace(/"/g, '&quot;')}">${truncate(ev.question, 90)}</td>
+    </tr>
+  `).join("");
+}
+
+async function fetchNewEvents() {
+  if (lastEventSeq === null) return;
+  try {
+    const res = await fetch(`/uma/v1/events?after_sequence=${lastEventSeq}&limit=50`, { cache: "no-store" });
+    if (!res.ok) return;
+    const payload = await res.json();
+    if (payload.data && payload.data.length) {
+      for (const ev of payload.data) events.unshift(ev);
+      events.length = Math.min(events.length, MAX_EVENTS);
+      lastEventSeq = payload.latest_sequence;
+      renderEvents();
+    }
+  } catch (e) {
+    // transient — next tick retries
+  }
 }
 
 function card(title, dotClass, rows) {
@@ -185,6 +261,9 @@ async function tick() {
     ["累计下发字节", fmtBytes(data.ws_bytes_sent_total)],
     ["累计下发帧数", data.ws_frames_sent_total],
   ]));
+
+  if (lastEventSeq === null) lastEventSeq = data.event_ring_latest_sequence;
+  await fetchNewEvents();
 
   prev = data;
   prevAt = now;
