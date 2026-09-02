@@ -236,7 +236,14 @@ brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
   `catalog_reconcile_gaps_closed_total` 长期趋势（应该趋向 0，非零说明还在
   查漏补缺）；`decode_errors_total` 涨得快是正常的——UMA 的
   `ProposePrice`/`DisputePrice` topic 是全 Polygon 共用的，非 Polymarket 的
-  UMA 请求也会先收到再按 emitter 白名单过滤掉，这部分误差不代表故障。
+  UMA 请求也会先收到，解析/富化阶段自然过滤掉，这部分误差不代表故障（emitter
+  白名单默认关闭，见上）。
+- 每一条富化 miss 都会在默认日志级别打一条 `WARN enrichment miss: broadcasting
+  without token_ids/tag_ids`（`pipeline.rs`），带 `market_id`/
+  `derived_condition_id`/`requester`/`tx`/`block`，不需要开 `RUST_LOG=debug`
+  就能看到：`sudo journalctl -u rust-uma.service -f | grep "enrichment miss"`。
+  这是排查"为什么这条事件没富化"的第一手数据源，比事后翻 `/uma/v1/events`
+  更直接——后者查的是当前 Catalog 状态，不是事件处理那一刻的状态。
 
 ## 5. 升级
 

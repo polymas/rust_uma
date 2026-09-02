@@ -4,13 +4,13 @@ use std::sync::{
 };
 
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     config::Config,
     enrichment::Catalog,
     hub::{EventHub, FrameHub},
-    model::{EventKey, EventRecord},
+    model::{EventKey, EventRecord, hex_prefixed},
     stats::Stats,
     storage::StorageCommand,
     uma::events::{RpcLog, decode_signal_log},
@@ -97,6 +97,26 @@ impl Processor {
             }
         } else {
             Stats::increment(&self.stats.enrichment_misses);
+            // At `warn!` (not `debug!`) deliberately: every miss is a real
+            // event broadcast downstream with empty enrichment, right now,
+            // permanently — this must be visible in production logs at the
+            // default log level, not only when someone happens to be running
+            // with RUST_LOG=debug. Carries enough to investigate without a
+            // follow-up query: market_id (or its absence — a different root
+            // cause than "market_id present but uncached"), the derived
+            // condition_id (what a standard-adapter lookup would have used),
+            // requester (which Adapter this is — helps spot Neg Risk/unknown
+            // adapter patterns), and the tx/block to cross-reference on-chain.
+            warn!(
+                tx = %raw.transaction_hash,
+                block = decoded.chain().block_number,
+                kind = ?decoded.kind(),
+                market_id = ?market_id,
+                derived_condition_id = %hex_prefixed(&decoded.request().condition_id),
+                requester = %hex_prefixed(&decoded.request().requester),
+                source,
+                "enrichment miss: broadcasting without token_ids/tag_ids"
+            );
         }
         debug!(
             source,
