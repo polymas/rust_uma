@@ -313,7 +313,7 @@ function renderEvents() {
   const fmtTime = useAbsoluteTime ? fmtAbsolute : fmtAgo;
   eventsBody.innerHTML = events.map(ev => {
     const latencyUs = ev.received_at_client_us - ev.upstream_received_at_us;
-    const latency = useAbsoluteTime ? fmtAbsolute(ev.received_at_client_us) : fmtDuration(latencyUs);
+    const latency = fmtDuration(latencyUs); // always a duration — absolute/relative toggle only affects "收到于"
     const winnerIdx = ev.price_outcome === "token0" ? 0 : ev.price_outcome === "token1" ? 1 : -1;
     const tokenIds = (ev.token_ids || []).map((id, i) =>
       i === winnerIdx ? `<b>${short(id)}</b>` : short(id)
