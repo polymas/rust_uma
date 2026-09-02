@@ -3,6 +3,8 @@
 开发、测试、提交、部署、升级的完整规范在 [docs/WORKFLOW.md](docs/WORKFLOW.md)，
 改代码或部署前先读那份文档，尤其是"热路径铁律"一节——本项目唯一的核心目标是
 链上事件到下游广播的延迟最小化，任何改动先确认没有在热路径上引入同步网络请求。
+结构性的问题（数据怎么流、启动顺序、部署拓扑）先看
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 的 Mermaid 图。
 
 关键约定速记（细节以 WORKFLOW.md 为准）：
 
