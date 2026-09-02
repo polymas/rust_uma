@@ -87,6 +87,7 @@ ssh "${REMOTE}" "sudo systemctl enable --now ${SERVICE} >/dev/null 2>&1; sudo sy
 echo "==> waiting for health check (initial Gamma catalog sync can take a while on a cold data dir)"
 HEALTHY=""
 for i in $(seq 1 60); do
+  echo "    attempt ${i}/60..."
   if ssh "${REMOTE}" "curl -fsS http://127.0.0.1:8011/healthz" > /tmp/rust_uma_health.json 2>/dev/null; then
     HEALTHY=1
     break
