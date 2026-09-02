@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -33,6 +34,9 @@ pub struct AppState {
     pub frames: Arc<FrameHub>,
     pub catalog: Arc<Catalog>,
     pub stats: Arc<Stats>,
+    /// Polymarket tag id -> label, loaded once at startup — see
+    /// `enrichment::load_tag_labels`. Display-only.
+    pub tag_labels: Arc<HashMap<u32, String>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -43,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         .route("/uma/v1/ws", get(websocket))
         .route("/dashboard", get(dashboard_page))
         .route("/uma/v1/dashboard-data", get(dashboard_data))
+        .route("/uma/v1/tags", get(tags))
         .with_state(state)
 }
 
@@ -309,6 +314,17 @@ async fn dashboard_data(
         event_ring_oldest_sequence: oldest,
         event_ring_latest_sequence: latest,
     }))
+}
+
+/// Tag id -> label, for the dashboard's event table to render human-readable
+/// tag names instead of raw ids. Gated the same as `dashboard_data` since
+/// it's dashboard-only, not a general public API.
+async fn tags(
+    State(state): State<AppState>,
+    Query(query): Query<DashboardQuery>,
+) -> Result<Json<HashMap<u32, String>>, ApiError> {
+    check_dashboard_token(&state, query.token.as_deref())?;
+    Ok(Json(state.tag_labels.as_ref().clone()))
 }
 
 async fn llms() -> Response {
