@@ -4,8 +4,7 @@ use serde::Serialize;
 
 use crate::{
     uma::events::common::{
-        ChainLog, DisputePrice, PolymarketAncillary, PriceRequest, ProposePrice, ResolutionValues,
-        UmaEvent,
+        ChainLog, DisputePrice, PolymarketAncillary, PriceRequest, ProposePrice, UmaEvent,
     },
     wire::pb,
 };
@@ -191,42 +190,24 @@ impl EventRecord {
         });
         let kind = EventKind::from_proto(value.event_type)?;
         let chain = ChainLog {
-            contract_address: [0; 20],
             block_number: 0,
-            block_hash: [0; 32],
             transaction_hash: fixed::<32>(&value.transaction_hash)?,
-            transaction_index: None,
             log_index: value.log_index,
             upstream_received_at_us: value.upstream_received_at_us,
             removed: value.removed,
         };
         let request = PriceRequest {
             requester: [0; 20],
-            proposer: [0; 20],
             condition_id,
-            identifier: [0; 32],
-            timestamp: 0,
             ancillary: PolymarketAncillary {
                 question_id: [0; 32],
-                question: String::new(),
-                resolution: ResolutionValues::default(),
-                initializer: None,
                 market_id: (value.market_id != 0).then_some(value.market_id),
             },
             proposed_price: [0; 32],
         };
         let event = match kind {
-            EventKind::Propose => UmaEvent::ProposePrice(ProposePrice {
-                chain,
-                request,
-                expiration_timestamp: 0,
-                currency: [0; 20],
-            }),
-            EventKind::Dispute => UmaEvent::DisputePrice(DisputePrice {
-                chain,
-                request,
-                disputer: [0; 20],
-            }),
+            EventKind::Propose => UmaEvent::ProposePrice(ProposePrice { chain, request }),
+            EventKind::Dispute => UmaEvent::DisputePrice(DisputePrice { chain, request }),
         };
         Some(Self {
             sequence: value.sequence,
@@ -241,37 +222,21 @@ impl EventRecord {
 pub(crate) fn test_uma_event(transaction_byte: u8, market_id: u64) -> UmaEvent {
     UmaEvent::ProposePrice(ProposePrice {
         chain: ChainLog {
-            contract_address: [9; 20],
             block_number: 10,
-            block_hash: [1; 32],
             transaction_hash: [transaction_byte; 32],
-            transaction_index: Some(2),
             log_index: 3,
             upstream_received_at_us: 8,
             removed: false,
         },
         request: PriceRequest {
             requester: [6; 20],
-            proposer: [7; 20],
             condition_id: [10; 32],
-            identifier: [4; 32],
-            timestamp: 11,
             ancillary: PolymarketAncillary {
                 question_id: [3; 32],
-                question: "test question".into(),
-                resolution: ResolutionValues {
-                    p1: Some("0".into()),
-                    p2: Some("1".into()),
-                    p3: Some("0.5".into()),
-                    p4: None,
-                },
-                initializer: Some([2; 20]),
                 market_id: Some(market_id),
             },
             proposed_price: [5; 32],
         },
-        expiration_timestamp: 12,
-        currency: [8; 20],
     })
 }
 

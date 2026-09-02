@@ -94,21 +94,8 @@ fn parse_data(raw: &RpcLog, words: usize) -> Result<Vec<u8>, DecodeError> {
 
 fn build_chain(raw: &RpcLog, received_at_us: u64) -> Result<ChainLog, DecodeError> {
     Ok(ChainLog {
-        contract_address: decode_fixed::<20>(&raw.address, "address")?,
         block_number: parse_hex_u64(&raw.block_number, "blockNumber")?,
-        block_hash: decode_fixed::<32>(&raw.block_hash, "blockHash")?,
         transaction_hash: decode_fixed::<32>(&raw.transaction_hash, "transactionHash")?,
-        transaction_index: raw
-            .transaction_index
-            .as_deref()
-            .map(|value| parse_hex_u64(value, "transactionIndex"))
-            .transpose()?
-            .map(|value| {
-                value
-                    .try_into()
-                    .map_err(|_| DecodeError::Number("transactionIndex"))
-            })
-            .transpose()?,
         log_index: parse_hex_u64(&raw.log_index, "logIndex")?
             .try_into()
             .map_err(|_| DecodeError::Number("logIndex"))?,
@@ -123,9 +110,6 @@ fn parse_request(raw: &RpcLog, data: &[u8]) -> Result<PriceRequest, DecodeError>
     Ok(PriceRequest {
         condition_id: derive_binary_condition_id(&requester, &ancillary.question_id),
         requester,
-        proposer: topic_address(&raw.topics[2])?,
-        identifier: word(data, 0),
-        timestamp: word_u64(data, 1, "timestamp")?,
         ancillary,
         proposed_price: word(data, 3),
     })
@@ -150,12 +134,6 @@ fn word(data: &[u8], index: usize) -> [u8; 32] {
     data[index * 32..(index + 1) * 32]
         .try_into()
         .expect("validated ABI word")
-}
-
-fn word_address(data: &[u8], index: usize) -> [u8; 20] {
-    data[index * 32 + 12..(index + 1) * 32]
-        .try_into()
-        .expect("validated ABI address")
 }
 
 fn word_u64(data: &[u8], index: usize, field: &'static str) -> Result<u64, DecodeError> {
@@ -266,19 +244,13 @@ mod tests {
         let UmaEvent::ProposePrice(event) = event else {
             panic!("wrong event")
         };
-        assert_eq!(event.chain.contract_address, [0xaa; 20]);
-        assert_eq!(event.chain.transaction_index, Some(2));
-        assert_eq!(event.request.identifier, [0x44; 32]);
-        assert_eq!(event.request.timestamp, 100);
+        assert_eq!(event.chain.transaction_hash, [0xcc; 32]);
         assert_eq!(event.request.ancillary.market_id, Some(42));
         assert_eq!(
             event.request.condition_id,
             derive_binary_condition_id(&[1; 20], &event.request.ancillary.question_id)
         );
-        assert_eq!(event.request.ancillary.question, "Will it happen?");
         assert_eq!(event.request.proposed_price, [0x55; 32]);
-        assert_eq!(event.expiration_timestamp, 200);
-        assert_eq!(event.currency, [0x66; 20]);
     }
 
     #[test]
@@ -289,9 +261,7 @@ mod tests {
             panic!("wrong event")
         };
         assert_eq!(event.request.requester, [1; 20]);
-        assert_eq!(event.request.proposer, [2; 20]);
-        assert_eq!(event.disputer, [3; 20]);
-        assert_eq!(event.request.ancillary.resolution.p2.as_deref(), Some("1"));
+        assert_eq!(event.request.ancillary.market_id, Some(42));
     }
 
     #[test]

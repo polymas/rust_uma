@@ -1,7 +1,7 @@
 use super::{
     DecodeError, RpcLog, build_chain,
     common::{DisputePrice, UmaEvent},
-    parse_data, parse_request, topic_address,
+    parse_data, parse_request,
 };
 
 pub fn parse(raw: &RpcLog, received_at_us: u64) -> Result<UmaEvent, DecodeError> {
@@ -12,6 +12,5 @@ pub fn parse(raw: &RpcLog, received_at_us: u64) -> Result<UmaEvent, DecodeError>
     Ok(UmaEvent::DisputePrice(DisputePrice {
         chain: build_chain(raw, received_at_us)?,
         request: parse_request(raw, &data)?,
-        disputer: topic_address(&raw.topics[3])?,
     }))
 }

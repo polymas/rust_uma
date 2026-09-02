@@ -11,7 +11,9 @@
   级/迁移，锁死地址列表有静默漏事件的风险，代价是可能混入少量非 Polymarket
   的同 ABI 事件（会在富化阶段自然表现为 miss，不会被当成正确数据广播）
 - 两类事件使用独立业务解析器，并通过公共链上元数据和价格请求结构组合复用
-- `ancillaryData` 直接解析为 question、question ID、p1-p4、initializer 和可选 market ID
+- `ancillaryData` 只解析出 question ID（用于标准 Adapter 的链上 condition_id
+  推导兜底）和可选 market ID；question 原文、resolution p1-p4、initializer
+  这些没人再读的字段，解码阶段直接不解析
 - 启动时先按富化 cursor 完成 Gamma 增量缓存，再按 UMA 区块 cursor 补拉
 - Gamma 增量缓存包含全部活跃（`closed=false`）市场，并额外滚动缓存最近
   `CLOSED_MARKET_LOOKBACK_DAYS`（默认 3）天内刚关闭的市场——

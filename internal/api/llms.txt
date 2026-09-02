@@ -28,12 +28,15 @@ Protobuf 路径，避免两套格式并存。其实时热路径仅执行以下�
 `condition_id` 查询。Gamma HTTP 请求、目录快照、文件系统 I/O、JSON 格式化和历
 史回补，均不会在实时 WebSocket 读取流程中同步执行。
 
-`ProposePrice` 和 `DisputePrice` 分别由独立业务解析器处理，内部解析出完整的链上
-字段（区块元数据、参与方地址、`ancillaryData` 解出的 `question_id`/`question`/
-`resolution_p1..p4`/`initializer`/可选 `market_id` 等）。但这些字段绝大多数**不会
-出现在对外的 wire schema 里**——凡是能通过 `transaction_hash` 反查到（链上原始
-日志、Gamma API）的信息，一律不重复广播，只发下单决策直接需要、且无法/不该
-反查的字段。具体删减范围和理由见 `proto/uma.proto` 里 `UmaEvent` 的注释。
+`ProposePrice` 和 `DisputePrice` 分别由独立业务解析器处理，但解码阶段本身就只
+提取热路径和 wire schema 实际用得到的字段：`transaction_hash`/`log_index`/
+`block_number`（去重、latest_block 统计）、`requester`（日志用）、
+`condition_id`（含 `ancillaryData` 解出的 `question_id`，用于标准 Adapter 的
+链上推导兜底）、可选 `market_id`、`proposed_price`（推导 `price_outcome`）。
+区块哈希、交易序号、参与方全量地址、问题原文、resolution 文字、initializer
+这些字段，日志里从来不需要读，因此解码阶段干脆不解析、不分配——不是"解析
+了但不广播"，是压根不解析。需要这些信息时用 `transaction_hash` 反查链上原始
+日志或 Gamma API。具体保留/删减范围见 `proto/uma.proto` 里 `UmaEvent` 的注释。
 
 `condition_id` 在解析阶段会按标准二元 Adapter 公式
 `keccak256(requester || question_id || uint256(2))` 推导一份，但这个公式仅对标准
