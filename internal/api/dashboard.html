@@ -115,6 +115,8 @@
   th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px dashed var(--border); }
   th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
   td.mono { font-variant-numeric: tabular-nums; }
+  td a { color: var(--text); text-decoration: underline; text-decoration-color: var(--dim); }
+  td a:hover { color: var(--ok); text-decoration-color: var(--ok); }
 </style>
 </head>
 <body>
@@ -287,10 +289,12 @@ function rate(curr, key, seconds) {
 }
 
 function short(hex) { return hex && hex.length > 14 ? hex.slice(0, 8) + "…" + hex.slice(-6) : hex; }
+// 统一只用 ms/s 两档，不出现 µs——sub-毫秒的延迟用两位小数的 ms 表示，不用切
+// 一个第三单位。
 function fmtDuration(us) {
-  if (us < 1000) return us.toFixed(0) + "µs";
-  if (us < 1_000_000) return (us / 1000).toFixed(1) + "ms";
-  return (us / 1_000_000).toFixed(2) + "s";
+  const ms = us / 1000;
+  if (ms < 1000) return (ms < 10 ? ms.toFixed(2) : ms.toFixed(1)) + "ms";
+  return (ms / 1000).toFixed(2) + "s";
 }
 
 const events = []; // newest-first, capped
@@ -358,6 +362,32 @@ async function ensureTagLabel(id) {
   }
 }
 
+// market_id -> slug，用于把 Condition ID 列做成指向对应 Polymarket 市场页面
+// 的链接（https://polymarket.com/market/<slug> 这个 URL 形态对单市场和
+// Neg Risk 分组里的单个市场都成立，不需要额外拿 event slug）。同样是懒加载
+// + 缓存：事件表里第一次出现某个 market_id 才查一次 Gamma 的
+// `GET /markets/{market_id}`。
+const marketSlugs = {};
+const marketSlugInflight = new Set();
+const marketSlugFailed = new Set();
+async function ensureMarketSlug(marketId) {
+  if (!marketId) return;
+  if (marketId in marketSlugs || marketSlugInflight.has(marketId) || marketSlugFailed.has(marketId)) return;
+  marketSlugInflight.add(marketId);
+  try {
+    const res = await fetch(`https://gamma-api.polymarket.com/markets/${marketId}`, { cache: "no-store" });
+    if (!res.ok) { marketSlugFailed.add(marketId); return; }
+    const market = await res.json();
+    if (!market || !market.slug) { marketSlugFailed.add(marketId); return; }
+    marketSlugs[marketId] = market.slug;
+    renderEvents();
+  } catch (e) {
+    marketSlugFailed.add(marketId);
+  } finally {
+    marketSlugInflight.delete(marketId);
+  }
+}
+
 function renderEvents() {
   if (!events.length) return;
   const fmtTime = useAbsoluteTime ? fmtAbsolute : fmtAgo;
@@ -370,6 +400,11 @@ function renderEvents() {
     ).join("<br>") || "—";
     for (const id of ev.tag_ids || []) ensureTagLabel(id); // fire-and-forget; re-renders itself once resolved
     const tags = (ev.tag_ids || []).map((id) => tagLabels[id] || id).join(", ") || "—";
+    ensureMarketSlug(ev.market_id); // fire-and-forget; re-renders itself once resolved
+    const slug = marketSlugs[ev.market_id];
+    const conditionCell = slug
+      ? `<a href="https://polymarket.com/market/${slug}" target="_blank" rel="noopener noreferrer">${short(ev.condition_id)}</a>`
+      : short(ev.condition_id);
     return `
     <tr>
       <td>#${ev.sequence}</td>
@@ -378,7 +413,7 @@ function renderEvents() {
       <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${ev.event_type}</td>
       <td>${OUTCOME_LABEL[ev.price_outcome] || "—"}</td>
       <td>${ev.market_id}</td>
-      <td title="${ev.condition_id}">${short(ev.condition_id)}</td>
+      <td title="${ev.condition_id}${slug ? ' — 点击跳转 Polymarket 市场页' : ''}">${conditionCell}</td>
       <td title="${(ev.token_ids || []).join(', ')}">${tokenIds}</td>
       <td>${tags}</td>
       <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ev.enrichment_status}</td>
