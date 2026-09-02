@@ -98,18 +98,6 @@
     flex: 0 0 auto;
   }
   .events-card h2 .hint { text-transform: none; letter-spacing: normal; font-weight: 400; }
-  button.timetoggle {
-    font: inherit;
-    font-size: 11px;
-    color: var(--text);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    padding: 3px 9px;
-    cursor: pointer;
-    flex: 0 0 auto;
-  }
-  button.timetoggle:hover { border-color: var(--dim); }
   .tablewrap { overflow: auto; flex: 1 1 auto; min-height: 0; }
   table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
   th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px dashed var(--border); }
@@ -127,7 +115,6 @@
 <div class="events-card">
   <h2>
     <span>实时推送 <span class="hint" id="wsStatus">（连接 WSS 中…）</span></span>
-    <button class="timetoggle" id="timeToggle">切换为绝对时间</button>
   </h2>
   <div class="tablewrap">
     <table>
@@ -302,13 +289,6 @@ const seenSeq = new Set();
 const MAX_EVENTS = 60;
 const eventsBody = document.getElementById("eventsBody");
 const wsStatus = document.getElementById("wsStatus");
-const timeToggle = document.getElementById("timeToggle");
-let useAbsoluteTime = false;
-timeToggle.addEventListener("click", () => {
-  useAbsoluteTime = !useAbsoluteTime;
-  timeToggle.textContent = useAbsoluteTime ? "切换为相对时间" : "切换为绝对时间";
-  renderEvents();
-});
 
 const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50", unspecified: "—" };
 
@@ -390,10 +370,9 @@ async function ensureMarketSlug(marketId) {
 
 function renderEvents() {
   if (!events.length) return;
-  const fmtTime = useAbsoluteTime ? fmtAbsolute : fmtAgo;
   eventsBody.innerHTML = events.map(ev => {
     const latencyUs = ev.received_at_client_us - ev.upstream_received_at_us;
-    const latency = fmtDuration(latencyUs); // always a duration — absolute/relative toggle only affects "收到于"
+    const latency = fmtDuration(latencyUs); // 一直是耗时，不受"收到于"用什么时间格式影响
     const winnerIdx = ev.price_outcome === "token0" ? 0 : ev.price_outcome === "token1" ? 1 : -1;
     const tokenIds = (ev.token_ids || []).map((id, i) =>
       i === winnerIdx ? `<b>${short(id)}</b>` : short(id)
@@ -408,7 +387,7 @@ function renderEvents() {
     return `
     <tr>
       <td>#${ev.sequence}</td>
-      <td class="mono">${fmtTime(ev.upstream_received_at_us)}</td>
+      <td class="mono">${fmtAbsolute(ev.upstream_received_at_us)}</td>
       <td class="mono" title="端到端：从上游收到日志到这个浏览器收到 WSS 帧，含服务器处理和网络传输">${latency}</td>
       <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${ev.event_type}</td>
       <td>${OUTCOME_LABEL[ev.price_outcome] || "—"}</td>
@@ -495,6 +474,12 @@ async function tick() {
   const logsRate = rate(data, "rpc_logs_received_total", seconds);
   const hitTotal = data.enrichment_hits_total + data.enrichment_misses_total;
   const hitPct = hitTotal ? (data.enrichment_hits_total / hitTotal * 100) : 100;
+  // 总命中率跨重启持久化（见 storage::save_enrichment_stats），近1000例是
+  // 进程内存里的滚动窗口，重启清零重新累积——两者刻意不是同一个数：总量反映
+  // 服务上线以来的整体历史，近1000例反映"现在这一刻"的富化状况。
+  const recentPct = data.enrichment_recent_total
+    ? (data.enrichment_recent_hits / data.enrichment_recent_total * 100)
+    : 100;
 
   meta.className = "";
   meta.textContent = `服务端时间 ${new Date(data.server_time_us/1000).toLocaleTimeString()} · 每 2s 刷新一次`;
@@ -517,7 +502,8 @@ async function tick() {
     ["命中总数", data.enrichment_hits_total],
     ["其中 via market_id", data.enrichment_hits_via_market_id_total],
     ["未命中总数", data.enrichment_misses_total, data.enrichment_misses_total > 0 ? "warn" : ""],
-    ["命中率", hitPct.toFixed(2) + "%", hitPct > 95 ? "ok" : (hitPct > 80 ? "warn" : "bad")],
+    ["总命中率（跨重启累计）", hitPct.toFixed(2) + "%", hitPct > 95 ? "ok" : (hitPct > 80 ? "warn" : "bad")],
+    [`近${data.enrichment_recent_total}例命中率`, recentPct.toFixed(2) + "%", recentPct > 95 ? "ok" : (recentPct > 80 ? "warn" : "bad")],
     ["自愈补齐总数", data.catalog_reconcile_gaps_closed_total, data.catalog_reconcile_gaps_closed_total > 0 ? "warn" : ""],
   ]));
 

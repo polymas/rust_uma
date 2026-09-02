@@ -61,6 +61,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     stats
         .catalog_markets
         .store(catalog.len() as u64, Ordering::Relaxed);
+    // Resume the all-time enrichment hit/miss counters from the last run
+    // instead of dropping back to zero on every restart — see
+    // `storage::{load_enrichment_stats, save_enrichment_stats}`.
+    if let Some(snapshot) = storage.load_enrichment_stats()? {
+        stats
+            .enrichment_hits
+            .store(snapshot.hits, Ordering::Relaxed);
+        stats
+            .enrichment_hits_via_market_id
+            .store(snapshot.hits_via_market_id, Ordering::Relaxed);
+        stats
+            .enrichment_misses
+            .store(snapshot.misses, Ordering::Relaxed);
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (batch_tx, batch_rx) = mpsc::channel(config.live_buffer.max(1));
     let (storage_tx, storage_rx) = mpsc::channel(config.live_buffer.max(1));
@@ -101,6 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             storage.clone(),
             events.clone(),
             config.event_ring_capacity,
+            stats.clone(),
             storage_rx,
             shutdown_rx.clone(),
         )),

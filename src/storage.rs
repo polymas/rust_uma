@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
@@ -15,6 +15,7 @@ use tracing::{error, warn};
 use crate::{
     hub::EventHub,
     model::{EventRecord, MarketEnrichment},
+    stats::{EnrichmentStatsSnapshot, Stats},
     wire::pb,
 };
 
@@ -62,6 +63,10 @@ impl Storage {
 
     fn uma_cursor_path(&self) -> PathBuf {
         self.dir.join("uma.cursor")
+    }
+
+    fn enrichment_stats_path(&self) -> PathBuf {
+        self.dir.join("enrichment_stats.json")
     }
 
     pub fn load_catalog(&self) -> Result<Vec<MarketEnrichment>, StorageError> {
@@ -234,6 +239,30 @@ impl Storage {
     pub fn save_uma_cursor(&self, block: u64) -> Result<(), StorageError> {
         atomic_write(&self.uma_cursor_path(), block.to_string().as_bytes())
     }
+
+    /// All-time enrichment hit/miss counters, so a restart resumes the
+    /// running total instead of dropping back to zero (the point of this
+    /// dashboard metric is to reflect the service's whole operating history,
+    /// not just this process's uptime).
+    pub fn load_enrichment_stats(&self) -> Result<Option<EnrichmentStatsSnapshot>, StorageError> {
+        let path = self.enrichment_stats_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        Ok(Some(
+            serde_json::from_slice(&bytes).map_err(|_| StorageError::Format("enrichment stats"))?,
+        ))
+    }
+
+    pub fn save_enrichment_stats(
+        &self,
+        snapshot: &EnrichmentStatsSnapshot,
+    ) -> Result<(), StorageError> {
+        let bytes =
+            serde_json::to_vec(snapshot).map_err(|_| StorageError::Format("enrichment stats"))?;
+        atomic_write(&self.enrichment_stats_path(), &bytes)
+    }
 }
 
 fn atomic_write(path: &Path, value: &[u8]) -> Result<(), StorageError> {
@@ -255,6 +284,7 @@ pub async fn run_storage_writer(
     storage: Storage,
     event_hub: Arc<EventHub>,
     event_capacity: usize,
+    stats: Arc<Stats>,
     mut commands: mpsc::Receiver<StorageCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -266,6 +296,7 @@ pub async fn run_storage_writer(
         }
     };
     let mut uma_cursor = storage.load_uma_cursor().ok().flatten().unwrap_or_default();
+    let mut last_enrichment_snapshot = EnrichmentStatsSnapshot::default();
     let mut flush = tokio::time::interval(Duration::from_secs(1));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -280,6 +311,7 @@ pub async fn run_storage_writer(
                 if uma_cursor > 0 && let Err(error) = storage.save_uma_cursor(uma_cursor) {
                     error!(%error, uma_cursor, "save UMA cursor");
                 }
+                last_enrichment_snapshot = persist_enrichment_stats(&storage, &stats, last_enrichment_snapshot);
             }
             command = commands.recv() => {
                 match command {
@@ -304,6 +336,34 @@ pub async fn run_storage_writer(
     if uma_cursor > 0 {
         let _ = storage.save_uma_cursor(uma_cursor);
     }
+    persist_enrichment_stats(&storage, &stats, last_enrichment_snapshot);
+}
+
+/// Reads the current all-time enrichment counters off `stats` and persists
+/// them if they moved since `previous` — skipping the write entirely while
+/// idle (nothing to enrich between ticks) avoids a needless disk write every
+/// second. Returns the snapshot actually observed, for the caller to pass
+/// back in as `previous` next time.
+fn persist_enrichment_stats(
+    storage: &Storage,
+    stats: &Stats,
+    previous: EnrichmentStatsSnapshot,
+) -> EnrichmentStatsSnapshot {
+    let current = EnrichmentStatsSnapshot {
+        hits: stats.enrichment_hits.load(Ordering::Relaxed),
+        hits_via_market_id: stats.enrichment_hits_via_market_id.load(Ordering::Relaxed),
+        misses: stats.enrichment_misses.load(Ordering::Relaxed),
+    };
+    if current.hits == previous.hits
+        && current.hits_via_market_id == previous.hits_via_market_id
+        && current.misses == previous.misses
+    {
+        return previous;
+    }
+    if let Err(error) = storage.save_enrichment_stats(&current) {
+        error!(%error, "save enrichment stats");
+    }
+    current
 }
 
 struct Journal {
@@ -452,5 +512,60 @@ mod tests {
         assert!(dir.path().join("enrichment.cursor").is_file());
         assert!(dir.path().join("enrichment_closed.cursor").is_file());
         assert!(dir.path().join("uma.cursor").is_file());
+    }
+
+    #[test]
+    fn enrichment_stats_round_trip_and_default_to_none() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(storage.load_enrichment_stats().unwrap().is_none());
+
+        let snapshot = EnrichmentStatsSnapshot {
+            hits: 42,
+            hits_via_market_id: 40,
+            misses: 3,
+        };
+        storage.save_enrichment_stats(&snapshot).unwrap();
+        let loaded = storage.load_enrichment_stats().unwrap().unwrap();
+        assert_eq!(loaded.hits, 42);
+        assert_eq!(loaded.hits_via_market_id, 40);
+        assert_eq!(loaded.misses, 3);
+    }
+
+    #[tokio::test]
+    async fn storage_writer_persists_enrichment_stats_across_a_restart() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let event_hub = Arc::new(EventHub::new(16));
+        let stats = Arc::new(Stats::default());
+        stats.enrichment_hits.store(7, Ordering::Relaxed);
+        stats
+            .enrichment_hits_via_market_id
+            .store(5, Ordering::Relaxed);
+        stats.enrichment_misses.store(2, Ordering::Relaxed);
+
+        let (_storage_tx, storage_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let writer = tokio::spawn(run_storage_writer(
+            storage.clone(),
+            event_hub,
+            16,
+            stats,
+            storage_rx,
+            shutdown_rx,
+        ));
+        // No flush.tick() has necessarily fired yet — shutdown must still
+        // persist the latest snapshot on its way out (mirrors the uma_cursor
+        // final-flush behavior right above it in run_storage_writer).
+        let _ = shutdown_tx.send(true);
+        writer.await.unwrap();
+
+        // Simulates "process restarted": a fresh Storage handle over the same
+        // directory must see what the previous run persisted.
+        let restarted = Storage::open(dir.path()).unwrap();
+        let snapshot = restarted.load_enrichment_stats().unwrap().unwrap();
+        assert_eq!(snapshot.hits, 7);
+        assert_eq!(snapshot.hits_via_market_id, 5);
+        assert_eq!(snapshot.misses, 2);
     }
 }

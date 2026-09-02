@@ -239,6 +239,11 @@ struct DashboardData {
     enrichment_hits_total: u64,
     enrichment_hits_via_market_id_total: u64,
     enrichment_misses_total: u64,
+    /// Hits within the trailing `RECENT_ENRICHMENT_WINDOW` (see pipeline.rs)
+    /// — a live complement to the all-time totals above.
+    enrichment_recent_hits: u64,
+    /// Size of that trailing window (<=1000; smaller right after startup).
+    enrichment_recent_total: u64,
     catalog_markets: u64,
     catalog_reconcile_gaps_closed_total: u64,
     last_upstream_received_at_us: u64,
@@ -290,6 +295,8 @@ async fn dashboard_data(
             .enrichment_hits_via_market_id
             .load(Ordering::Relaxed),
         enrichment_misses_total: state.stats.enrichment_misses.load(Ordering::Relaxed),
+        enrichment_recent_hits: state.stats.enrichment_recent_hits.load(Ordering::Relaxed),
+        enrichment_recent_total: state.stats.enrichment_recent_total.load(Ordering::Relaxed),
         catalog_markets: state.catalog.len() as u64,
         catalog_reconcile_gaps_closed_total: state
             .stats

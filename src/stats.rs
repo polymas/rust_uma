@@ -1,5 +1,20 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
+
+/// The subset of `Stats` that survives a restart — see
+/// `storage::{load_enrichment_stats, save_enrichment_stats}`. Deliberately
+/// small: only the all-time enrichment counters, not every counter in
+/// `Stats` (most of them, like `rpc_reconnects` or `subscribers`, are
+/// meaningful only for the current process's uptime and a stale value from a
+/// previous run would be actively misleading).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct EnrichmentStatsSnapshot {
+    pub hits: u64,
+    pub hits_via_market_id: u64,
+    pub misses: u64,
+}
+
 #[derive(Default)]
 pub struct Stats {
     pub rpc_connected: AtomicBool,
@@ -17,6 +32,17 @@ pub struct Stats {
     /// only via the on-chain derived binary condition_id.
     pub enrichment_hits_via_market_id: AtomicU64,
     pub enrichment_misses: AtomicU64,
+    /// Hits within the trailing window of the most recent
+    /// `pipeline::RECENT_ENRICHMENT_WINDOW` processed events (currently
+    /// 1000) — a "how are we doing right now" complement to the all-time
+    /// `enrichment_hits`/`enrichment_misses`, which a long-lived process can
+    /// leave close to 100% even during a fresh, ongoing miss streak.
+    /// Maintained alongside `Processor`'s rolling window (see pipeline.rs);
+    /// not persisted — it's a live snapshot, restarting empty is correct.
+    pub enrichment_recent_hits: AtomicU64,
+    /// Size of the trailing window above (saturates at 1000; smaller only
+    /// right after startup before 1000 events have been processed).
+    pub enrichment_recent_total: AtomicU64,
     pub catalog_markets: AtomicU64,
     /// Markets added by a from-scratch reconciliation walk that the
     /// cursor-driven incremental sync had permanently skipped (Gamma's

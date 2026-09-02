@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use tokio::sync::{mpsc, watch};
@@ -17,6 +20,12 @@ use crate::{
     wire::{WireConfig, encode_frame, encoded_event_len, now_us},
 };
 
+/// Size of the trailing enrichment-outcome window backing
+/// `Stats::enrichment_recent_hits`/`enrichment_recent_total` — a "how are we
+/// doing right now" complement to the all-time counters (see the doc comment
+/// on those fields).
+const RECENT_ENRICHMENT_WINDOW: usize = 1000;
+
 pub struct Processor {
     config: Arc<Config>,
     catalog: Arc<Catalog>,
@@ -25,6 +34,12 @@ pub struct Processor {
     storage_tx: mpsc::Sender<StorageCommand>,
     stats: Arc<Stats>,
     sequence: AtomicU64,
+    /// Ring of the last `RECENT_ENRICHMENT_WINDOW` enrichment outcomes
+    /// (true = hit). A plain `Mutex` is fine here: multiple WSS racers can
+    /// call `process` concurrently, but each hold is O(1) with no I/O —
+    /// nowhere near the hot-path cost of the network calls this project
+    /// actually needs to keep off the hot path.
+    recent_enrichment: Mutex<VecDeque<bool>>,
 }
 
 impl Processor {
@@ -46,6 +61,7 @@ impl Processor {
             storage_tx,
             stats,
             sequence: AtomicU64::new(initial_sequence),
+            recent_enrichment: Mutex::new(VecDeque::with_capacity(RECENT_ENRICHMENT_WINDOW)),
         }
     }
 
@@ -90,6 +106,7 @@ impl Processor {
         let enrichment = self
             .catalog
             .resolve(market_id, &decoded.request().condition_id);
+        self.record_recent_enrichment(enrichment.is_some());
         if enrichment.is_some() {
             Stats::increment(&self.stats.enrichment_hits);
             if market_id.is_some() {
@@ -159,6 +176,26 @@ impl Processor {
         if self.batch_tx.send(record).await.is_err() {
             error!("batch pipeline stopped");
         }
+    }
+
+    /// Pushes one outcome into the trailing window and republishes the
+    /// window's hit count / size onto `Stats` — see `RECENT_ENRICHMENT_WINDOW`
+    /// and the doc comment on `Stats::enrichment_recent_hits`.
+    fn record_recent_enrichment(&self, hit: bool) {
+        let mut window = self
+            .recent_enrichment
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        window.push_back(hit);
+        if hit {
+            Stats::increment(&self.stats.enrichment_recent_hits);
+        }
+        if window.len() > RECENT_ENRICHMENT_WINDOW && window.pop_front() == Some(true) {
+            Stats::decrement_saturating(&self.stats.enrichment_recent_hits);
+        }
+        self.stats
+            .enrichment_recent_total
+            .store(window.len() as u64, Ordering::Relaxed);
     }
 
     pub fn checkpoint(&self, block: u64) {
