@@ -3,17 +3,23 @@ use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use thiserror::Error;
 use url::Url;
 
-pub const DEFAULT_ORACLE: &str = "0xCB1822859cEF82Cd2Eb4E6276C7916e692995130";
+pub const DEFAULT_ORACLES: &str =
+    "0xCB1822859cEF82Cd2Eb4E6276C7916e692995130,0xeE3Afe347D5C74317041E2618C49534dAf887c24";
 
 #[derive(Clone)]
 pub struct Config {
     pub api_addr: SocketAddr,
     pub polygon_wss_url: String,
+    /// Polygon WSS endpoints raced against each other for live subscription.
+    /// Always non-empty; degenerates to a single connection (`polygon_wss_url`)
+    /// when only one endpoint is configured.
+    pub wss_rpc_urls: Vec<String>,
     pub polygon_rpc_url: String,
     pub contract_addresses: Vec<String>,
     pub contract_address_bytes: Vec<[u8; 20]>,
     pub data_dir: PathBuf,
     pub start_block: Option<u64>,
+    pub initial_backfill_days: u64,
     pub backfill_batch_blocks: u64,
     pub live_buffer: usize,
     pub event_ring_capacity: usize,
@@ -23,16 +29,14 @@ pub struct Config {
     pub zstd_threshold: usize,
     pub max_decompressed_bytes: usize,
     pub gamma_base_url: String,
-    pub gamma_bootstrap: bool,
     pub gamma_refresh_interval: Duration,
-    pub gamma_refresh_pages: usize,
     pub require_market_id: bool,
     pub ws_write_timeout: Duration,
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("POLYGON_WSS_URL is required")]
+    #[error("WSS_RPC is required")]
     MissingWss,
     #[error("invalid {key}: {value}")]
     Invalid { key: &'static str, value: String },
@@ -40,13 +44,39 @@ pub enum ConfigError {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let polygon_wss_url = required("POLYGON_WSS_URL")?;
-        let polygon_rpc_url = match nonempty("POLYGON_RPC_URL") {
+        let extra_wss_urls: Vec<String> = nonempty("WSS_RPC_LIST")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let polygon_wss_url = match extra_wss_urls.first() {
+            Some(first) => first.clone(),
+            None => required_any("WSS_RPC", "POLYGON_WSS_URL")?,
+        };
+        // De-duplicate while preserving order, so a WSS_RPC_LIST entry that also
+        // matches WSS_RPC/POLYGON_WSS_URL doesn't open a redundant connection.
+        let mut wss_rpc_urls = Vec::with_capacity(extra_wss_urls.len().max(1));
+        for url in extra_wss_urls
+            .into_iter()
+            .chain(nonempty("WSS_RPC").or_else(|| nonempty("POLYGON_WSS_URL")))
+        {
+            if !wss_rpc_urls.contains(&url) {
+                wss_rpc_urls.push(url);
+            }
+        }
+        if wss_rpc_urls.is_empty() {
+            wss_rpc_urls.push(polygon_wss_url.clone());
+        }
+        let polygon_rpc_url = match nonempty("HTTP_RPC").or_else(|| nonempty("POLYGON_RPC_URL")) {
             Some(value) => value,
             None => derive_http_url(&polygon_wss_url)?,
         };
         let contract_addresses = nonempty("UMA_CONTRACT_ADDRESSES")
-            .unwrap_or_else(|| DEFAULT_ORACLE.to_owned())
+            .unwrap_or_else(|| DEFAULT_ORACLES.to_owned())
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -66,12 +96,14 @@ impl Config {
         Ok(Self {
             api_addr: parse("API_ADDR", "127.0.0.1:8011")?,
             polygon_wss_url,
+            wss_rpc_urls,
             polygon_rpc_url,
             contract_addresses,
             contract_address_bytes,
-            data_dir: PathBuf::from(nonempty("DATA_DIR").unwrap_or_else(|| "./data".into())),
+            data_dir: PathBuf::from(nonempty("DATA_DIR").unwrap_or_else(|| "./.cache".into())),
             start_block: optional_parse("START_BLOCK")?,
-            backfill_batch_blocks: parse("RPC_BACKFILL_BATCH_BLOCKS", "2000")?,
+            initial_backfill_days: parse("INITIAL_BACKFILL_DAYS", "7")?,
+            backfill_batch_blocks: parse("RPC_BACKFILL_BATCH_BLOCKS", "1000")?,
             live_buffer: parse("RPC_LIVE_BUFFER", "8192")?,
             event_ring_capacity: parse("EVENT_RING_CAPACITY", "10000")?,
             frame_ring_capacity: parse("FRAME_RING_CAPACITY", "2048")?,
@@ -83,20 +115,20 @@ impl Config {
                 .unwrap_or_else(|| "https://gamma-api.polymarket.com".into())
                 .trim_end_matches('/')
                 .to_owned(),
-            gamma_bootstrap: parse_bool("GAMMA_BOOTSTRAP", true)?,
             gamma_refresh_interval: Duration::from_secs(parse(
                 "GAMMA_REFRESH_INTERVAL_SECONDS",
                 "60",
             )?),
-            gamma_refresh_pages: parse("GAMMA_REFRESH_PAGES", "5")?,
             require_market_id: parse_bool("REQUIRE_MARKET_ID", true)?,
             ws_write_timeout: Duration::from_millis(parse("WS_WRITE_TIMEOUT_MS", "5000")?),
         })
     }
 }
 
-fn required(key: &'static str) -> Result<String, ConfigError> {
-    nonempty(key).ok_or(ConfigError::MissingWss)
+fn required_any(primary: &'static str, fallback: &'static str) -> Result<String, ConfigError> {
+    nonempty(primary)
+        .or_else(|| nonempty(fallback))
+        .ok_or(ConfigError::MissingWss)
 }
 
 fn nonempty(key: &str) -> Option<String> {
@@ -142,7 +174,7 @@ fn parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
 
 fn derive_http_url(wss: &str) -> Result<String, ConfigError> {
     let mut url = Url::parse(wss).map_err(|_| ConfigError::Invalid {
-        key: "POLYGON_WSS_URL",
+        key: "WSS_RPC",
         value: "<redacted>".into(),
     })?;
     let scheme = match url.scheme() {
@@ -150,13 +182,13 @@ fn derive_http_url(wss: &str) -> Result<String, ConfigError> {
         "ws" => "http",
         _ => {
             return Err(ConfigError::Invalid {
-                key: "POLYGON_WSS_URL",
+                key: "WSS_RPC",
                 value: "<redacted>".into(),
             });
         }
     };
     url.set_scheme(scheme).map_err(|_| ConfigError::Invalid {
-        key: "POLYGON_WSS_URL",
+        key: "WSS_RPC",
         value: "<redacted>".into(),
     })?;
     Ok(url.to_string())

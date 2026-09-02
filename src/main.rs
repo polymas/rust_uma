@@ -6,15 +6,12 @@ use std::{
 use rust_uma::{
     api::{AppState, serve},
     config::Config,
-    enrichment::{
-        Catalog, GammaClient, PersistHandle, RepairHandle, run_catalog_persister, run_catalog_sync,
-        run_repair_worker,
-    },
+    enrichment::{Catalog, GammaClient, run_catalog_sync, sync_catalog_before_uma},
     hub::{EventHub, FrameHub},
     pipeline::{Processor, run_batcher},
-    rpc::run_rpc_loop,
     stats::Stats,
     storage::{Storage, run_storage_writer},
+    uma::rpc::run_rpc_loop,
 };
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
@@ -52,21 +49,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     stats
         .catalog_markets
         .store(catalog.len() as u64, Ordering::Relaxed);
-    stats
-        .latest_block
-        .store(storage.load_checkpoint()?, Ordering::Relaxed);
-
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (batch_tx, batch_rx) = mpsc::channel(config.live_buffer.max(1));
     let (storage_tx, storage_rx) = mpsc::channel(config.live_buffer.max(1));
-    let (repair, repair_rx) = RepairHandle::channel(4096);
-    let (persist, persist_rx) = PersistHandle::channel();
     let gamma = GammaClient::new(config.gamma_base_url.clone())?;
+
+    let changed = sync_catalog_before_uma(&gamma, &catalog, &storage).await?;
+    stats
+        .catalog_markets
+        .store(catalog.len() as u64, Ordering::Relaxed);
+    info!(
+        changed,
+        markets = catalog.len(),
+        "Gamma catalog synchronized before UMA"
+    );
+    stats.latest_block.store(
+        storage.load_uma_cursor()?.unwrap_or_default(),
+        Ordering::Relaxed,
+    );
 
     let processor = Arc::new(Processor::new(
         config.clone(),
         catalog.clone(),
-        repair.clone(),
         events.clone(),
         batch_tx,
         storage_tx,
@@ -89,27 +93,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             batch_rx,
             shutdown_rx.clone(),
         )),
-        tokio::spawn(run_repair_worker(
-            gamma.clone(),
-            catalog.clone(),
-            repair,
-            repair_rx,
-            persist.clone(),
-            stats.clone(),
-            shutdown_rx.clone(),
-        )),
         tokio::spawn(run_catalog_sync(
             config.clone(),
             gamma,
             catalog.clone(),
-            persist,
-            stats.clone(),
-            shutdown_rx.clone(),
-        )),
-        tokio::spawn(run_catalog_persister(
             storage.clone(),
-            catalog.clone(),
-            persist_rx,
+            stats.clone(),
             shutdown_rx.clone(),
         )),
         tokio::spawn(run_rpc_loop(

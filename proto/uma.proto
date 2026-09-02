@@ -29,6 +29,20 @@ message UmaEvent {
   bytes block_hash = 15;
   bool removed = 16;
   EnrichmentStatus enrichment_status = 17;
+
+  bytes contract_address = 18;
+  bytes identifier = 19;
+  uint64 request_timestamp = 20;
+  bytes question_id = 21;
+  string question = 22;
+  string resolution_p1 = 23;
+  string resolution_p2 = 24;
+  string resolution_p3 = 25;
+  string resolution_p4 = 26;
+  bytes initializer = 27;
+  uint64 expiration_timestamp = 28;
+  bytes currency = 29;
+  optional uint32 transaction_index = 30;
 }
 
 enum EventType {

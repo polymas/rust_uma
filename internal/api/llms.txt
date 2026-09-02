@@ -4,16 +4,25 @@
 
 ## 范围
 
-`rust_uma` 是一个极简的 Polygon UMA 信号服务。其实时热路径仅执行以下操作：
+`rust_uma` 是一个极简的 Polygon UMA 信号服务。对外实时事件流只提供 Protobuf
+WSS；HTTP 仅用于查询、健康检查和指标。其实时热路径仅执行以下操作：
 
-1. 订阅 `ProposePrice` 和 `DisputePrice` 日志；
+1. 按 topic 订阅 `ProposePrice` 和 `DisputePrice` 日志，再校验 emitter 白名单；
 2. 校验日志发送合约并解码 ABI 载荷；
 3. 关联驻留内存的 Polymarket 身份目录；
 4. 向所有 WebSocket 客户端发布同一份预编码二进制批次；
 5. 异步追加可重放的本地状态。
 
-Gamma HTTP 请求、目录快照、文件系统 I/O、JSON 格式化和历史回补，均不会在
-实时 WebSocket 读取流程中同步执行。
+每次启动先读取 `.cache/enrichment.cursor`，完成 Gamma 增量目录同步并持久化；随后
+才读取 `.cache/uma.cursor`，建立订阅并补拉 UMA 区块。事件富化只按相关
+`condition_id` 查询内存 HashMap，平均时间复杂度为 O(1)。Gamma HTTP 请求、目录快照、
+文件系统 I/O、JSON 格式化和历史回补，均不会在实时 WebSocket 读取流程中同步执行。
+
+`ProposePrice` 和 `DisputePrice` 分别由独立业务解析器处理。输出通过组合结构共享链上
+日志元数据和价格请求字段。`ancillaryData` 不以原始字节数组发布，而是解析为
+`question_id`、`question`、`resolution_p1` 至 `resolution_p4`、`initializer` 和可选
+`market_id`；其中 `question_id` 为原始 ancillary bytes 的 Keccak-256，`condition_id` 为
+`keccak256(requester || question_id || uint256(2))`，不依赖 Gamma 才能获得。
 
 ## 富化契约
 
@@ -66,7 +75,7 @@ GET /metrics
 GET /llms.txt
 GET /uma/v1/events?after_sequence=<u64>&limit=<1..500>&event_type=propose|dispute
 GET /uma/v1/events/:transaction_hash/:log_index
-GET /uma/v1/markets/:market_id
+GET /uma/v1/markets/:condition_id
 ```
 
 事件 HTTP 响应使用 JSON，并在读取时关联最新的目录快照。WSS 事件记录会标明事件
@@ -75,16 +84,19 @@ GET /uma/v1/markets/:market_id
 ## 默认值与运行语义
 
 - API 监听地址：`127.0.0.1:8011`。
-- 默认发送方白名单：Polygon Optimistic Oracle
-  `0xCB1822859cEF82Cd2Eb4E6276C7916e692995130`。
-- 首次启动且未设置 `START_BLOCK`：先建立订阅，将 checkpoint 设置为当前区块头，
-  然后只处理后续实时数据，不扫描链上历史。
-- 重启：先建立订阅，再通过 HTTP RPC 回补 `(checkpoint, subscribed_head]`，同时缓冲
+- RPC 采集仅按事件 topic 过滤；解析后使用 `UMA_CONTRACT_ADDRESSES` 发送方白名单，
+  默认包含已支持的新旧 Polygon UMA Oracle 地址。
+- `.cache` 包含两个独立水位：`enrichment.cursor` 为 Gamma 的
+  `(updatedAt, market_id)` 增量水位，`uma.cursor` 为已完成的 Polygon 区块高度。
+- 启动顺序固定为：同步富化 cursor 并落盘，加载富化缓存，再同步 UMA 区块 cursor。
+- 首次启动且未设置 `START_BLOCK`：根据链上区块时间戳定位最近 7 天的起始区块并
+  补拉；天数由 `INITIAL_BACKFILL_DAYS` 配置。
+- 重启：先建立订阅，再通过 HTTP RPC 回补 `(uma.cursor, subscribed_head]`，同时缓冲
   实时日志；按交易哈希和日志索引去重。
 - 事件环和帧环都有容量上限。慢客户端绝不会阻塞数据摄取。
-- 目录未命中时，立即以空富化数据和 `ENRICHMENT_STATUS_MISS` 广播；精确的 Gamma
-  修复在后台异步执行。
-- checkpoint 落后是安全的：重放可能产生重复事件，但不会遗漏事件。
+- 目录未命中时，立即以空富化数据和 `ENRICHMENT_STATUS_MISS` 广播；热路径不会
+  发起 Gamma 请求，目录由周期性预缓存刷新补充。
+- UMA cursor 落后是安全的：重放可能产生重复事件，但不会遗漏事件。
 - 被移除或发生链重组的日志仍会保留，并标记 `removed=true`。
 
 ## 下游要求

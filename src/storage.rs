@@ -52,8 +52,12 @@ impl Storage {
         self.dir.join("events.wal")
     }
 
-    fn checkpoint_path(&self) -> PathBuf {
-        self.dir.join("checkpoint.bin")
+    fn enrichment_cursor_path(&self) -> PathBuf {
+        self.dir.join("enrichment.cursor")
+    }
+
+    fn uma_cursor_path(&self) -> PathBuf {
+        self.dir.join("uma.cursor")
     }
 
     pub fn load_catalog(&self) -> Result<Vec<MarketEnrichment>, StorageError> {
@@ -178,26 +182,46 @@ impl Storage {
         Ok(events.into())
     }
 
-    pub fn load_checkpoint(&self) -> Result<u64, StorageError> {
-        let path = self.checkpoint_path();
+    pub fn load_enrichment_cursor(&self) -> Result<Option<String>, StorageError> {
+        let path = self.enrichment_cursor_path();
         if !path.exists() {
-            return Ok(0);
+            return Ok(None);
         }
-        let mut value = [0_u8; 8];
-        File::open(path)?.read_exact(&mut value)?;
-        Ok(u64::from_be_bytes(value))
+        let value = fs::read_to_string(path)?;
+        let value = value.trim();
+        Ok((!value.is_empty()).then(|| value.to_owned()))
     }
 
-    pub fn save_checkpoint(&self, block: u64) -> Result<(), StorageError> {
-        let path = self.checkpoint_path();
-        let temp = temporary_path(&path);
-        let mut file = File::create(&temp)?;
-        file.write_all(&block.to_be_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(temp, path)?;
-        Ok(())
+    pub fn save_enrichment_cursor(&self, cursor: &str) -> Result<(), StorageError> {
+        atomic_write(&self.enrichment_cursor_path(), cursor.as_bytes())
     }
+
+    pub fn load_uma_cursor(&self) -> Result<Option<u64>, StorageError> {
+        let path = self.uma_cursor_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let value = fs::read_to_string(path)?;
+        value
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| StorageError::Format("UMA cursor"))
+    }
+
+    pub fn save_uma_cursor(&self, block: u64) -> Result<(), StorageError> {
+        atomic_write(&self.uma_cursor_path(), block.to_string().as_bytes())
+    }
+}
+
+fn atomic_write(path: &Path, value: &[u8]) -> Result<(), StorageError> {
+    let temp = temporary_path(path);
+    let mut file = File::create(&temp)?;
+    file.write_all(value)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, path)?;
+    Ok(())
 }
 
 pub enum StorageCommand {
@@ -219,7 +243,7 @@ pub async fn run_storage_writer(
             return;
         }
     };
-    let mut checkpoint = storage.load_checkpoint().unwrap_or_default();
+    let mut uma_cursor = storage.load_uma_cursor().ok().flatten().unwrap_or_default();
     let mut flush = tokio::time::interval(Duration::from_secs(1));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -231,8 +255,8 @@ pub async fn run_storage_writer(
                 if let Err(error) = journal.flush() {
                     error!(%error, "flush event journal");
                 }
-                if checkpoint > 0 && let Err(error) = storage.save_checkpoint(checkpoint) {
-                    error!(%error, checkpoint, "save checkpoint");
+                if uma_cursor > 0 && let Err(error) = storage.save_uma_cursor(uma_cursor) {
+                    error!(%error, uma_cursor, "save UMA cursor");
                 }
             }
             command = commands.recv() => {
@@ -248,15 +272,15 @@ pub async fn run_storage_writer(
                             }
                         }
                     }
-                    Some(StorageCommand::Checkpoint(block)) => checkpoint = checkpoint.max(block),
+                    Some(StorageCommand::Checkpoint(block)) => uma_cursor = uma_cursor.max(block),
                     None => break,
                 }
             }
         }
     }
     let _ = journal.flush();
-    if checkpoint > 0 {
-        let _ = storage.save_checkpoint(checkpoint);
+    if uma_cursor > 0 {
+        let _ = storage.save_uma_cursor(uma_cursor);
     }
 }
 
@@ -386,10 +410,17 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_round_trip() {
+    fn independent_cursors_round_trip() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
-        storage.save_checkpoint(123).unwrap();
-        assert_eq!(storage.load_checkpoint().unwrap(), 123);
+        storage.save_enrichment_cursor("gamma-watermark").unwrap();
+        storage.save_uma_cursor(123).unwrap();
+        assert_eq!(
+            storage.load_enrichment_cursor().unwrap().as_deref(),
+            Some("gamma-watermark")
+        );
+        assert_eq!(storage.load_uma_cursor().unwrap(), Some(123));
+        assert!(dir.path().join("enrichment.cursor").is_file());
+        assert!(dir.path().join("uma.cursor").is_file());
     }
 }

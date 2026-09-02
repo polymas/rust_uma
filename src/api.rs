@@ -19,11 +19,11 @@ use tokio::sync::watch;
 
 use crate::{
     config::Config,
-    decode::decode_fixed,
     enrichment::Catalog,
     hub::{EventHub, FrameHub, FrameReadError},
     model::{EventKind, EventRecord, MarketEnrichment, hex_prefixed, uint256_decimal},
     stats::Stats,
+    uma::events::decode_fixed,
 };
 
 const SUBPROTOCOL: &str = "uma.pb.v1";
@@ -47,7 +47,7 @@ pub fn router(state: AppState) -> Router {
             "/uma/v1/events/{transaction_hash}/{log_index}",
             get(event_lookup),
         )
-        .route("/uma/v1/markets/{market_id}", get(market_lookup))
+        .route("/uma/v1/markets/{condition_id}", get(market_lookup))
         .route("/uma/v1/ws", get(websocket))
         .with_state(state)
 }
@@ -72,12 +72,15 @@ pub async fn serve(
 struct HealthResponse {
     status: &'static str,
     rpc_connected: bool,
+    rpc_sources_connected: u64,
+    rpc_sources_configured: usize,
     rpc_reconnects_total: u64,
     rpc_logs_received_total: u64,
     events_decoded_total: u64,
     decode_errors_total: u64,
     duplicates_total: u64,
     enrichment_hits_total: u64,
+    enrichment_hits_via_market_id_total: u64,
     enrichment_misses_total: u64,
     catalog_markets: u64,
     last_upstream_received_at_us: u64,
@@ -96,12 +99,18 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: if rpc_connected { "ok" } else { "degraded" },
         rpc_connected,
+        rpc_sources_connected: state.stats.rpc_sources_connected.load(Ordering::Relaxed),
+        rpc_sources_configured: state.config.wss_rpc_urls.len(),
         rpc_reconnects_total: state.stats.rpc_reconnects.load(Ordering::Relaxed),
         rpc_logs_received_total: state.stats.rpc_logs_received.load(Ordering::Relaxed),
         events_decoded_total: state.stats.events_decoded.load(Ordering::Relaxed),
         decode_errors_total: state.stats.decode_errors.load(Ordering::Relaxed),
         duplicates_total: state.stats.duplicates.load(Ordering::Relaxed),
         enrichment_hits_total: state.stats.enrichment_hits.load(Ordering::Relaxed),
+        enrichment_hits_via_market_id_total: state
+            .stats
+            .enrichment_hits_via_market_id
+            .load(Ordering::Relaxed),
         enrichment_misses_total: state.stats.enrichment_misses.load(Ordering::Relaxed),
         catalog_markets: state.stats.catalog_markets.load(Ordering::Relaxed),
         last_upstream_received_at_us: state
@@ -126,6 +135,14 @@ async fn metrics(State(state): State<AppState>) -> Response {
             state.stats.rpc_connected.load(Ordering::Relaxed) as u64,
         ),
         (
+            "rust_uma_rpc_sources_connected",
+            state.stats.rpc_sources_connected.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_rpc_sources_configured",
+            state.config.wss_rpc_urls.len() as u64,
+        ),
+        (
             "rust_uma_rpc_reconnects_total",
             state.stats.rpc_reconnects.load(Ordering::Relaxed),
         ),
@@ -148,6 +165,13 @@ async fn metrics(State(state): State<AppState>) -> Response {
         (
             "rust_uma_enrichment_hits_total",
             state.stats.enrichment_hits.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_enrichment_hits_via_market_id_total",
+            state
+                .stats
+                .enrichment_hits_via_market_id
+                .load(Ordering::Relaxed),
         ),
         (
             "rust_uma_enrichment_misses_total",
@@ -243,11 +267,13 @@ async fn event_lookup(
 
 async fn market_lookup(
     State(state): State<AppState>,
-    Path(market_id): Path<u64>,
+    Path(condition_id): Path<String>,
 ) -> Result<Json<MarketDto>, ApiError> {
+    let condition_id = decode_fixed::<32>(&condition_id, "condition_id")
+        .map_err(|_| ApiError::bad_request("invalid condition ID"))?;
     let market = state
         .catalog
-        .get(market_id)
+        .get(&condition_id)
         .ok_or_else(ApiError::not_found)?;
     Ok(Json(market_dto(&market)))
 }
@@ -259,9 +285,10 @@ struct EventDto {
     block_number: u64,
     block_hash: String,
     transaction_hash: String,
+    transaction_index: Option<u32>,
     log_index: u32,
     market_id: u64,
-    condition_id: Option<String>,
+    condition_id: String,
     token_ids: Vec<String>,
     tag_ids: Vec<u32>,
     price_raw: String,
@@ -271,6 +298,23 @@ struct EventDto {
     upstream_received_at_us: u64,
     removed: bool,
     enrichment_status: &'static str,
+    contract_address: String,
+    identifier: String,
+    request_timestamp: u64,
+    question_id: String,
+    question: String,
+    resolution: ResolutionDto,
+    initializer: Option<String>,
+    expiration_timestamp: Option<u64>,
+    currency: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResolutionDto {
+    p1: Option<String>,
+    p2: Option<String>,
+    p3: Option<String>,
+    p4: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -282,20 +326,36 @@ struct MarketDto {
 }
 
 fn event_dto(event: &EventRecord, catalog: &Catalog) -> EventDto {
+    let chain = event.event.chain();
+    let request = event.event.request();
+    let ancillary = &request.ancillary;
+    // Re-resolve against the current catalog (it may have grown since this
+    // event was first processed), preferring market_id the same way the hot
+    // path does, then fall back to the snapshot captured at processing time.
     let enrichment = catalog
-        .get(event.event.market_id)
+        .resolve(request.ancillary.market_id, &request.condition_id)
         .or_else(|| event.enrichment.clone());
+    let condition_id = enrichment
+        .as_ref()
+        .map(|value| value.condition_id)
+        .unwrap_or(request.condition_id);
+    let (expiration_timestamp, currency) = match &event.event {
+        crate::uma::events::common::UmaEvent::ProposePrice(value) => (
+            Some(value.expiration_timestamp),
+            Some(hex_prefixed(&value.currency)),
+        ),
+        crate::uma::events::common::UmaEvent::DisputePrice(_) => (None, None),
+    };
     EventDto {
         sequence: event.sequence,
-        event_type: event.event.kind.as_str(),
-        block_number: event.event.block_number,
-        block_hash: hex_prefixed(&event.event.block_hash),
-        transaction_hash: hex_prefixed(&event.event.transaction_hash),
-        log_index: event.event.log_index,
-        market_id: event.event.market_id,
-        condition_id: enrichment
-            .as_ref()
-            .map(|value| hex_prefixed(&value.condition_id)),
+        event_type: event.event.kind().as_str(),
+        block_number: chain.block_number,
+        block_hash: hex_prefixed(&chain.block_hash),
+        transaction_hash: hex_prefixed(&chain.transaction_hash),
+        transaction_index: chain.transaction_index,
+        log_index: chain.log_index,
+        market_id: event.event.market_id(),
+        condition_id: hex_prefixed(&condition_id),
         token_ids: enrichment
             .as_ref()
             .map(|value| value.token_ids.iter().map(uint256_decimal).collect())
@@ -304,17 +364,30 @@ fn event_dto(event: &EventRecord, catalog: &Catalog) -> EventDto {
             .as_ref()
             .map(|value| value.tag_ids.clone())
             .unwrap_or_default(),
-        price_raw: hex_prefixed(&event.event.price_raw),
-        requester: hex_prefixed(&event.event.requester),
-        proposer: hex_prefixed(&event.event.proposer),
-        disputer: event
-            .event
-            .disputer
+        price_raw: hex_prefixed(&request.proposed_price),
+        requester: hex_prefixed(&request.requester),
+        proposer: hex_prefixed(&request.proposer),
+        disputer: event.event.disputer().map(|value| hex_prefixed(value)),
+        upstream_received_at_us: chain.upstream_received_at_us,
+        removed: chain.removed,
+        enrichment_status: if enrichment.is_some() { "hit" } else { "miss" },
+        contract_address: hex_prefixed(&chain.contract_address),
+        identifier: hex_prefixed(&request.identifier),
+        request_timestamp: request.timestamp,
+        question_id: hex_prefixed(&ancillary.question_id),
+        question: ancillary.question.clone(),
+        resolution: ResolutionDto {
+            p1: ancillary.resolution.p1.clone(),
+            p2: ancillary.resolution.p2.clone(),
+            p3: ancillary.resolution.p3.clone(),
+            p4: ancillary.resolution.p4.clone(),
+        },
+        initializer: ancillary
+            .initializer
             .as_ref()
             .map(|value| hex_prefixed(value)),
-        upstream_received_at_us: event.event.upstream_received_at_us,
-        removed: event.event.removed,
-        enrichment_status: if enrichment.is_some() { "hit" } else { "miss" },
+        expiration_timestamp,
+        currency,
     }
 }
 

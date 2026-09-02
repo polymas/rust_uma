@@ -97,7 +97,7 @@ impl EventHub {
             .events
             .iter()
             .filter(|event| {
-                event.sequence > after && kind.is_none_or(|value| value == event.event.kind)
+                event.sequence > after && kind.is_none_or(|value| value == event.event.kind())
             })
             .take(limit)
             .cloned()
@@ -112,7 +112,8 @@ impl EventHub {
             .iter()
             .rev()
             .find(|event| {
-                &event.event.transaction_hash == tx_hash && event.event.log_index == log_index
+                &event.event.chain().transaction_hash == tx_hash
+                    && event.event.chain().log_index == log_index
             })
             .cloned()
     }
@@ -188,25 +189,12 @@ impl FrameHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::DecodedEvent;
+    use crate::model::test_uma_event;
 
     fn record(sequence: u64, tx: u8) -> Arc<EventRecord> {
         Arc::new(EventRecord {
             sequence,
-            event: DecodedEvent {
-                kind: EventKind::Propose,
-                block_number: 1,
-                block_hash: [0; 32],
-                transaction_hash: [tx; 32],
-                log_index: 0,
-                market_id: 1,
-                price_raw: [0; 32],
-                requester: [0; 20],
-                proposer: [0; 20],
-                disputer: None,
-                upstream_received_at_us: 0,
-                removed: false,
-            },
+            event: test_uma_event(tx, 1),
             enrichment: None,
         })
     }

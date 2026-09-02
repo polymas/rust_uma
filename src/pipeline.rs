@@ -8,19 +8,18 @@ use tracing::{debug, error};
 
 use crate::{
     config::Config,
-    decode::{RpcLog, decode_signal_log},
-    enrichment::{Catalog, RepairHandle},
+    enrichment::Catalog,
     hub::{EventHub, FrameHub},
     model::{EventKey, EventRecord},
     stats::Stats,
     storage::StorageCommand,
+    uma::events::{RpcLog, decode_signal_log},
     wire::{WireConfig, encode_frame, encoded_event_len, now_us},
 };
 
 pub struct Processor {
     config: Arc<Config>,
     catalog: Arc<Catalog>,
-    repair: RepairHandle,
     events: Arc<EventHub>,
     batch_tx: mpsc::Sender<Arc<EventRecord>>,
     storage_tx: mpsc::Sender<StorageCommand>,
@@ -33,7 +32,6 @@ impl Processor {
     pub fn new(
         config: Arc<Config>,
         catalog: Arc<Catalog>,
-        repair: RepairHandle,
         events: Arc<EventHub>,
         batch_tx: mpsc::Sender<Arc<EventRecord>>,
         storage_tx: mpsc::Sender<StorageCommand>,
@@ -43,7 +41,6 @@ impl Processor {
         Self {
             config,
             catalog,
-            repair,
             events,
             batch_tx,
             storage_tx,
@@ -52,7 +49,10 @@ impl Processor {
         }
     }
 
-    pub async fn process(&self, raw: RpcLog, received_at_us: u64) {
+    /// `source` identifies which upstream feed delivered this log (a WSS racer
+    /// index/tag, or "backfill"). It is only used for tracing/verification —
+    /// deduplication and correctness never depend on it.
+    pub async fn process(&self, raw: RpcLog, received_at_us: u64, source: &str) {
         Stats::increment(&self.stats.rpc_logs_received);
         self.stats
             .last_upstream_received_at_us
@@ -70,24 +70,43 @@ impl Processor {
                 return;
             }
         };
+        let chain = decoded.chain();
         let key = EventKey {
-            transaction_hash: decoded.transaction_hash,
-            log_index: decoded.log_index,
-            removed: decoded.removed,
+            transaction_hash: chain.transaction_hash,
+            log_index: chain.log_index,
+            removed: chain.removed,
         };
         if self.events.contains(&key) {
             Stats::increment(&self.stats.duplicates);
             return;
         }
-        let enrichment = self.catalog.get(decoded.market_id);
+        // Resolve enrichment by market_id first: Gamma's condition_id is
+        // authoritative for every adapter type (standard and Neg Risk alike),
+        // and the catalog is pre-warmed, so this is a local O(1) lookup with no
+        // extra RPC round trip. The on-chain derived condition_id only covers
+        // standard binary UmaCtfAdapter markets and is the fallback for the
+        // rare event whose ancillary data omits market_id.
+        let market_id = decoded.request().ancillary.market_id;
+        let enrichment = self
+            .catalog
+            .resolve(market_id, &decoded.request().condition_id);
         if enrichment.is_some() {
             Stats::increment(&self.stats.enrichment_hits);
+            if market_id.is_some() {
+                Stats::increment(&self.stats.enrichment_hits_via_market_id);
+            }
         } else {
             Stats::increment(&self.stats.enrichment_misses);
-            self.repair.enqueue(decoded.market_id);
         }
+        debug!(
+            source,
+            tx = %raw.transaction_hash,
+            market_id = ?market_id,
+            enriched = enrichment.is_some(),
+            "event accepted"
+        );
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let block_number = decoded.block_number;
+        let block_number = decoded.chain().block_number;
         let record = Arc::new(EventRecord {
             sequence,
             event: decoded,
