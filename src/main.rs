@@ -16,7 +16,7 @@ use rust_uma::{
     uma::rpc::run_rpc_loop,
 };
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -40,7 +40,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let catalog_rows = storage.load_catalog()?;
     let catalog = Arc::new(Catalog::new(catalog_rows));
     let events = Arc::new(EventHub::new(config.event_ring_capacity));
-    let recovered = storage.load_events(config.event_ring_capacity)?;
+    // A WAL this build can't decode (e.g. a wire schema change since the last
+    // run — see docs/WORKFLOW.md "升级") must not be fatal: that turns one
+    // stale local file into a full outage via systemd's restart loop, for
+    // data that's only a resume-cache (events.wal), never authoritative.
+    // Degrade to an empty event history and keep booting instead.
+    let recovered = storage
+        .load_events(config.event_ring_capacity)
+        .unwrap_or_else(|error| {
+            warn!(%error, "event WAL unreadable; starting with empty event history");
+            Vec::new()
+        });
     let mut initial_sequence = 0;
     for event in recovered {
         initial_sequence = initial_sequence.max(event.sequence);
