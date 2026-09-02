@@ -222,16 +222,16 @@ function decodeUmaEvent(buf) {
   return {
     sequence: val(1, 0),
     event_type: EVENT_TYPE[val(2, 0)] || "unspecified",
-    transaction_hash: hex(4),
-    log_index: val(5, 0),
-    market_id: val(6, 0),
-    condition_id: hex(7),
-    token_ids: repeatedBytes(8),
-    tag_ids: repeatedVal(9),
-    upstream_received_at_us: val(14, 0),
-    removed: !!val(16, 0),
-    enrichment_status: ENRICHMENT_STATUS[val(17, 0)] || "unspecified",
-    price_outcome: PRICE_OUTCOME[val(31, 0)] || "unspecified",
+    transaction_hash: hex(3),
+    log_index: val(4, 0),
+    market_id: val(5, 0),
+    condition_id: hex(6),
+    token_ids: repeatedBytes(7),
+    tag_ids: repeatedVal(8),
+    upstream_received_at_us: val(9, 0),
+    removed: !!val(10, 0),
+    enrichment_status: ENRICHMENT_STATUS[val(11, 0)] || "unspecified",
+    price_outcome: PRICE_OUTCOME[val(12, 0)] || "unspecified",
   };
 }
 function decodeUmaBatch(buf) {
