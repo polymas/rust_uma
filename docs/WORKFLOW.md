@@ -21,6 +21,12 @@
 - 数据目录：服务器上是 `/var/lib/rust-uma`（`enrichment.cursor` /
   `enrichment_closed.cursor` / `uma.cursor` / `catalog.bin` / `events.wal`），
   本地开发默认是 `./.cache`。
+- `UMA_CONTRACT_ADDRESSES` 默认留空：解码阶段不按 emitter 地址过滤，只按
+  `ProposePrice`/`DisputePrice` topic 收——这是明确的既定决策（Oracle 合约地
+  址可能升级/迁移，锁死地址列表有静默漏真实事件的风险），代价是可能混入少量
+  非 Polymarket 的同 ABI 事件，这些会在 market_id/富化阶段自然表现为 miss，
+  不会被当成正确数据广播出去。要收紧回严格校验，显式设置该变量即可（非空列
+  表才启用白名单）。
 
 ## 1. 开发
 

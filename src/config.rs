@@ -3,7 +3,11 @@ use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use thiserror::Error;
 use url::Url;
 
-pub const DEFAULT_ORACLES: &str =
+/// Known official Polygon UMA Optimistic Oracle addresses, kept here for
+/// reference only. Not applied by default — see the `UMA_CONTRACT_ADDRESSES`
+/// doc comment on `Config::from_env` for why decode no longer filters by
+/// emitter address unless explicitly configured to.
+pub const KNOWN_UMA_ORACLE_ADDRESSES: &str =
     "0xCB1822859cEF82Cd2Eb4E6276C7916e692995130,0xeE3Afe347D5C74317041E2618C49534dAf887c24";
 
 #[derive(Clone)]
@@ -92,8 +96,14 @@ impl Config {
             Some(value) => value,
             None => derive_http_url(&polygon_wss_url)?,
         };
+        // Empty (the default) means "accept ProposePrice/DisputePrice from any
+        // emitter" — collection has always filtered by topic only, never by
+        // address (an oracle contract can be upgraded/rotated), and pinning
+        // decode to a fixed address list risks silently dropping real
+        // Polymarket events the moment that list goes stale. Set this
+        // explicitly only to deliberately re-enable the stricter allowlist.
         let contract_addresses = nonempty("UMA_CONTRACT_ADDRESSES")
-            .unwrap_or_else(|| DEFAULT_ORACLES.to_owned())
+            .unwrap_or_default()
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -103,12 +113,6 @@ impl Config {
             .iter()
             .map(|value| parse_fixed_hex::<20>("UMA_CONTRACT_ADDRESSES", value))
             .collect::<Result<Vec<_>, _>>()?;
-        if contract_addresses.is_empty() {
-            return Err(ConfigError::Invalid {
-                key: "UMA_CONTRACT_ADDRESSES",
-                value: String::new(),
-            });
-        }
 
         Ok(Self {
             api_addr: parse("API_ADDR", "127.0.0.1:8011")?,

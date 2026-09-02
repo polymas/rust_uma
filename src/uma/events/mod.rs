@@ -54,6 +54,16 @@ pub enum DecodeError {
     MissingMarketId,
 }
 
+/// Collection (WSS subscribe / HTTP backfill) filters by event topic only,
+/// never by emitter address — an oracle contract address can be upgraded or
+/// rotated, so pinning to one is fragile. `allowed_emitters` is an optional,
+/// **off-by-default** secondary filter for this decode step: empty (the
+/// default) accepts a matching topic from any emitter, trading a known
+/// "noise" cost (irrelevant events from unrelated projects that happen to
+/// share UMA's ProposePrice/DisputePrice ABI, visible as decode/enrichment
+/// misses further downstream) for never silently dropping a real Polymarket
+/// event just because its emitter isn't in a possibly-stale allowlist. Pass
+/// a non-empty list only when you deliberately want the stricter behavior.
 pub fn decode_signal_log(
     raw: &RpcLog,
     received_at_us: u64,
@@ -61,7 +71,7 @@ pub fn decode_signal_log(
     require_market_id: bool,
 ) -> Result<UmaEvent, DecodeError> {
     let emitter = decode_fixed::<20>(&raw.address, "address")?;
-    if !allowed_emitters.iter().any(|allowed| allowed == &emitter) {
+    if !allowed_emitters.is_empty() && !allowed_emitters.iter().any(|allowed| allowed == &emitter) {
         return Err(DecodeError::Emitter);
     }
     let event = match raw.topics.first().map(|topic| topic.to_ascii_lowercase()) {
@@ -282,6 +292,24 @@ mod tests {
         assert_eq!(event.request.proposer, [2; 20]);
         assert_eq!(event.disputer, [3; 20]);
         assert_eq!(event.request.ancillary.resolution.p2.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn empty_allowlist_accepts_any_emitter() {
+        // Default posture: collection filters by topic only, never by
+        // address. An empty allowlist must not reject a real event just
+        // because its emitter isn't in some (possibly stale) list.
+        decode_signal_log(&log(TOPIC_PROPOSE_PRICE, false), 999, &[], true)
+            .expect("empty allowlist must accept any emitter");
+    }
+
+    #[test]
+    fn non_empty_allowlist_still_rejects_unknown_emitter() {
+        // Opting into the stricter mode (non-empty UMA_CONTRACT_ADDRESSES)
+        // must still work as a deliberate, explicit choice.
+        let error = decode_signal_log(&log(TOPIC_PROPOSE_PRICE, false), 999, &[[0xbb; 20]], true)
+            .unwrap_err();
+        assert_eq!(error, DecodeError::Emitter);
     }
 
     #[test]

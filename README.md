@@ -6,7 +6,10 @@
 
 - 对外实时数据仅提供 Protobuf WSS（`uma.pb.v1`）
 - 只解析 `ProposePrice`、`DisputePrice`
-- RPC 订阅和历史补拉按事件 topic 过滤，解析后再校验 emitter 白名单
+- RPC 订阅和历史补拉只按事件 topic 过滤，不按地址；解析后的 emitter 白名单
+  （`UMA_CONTRACT_ADDRESSES`）默认留空即接受任意发送方——Oracle 合约地址可能升
+  级/迁移，锁死地址列表有静默漏事件的风险，代价是可能混入少量非 Polymarket
+  的同 ABI 事件（会在富化阶段自然表现为 miss，不会被当成正确数据广播）
 - 两类事件使用独立业务解析器，并通过公共链上元数据和价格请求结构组合复用
 - `ancillaryData` 直接解析为 question、question ID、p1-p4、initializer 和可选 market ID
 - 启动时先按富化 cursor 完成 Gamma 增量缓存，再按 UMA 区块 cursor 补拉

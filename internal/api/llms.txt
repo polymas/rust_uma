@@ -7,8 +7,10 @@
 `rust_uma` 是一个极简的 Polygon UMA 信号服务。对外实时事件流只提供 Protobuf
 WSS；HTTP 仅用于查询、健康检查和指标。其实时热路径仅执行以下操作：
 
-1. 按 topic 订阅 `ProposePrice` 和 `DisputePrice` 日志，再校验 emitter 白名单；
-2. 校验日志发送合约并解码 ABI 载荷；
+1. 按 topic 订阅 `ProposePrice` 和 `DisputePrice` 日志（不按地址过滤，
+   `UMA_CONTRACT_ADDRESSES` 默认留空即接受任意发送方；仅当显式配置非空列表时
+   才启用更严格的 emitter 白名单校验）；
+2. 解码 ABI 载荷；
 3. 关联驻留内存的 Polymarket 身份目录；
 4. 向所有 WebSocket 客户端发布同一份预编码二进制批次；
 5. 异步追加可重放的本地状态。
@@ -94,8 +96,10 @@ GET /uma/v1/markets/:condition_id
 ## 默认值与运行语义
 
 - API 监听地址：`127.0.0.1:8011`。
-- RPC 采集仅按事件 topic 过滤；解析后使用 `UMA_CONTRACT_ADDRESSES` 发送方白名单，
-  默认包含已支持的新旧 Polygon UMA Oracle 地址。
+- RPC 采集仅按事件 topic 过滤；`UMA_CONTRACT_ADDRESSES` 默认留空，解析阶段不
+  再按发送方过滤——Oracle 合约地址可能升级/迁移，锁死列表有静默漏事件的风险。
+  仅当显式配置该变量（例如已知的新旧 Polygon UMA Oracle 地址）时才启用更严格
+  的 emitter 白名单校验。
 - `.cache` 包含三个独立水位：`enrichment.cursor`（活跃市场）与
   `enrichment_closed.cursor`（最近关闭市场，窗口由 `CLOSED_MARKET_LOOKBACK_DAYS`
   控制）均为 Gamma 的 `(updatedAt, market_id)` 增量水位，`uma.cursor` 为已完成
