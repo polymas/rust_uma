@@ -87,11 +87,14 @@ cargo run --release
 GET /healthz
 GET /metrics
 GET /llms.txt
-GET /uma/v1/events?after_sequence=0&limit=100&event_type=propose
-GET /uma/v1/events/:transaction_hash/:log_index
-GET /uma/v1/markets/:condition_id
+GET /dashboard?token=<DASHBOARD_TOKEN>
+GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 GET /uma/v1/ws?after_sequence=0
 ```
+
+业务事件只通过 `/uma/v1/ws` 分发（Protobuf，可选 Zstd），没有平行的 JSON
+查询接口——所有消费者，包括调试和回放脚本，统一解 Protobuf。`/dashboard`
+是一个 token 鉴权的只读运维面板，只展示聚合统计，不提供单条事件查询。
 
 WSS 客户端必须声明子协议 `uma.pb.v1`。消息头、压缩阈值、重放语义和
 下游约束见 `internal/api/llms.txt`，Protobuf schema 见 `proto/uma.proto`。

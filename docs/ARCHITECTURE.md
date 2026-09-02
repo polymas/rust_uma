@@ -60,7 +60,7 @@ flowchart TD
     subgraph API["api.rs · 对外接口"]
         direction LR
         WSAPI["/uma/v1/ws\nafter_sequence 续传"]
-        HTTPAPI["/uma/v1/events\n/uma/v1/markets/:id\n/healthz /metrics"]
+        HTTPAPI["/healthz /metrics\n/dashboard(-data)\n只读统计，无业务数据查询"]
     end
 
     WSS1 & WSSN -->|eth_subscribe logs| LW

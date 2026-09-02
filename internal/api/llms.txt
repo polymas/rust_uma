@@ -4,8 +4,10 @@
 
 ## 范围
 
-`rust_uma` 是一个极简的 Polygon UMA 信号服务。对外实时事件流只提供 Protobuf
-WSS；HTTP 仅用于查询、健康检查和指标。其实时热路径仅执行以下操作：
+`rust_uma` 是一个极简的 Polygon UMA 信号服务。对外只有一条事件出口：
+Protobuf WSS。HTTP 只提供健康检查、指标和一个 token 鉴权的只读运维面板，不
+提供任何业务数据查询接口——统一让所有消费者（含调试脚本）走同一条 WSS
+Protobuf 路径，避免两套格式并存。其实时热路径仅执行以下操作：
 
 1. 按 topic 订阅 `ProposePrice` 和 `DisputePrice` 日志（不按地址过滤，
    `UMA_CONTRACT_ADDRESSES` 默认留空即接受任意发送方；仅当显式配置非空列表时
@@ -77,21 +79,25 @@ Protobuf schema 位于 `proto/uma.proto`。小于 4096 字节的载荷不压缩�
 消息帧采用至少一次投递。重连时，如果 `after_sequence` 落在之前编码的某个批次
 内，客户端可能收到该批次中序号更早的事件；客户端必须按 `sequence` 或
 `(transaction_hash, log_index)` 去重。如果请求的游标早于内存帧环中最旧的记录，
-连接将被关闭，客户端必须改用 HTTP 补拉端点。
+连接将直接被关闭（错误码 1013）——没有 HTTP 补拉端点作为退路，客户端必须靠
+`EVENT_RING_CAPACITY`/`FRAME_RING_CAPACITY` 覆盖住自己可能的最长离线时间，或
+干脆断线后直接重新以 `after_sequence=0`（或不传，取最新）建立新连接。
 
-## HTTP 查询 API
+## HTTP 端点
 
 ```text
 GET /healthz
 GET /metrics
 GET /llms.txt
-GET /uma/v1/events?after_sequence=<u64>&limit=<1..500>&event_type=propose|dispute
-GET /uma/v1/events/:transaction_hash/:log_index
-GET /uma/v1/markets/:condition_id
+GET /dashboard?token=<DASHBOARD_TOKEN>
+GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 ```
 
-事件 HTTP 响应使用 JSON，并在读取时关联最新的目录快照。WSS 事件记录会标明事件
-首次广播时富化是否命中。
+`/dashboard` 和 `/uma/v1/dashboard-data` 是只读运维面板，展示 RPC 收发、富化
+命中率、下游 WSS 消费等聚合计数器，未配置 `DASHBOARD_TOKEN` 时这两个路由直接
+拒绝访问。这些端点不提供业务事件数据（不返回单条事件或市场详情）——业务数据
+只通过 `/uma/v1/ws` 分发，任何消费者（含调试/回放脚本）都应该解 Protobuf，
+不应该依赖一条平行的 JSON 业务接口。
 
 ## 默认值与运行语义
 

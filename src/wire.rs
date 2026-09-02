@@ -104,7 +104,6 @@ mod tests {
             sequence,
             event: test_uma_event(2, 4),
             enrichment: None,
-            broadcast_at_us: Default::default(),
         })
     }
 

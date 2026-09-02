@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Path, Query, State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
     http::{HeaderMap, StatusCode, header},
@@ -21,9 +21,7 @@ use crate::{
     config::Config,
     enrichment::Catalog,
     hub::{EventHub, FrameHub, FrameReadError},
-    model::{EventKind, EventRecord, MarketEnrichment, hex_prefixed, uint256_decimal},
     stats::Stats,
-    uma::events::decode_fixed,
 };
 
 const SUBPROTOCOL: &str = "uma.pb.v1";
@@ -42,12 +40,6 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .route("/llms.txt", get(llms))
-        .route("/uma/v1/events", get(events))
-        .route(
-            "/uma/v1/events/{transaction_hash}/{log_index}",
-            get(event_lookup),
-        )
-        .route("/uma/v1/markets/{condition_id}", get(market_lookup))
         .route("/uma/v1/ws", get(websocket))
         .route("/dashboard", get(dashboard_page))
         .route("/uma/v1/dashboard-data", get(dashboard_data))
@@ -328,214 +320,6 @@ async fn llms() -> Response {
 }
 
 #[derive(Deserialize)]
-struct EventQuery {
-    #[serde(default)]
-    after_sequence: u64,
-    #[serde(default = "default_limit")]
-    limit: usize,
-    event_type: Option<String>,
-}
-
-fn default_limit() -> usize {
-    100
-}
-
-#[derive(Serialize)]
-struct EventListResponse {
-    data: Vec<EventDto>,
-    count: usize,
-    oldest_sequence: u64,
-    latest_sequence: u64,
-    next_sequence: Option<u64>,
-}
-
-async fn events(
-    State(state): State<AppState>,
-    Query(query): Query<EventQuery>,
-) -> Result<Json<EventListResponse>, ApiError> {
-    let kind = parse_kind(query.event_type.as_deref())?;
-    let limit = query.limit.clamp(1, 500);
-    let records = state.events.query(query.after_sequence, limit, kind);
-    let data = records
-        .iter()
-        .map(|event| event_dto(event, &state.catalog))
-        .collect::<Vec<_>>();
-    let next_sequence = records.last().map(|event| event.sequence);
-    let (oldest_sequence, latest_sequence) = state.events.bounds();
-    Ok(Json(EventListResponse {
-        count: data.len(),
-        data,
-        oldest_sequence,
-        latest_sequence,
-        next_sequence,
-    }))
-}
-
-async fn event_lookup(
-    State(state): State<AppState>,
-    Path((transaction_hash, log_index)): Path<(String, u32)>,
-) -> Result<Json<EventDto>, ApiError> {
-    let hash = decode_fixed::<32>(&transaction_hash, "transaction_hash")
-        .map_err(|_| ApiError::bad_request("invalid transaction hash"))?;
-    let event = state
-        .events
-        .find(&hash, log_index)
-        .ok_or_else(ApiError::not_found)?;
-    Ok(Json(event_dto(&event, &state.catalog)))
-}
-
-async fn market_lookup(
-    State(state): State<AppState>,
-    Path(condition_id): Path<String>,
-) -> Result<Json<MarketDto>, ApiError> {
-    let condition_id = decode_fixed::<32>(&condition_id, "condition_id")
-        .map_err(|_| ApiError::bad_request("invalid condition ID"))?;
-    let market = state
-        .catalog
-        .get(&condition_id)
-        .ok_or_else(ApiError::not_found)?;
-    Ok(Json(market_dto(&market)))
-}
-
-#[derive(Serialize)]
-struct EventDto {
-    sequence: u64,
-    event_type: &'static str,
-    block_number: u64,
-    block_hash: String,
-    transaction_hash: String,
-    transaction_index: Option<u32>,
-    log_index: u32,
-    market_id: u64,
-    condition_id: String,
-    token_ids: Vec<String>,
-    tag_ids: Vec<u32>,
-    price_raw: String,
-    requester: String,
-    proposer: String,
-    disputer: Option<String>,
-    upstream_received_at_us: u64,
-    /// 0 if this event hasn't been through a broadcast batch yet (e.g. a
-    /// storage-replayed record from before this field existed). Dashboard-only,
-    /// not part of the WSS wire schema — see `EventRecord::broadcast_at_us`.
-    broadcast_at_us: u64,
-    removed: bool,
-    enrichment_status: &'static str,
-    contract_address: String,
-    identifier: String,
-    request_timestamp: u64,
-    question_id: String,
-    question: String,
-    resolution: ResolutionDto,
-    initializer: Option<String>,
-    expiration_timestamp: Option<u64>,
-    currency: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ResolutionDto {
-    p1: Option<String>,
-    p2: Option<String>,
-    p3: Option<String>,
-    p4: Option<String>,
-}
-
-#[derive(Serialize)]
-struct MarketDto {
-    market_id: u64,
-    condition_id: String,
-    token_ids: Vec<String>,
-    tag_ids: Vec<u32>,
-}
-
-fn event_dto(event: &EventRecord, catalog: &Catalog) -> EventDto {
-    let chain = event.event.chain();
-    let request = event.event.request();
-    let ancillary = &request.ancillary;
-    // Re-resolve against the current catalog (it may have grown since this
-    // event was first processed), preferring market_id the same way the hot
-    // path does, then fall back to the snapshot captured at processing time.
-    let enrichment = catalog
-        .resolve(request.ancillary.market_id, &request.condition_id)
-        .or_else(|| event.enrichment.clone());
-    let condition_id = enrichment
-        .as_ref()
-        .map(|value| value.condition_id)
-        .unwrap_or(request.condition_id);
-    let (expiration_timestamp, currency) = match &event.event {
-        crate::uma::events::common::UmaEvent::ProposePrice(value) => (
-            Some(value.expiration_timestamp),
-            Some(hex_prefixed(&value.currency)),
-        ),
-        crate::uma::events::common::UmaEvent::DisputePrice(_) => (None, None),
-    };
-    EventDto {
-        sequence: event.sequence,
-        event_type: event.event.kind().as_str(),
-        block_number: chain.block_number,
-        block_hash: hex_prefixed(&chain.block_hash),
-        transaction_hash: hex_prefixed(&chain.transaction_hash),
-        transaction_index: chain.transaction_index,
-        log_index: chain.log_index,
-        market_id: event.event.market_id(),
-        condition_id: hex_prefixed(&condition_id),
-        token_ids: enrichment
-            .as_ref()
-            .map(|value| value.token_ids.iter().map(uint256_decimal).collect())
-            .unwrap_or_default(),
-        tag_ids: enrichment
-            .as_ref()
-            .map(|value| value.tag_ids.clone())
-            .unwrap_or_default(),
-        price_raw: hex_prefixed(&request.proposed_price),
-        requester: hex_prefixed(&request.requester),
-        proposer: hex_prefixed(&request.proposer),
-        disputer: event.event.disputer().map(|value| hex_prefixed(value)),
-        upstream_received_at_us: chain.upstream_received_at_us,
-        broadcast_at_us: event.broadcast_at_us(),
-        removed: chain.removed,
-        enrichment_status: if enrichment.is_some() { "hit" } else { "miss" },
-        contract_address: hex_prefixed(&chain.contract_address),
-        identifier: hex_prefixed(&request.identifier),
-        request_timestamp: request.timestamp,
-        question_id: hex_prefixed(&ancillary.question_id),
-        question: ancillary.question.clone(),
-        resolution: ResolutionDto {
-            p1: ancillary.resolution.p1.clone(),
-            p2: ancillary.resolution.p2.clone(),
-            p3: ancillary.resolution.p3.clone(),
-            p4: ancillary.resolution.p4.clone(),
-        },
-        initializer: ancillary
-            .initializer
-            .as_ref()
-            .map(|value| hex_prefixed(value)),
-        expiration_timestamp,
-        currency,
-    }
-}
-
-fn market_dto(market: &MarketEnrichment) -> MarketDto {
-    MarketDto {
-        market_id: market.market_id,
-        condition_id: hex_prefixed(&market.condition_id),
-        token_ids: market.token_ids.iter().map(uint256_decimal).collect(),
-        tag_ids: market.tag_ids.clone(),
-    }
-}
-
-fn parse_kind(value: Option<&str>) -> Result<Option<EventKind>, ApiError> {
-    match value.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Ok(None),
-        Some("propose") => Ok(Some(EventKind::Propose)),
-        Some("dispute") => Ok(Some(EventKind::Dispute)),
-        Some(_) => Err(ApiError::bad_request(
-            "event_type must be propose or dispute",
-        )),
-    }
-}
-
-#[derive(Deserialize)]
 struct WsQuery {
     after_sequence: Option<u64>,
 }
@@ -649,22 +433,6 @@ impl Drop for SubscriberGuard {
 struct ApiError {
     status: StatusCode,
     message: &'static str,
-}
-
-impl ApiError {
-    fn bad_request(message: &'static str) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message,
-        }
-    }
-
-    fn not_found() -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: "not found",
-        }
-    }
 }
 
 impl IntoResponse for ApiError {

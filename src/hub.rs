@@ -7,7 +7,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::{
-    model::{EventKey, EventKind, EventRecord},
+    model::{EventKey, EventRecord},
     wire::WireFrame,
 };
 
@@ -83,39 +83,6 @@ impl EventHub {
                 .map(|event| event.sequence)
                 .unwrap_or_default(),
         )
-    }
-
-    pub fn query(
-        &self,
-        after: u64,
-        limit: usize,
-        kind: Option<EventKind>,
-    ) -> Vec<Arc<EventRecord>> {
-        self.state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .events
-            .iter()
-            .filter(|event| {
-                event.sequence > after && kind.is_none_or(|value| value == event.event.kind())
-            })
-            .take(limit)
-            .cloned()
-            .collect()
-    }
-
-    pub fn find(&self, tx_hash: &[u8; 32], log_index: u32) -> Option<Arc<EventRecord>> {
-        self.state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .events
-            .iter()
-            .rev()
-            .find(|event| {
-                &event.event.chain().transaction_hash == tx_hash
-                    && event.event.chain().log_index == log_index
-            })
-            .cloned()
     }
 
     pub fn snapshot(&self) -> Vec<Arc<EventRecord>> {
@@ -196,7 +163,6 @@ mod tests {
             sequence,
             event: test_uma_event(tx, 1),
             enrichment: None,
-            broadcast_at_us: Default::default(),
         })
     }
 

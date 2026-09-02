@@ -242,8 +242,9 @@ brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
   without token_ids/tag_ids`（`pipeline.rs`），带 `market_id`/
   `derived_condition_id`/`requester`/`tx`/`block`，不需要开 `RUST_LOG=debug`
   就能看到：`sudo journalctl -u rust-uma.service -f | grep "enrichment miss"`。
-  这是排查"为什么这条事件没富化"的第一手数据源，比事后翻 `/uma/v1/events`
-  更直接——后者查的是当前 Catalog 状态，不是事件处理那一刻的状态。
+  这是排查"为什么这条事件没富化"的第一手数据源，比事后翻监控面板的实时推送
+  列表更直接——面板解析的是当前批次的 WSS 帧，不是事件处理那一刻的状态，且
+  只保留打开面板之后的记录。
 
 ## 5. 升级
 

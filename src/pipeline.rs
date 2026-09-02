@@ -131,7 +131,6 @@ impl Processor {
             sequence,
             event: decoded,
             enrichment,
-            broadcast_at_us: Default::default(),
         });
         if !self.events.insert(record.clone()) {
             Stats::increment(&self.stats.duplicates);
@@ -208,16 +207,9 @@ pub async fn run_batcher(
         batch_sequence = batch_sequence.wrapping_add(1).max(1);
         match encode_frame(batch_sequence, &batch, &wire_config) {
             Ok(frame) => {
-                let broadcast_at = now_us();
                 stats
                     .last_broadcast_at_us
-                    .store(broadcast_at, Ordering::Relaxed);
-                // Dashboard-only stamp on the same Arc<EventRecord> already
-                // sitting in EventHub — not part of the wire frame itself, so
-                // this can't affect what downstream WSS consumers receive.
-                for event in &batch {
-                    event.mark_broadcast(broadcast_at);
-                }
+                    .store(now_us(), Ordering::Relaxed);
                 frames.publish(Arc::new(frame));
             }
             Err(error) => error!(%error, events=batch.len(), "encode WSS batch"),
