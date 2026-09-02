@@ -83,6 +83,7 @@ struct HealthResponse {
     enrichment_hits_via_market_id_total: u64,
     enrichment_misses_total: u64,
     catalog_markets: u64,
+    catalog_reconcile_gaps_closed_total: u64,
     last_upstream_received_at_us: u64,
     last_broadcast_at_us: u64,
     subscribers: u64,
@@ -113,6 +114,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
             .load(Ordering::Relaxed),
         enrichment_misses_total: state.stats.enrichment_misses.load(Ordering::Relaxed),
         catalog_markets: state.stats.catalog_markets.load(Ordering::Relaxed),
+        catalog_reconcile_gaps_closed_total: state
+            .stats
+            .catalog_reconcile_gaps_closed
+            .load(Ordering::Relaxed),
         last_upstream_received_at_us: state
             .stats
             .last_upstream_received_at_us
@@ -178,6 +183,13 @@ async fn metrics(State(state): State<AppState>) -> Response {
             state.stats.enrichment_misses.load(Ordering::Relaxed),
         ),
         ("rust_uma_catalog_markets", state.catalog.len() as u64),
+        (
+            "rust_uma_catalog_reconcile_gaps_closed_total",
+            state
+                .stats
+                .catalog_reconcile_gaps_closed
+                .load(Ordering::Relaxed),
+        ),
         (
             "rust_uma_subscribers",
             state.stats.subscribers.load(Ordering::Relaxed),

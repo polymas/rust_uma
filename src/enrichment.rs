@@ -334,6 +334,68 @@ pub async fn run_catalog_sync(
     }
 }
 
+/// Independent background task: every `config.catalog_reconcile_interval`,
+/// re-walk the entire active (closed=false) and recently-closed Gamma set
+/// from scratch — ignoring the incremental cursors — and merge any missing
+/// markets into the catalog.
+///
+/// This exists because Gamma's keyset pagination has been observed in
+/// production to silently drop entries (most reliably reproduced with a
+/// batch of Neg Risk sibling markets sharing a near-identical `updatedAt`,
+/// which likely straddles a page boundary on a tied sort key). Once the
+/// incremental cursor in `run_catalog_sync` advances past a missed market's
+/// timestamp, that fast path can never recover it — only a from-scratch walk
+/// can. Deliberately does not touch the persisted incremental cursors (it
+/// discards the `next` cursor `sync_incremental` would have returned), so it
+/// can never regress or race the fast path's own progress; it purely adds
+/// whatever the fast path missed. Runs as its own task (not a branch in
+/// `run_catalog_sync`'s select loop) so a multi-minute full walk never
+/// delays the 60s-scale incremental refresh.
+pub async fn run_catalog_reconcile(
+    config: Arc<Config>,
+    gamma: GammaClient,
+    catalog: Arc<Catalog>,
+    storage: Storage,
+    stats: Arc<Stats>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(config.catalog_reconcile_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await; // consume the immediate first tick; reconcile only after a full interval
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => if *shutdown.borrow() { break; },
+            _ = interval.tick() => {
+                match reconcile_full(&gamma, &catalog, config.closed_market_lookback_days).await {
+                    Ok(changed) if changed > 0 => {
+                        if let Err(error) = storage.save_catalog(&catalog.snapshot()) {
+                            warn!(%error, "persist catalog after reconciliation");
+                        }
+                        stats.catalog_markets.store(catalog.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        stats.catalog_reconcile_gaps_closed.fetch_add(changed as u64, std::sync::atomic::Ordering::Relaxed);
+                        info!(changed, markets = catalog.len(), "Gamma full catalog reconciliation closed a coverage gap");
+                    }
+                    Ok(_) => info!("Gamma full catalog reconciliation found no gap"),
+                    Err(error) => warn!(%error, "Gamma full catalog reconciliation failed"),
+                }
+            }
+        }
+    }
+}
+
+async fn reconcile_full(
+    gamma: &GammaClient,
+    catalog: &Catalog,
+    closed_lookback_days: u64,
+) -> Result<usize, EnrichmentError> {
+    let (changed_active, _) =
+        sync_incremental(gamma, catalog, None, false, None, usize::MAX).await?;
+    let boundary = lookback_boundary_date(closed_lookback_days);
+    let (changed_closed, _) =
+        sync_incremental(gamma, catalog, None, true, Some(&boundary), usize::MAX).await?;
+    Ok(changed_active + changed_closed)
+}
+
 /// `YYYY-MM-DD` for `days_ago` days before now (UTC), used as a lexicographic
 /// lower bound against Gamma's `updatedAt` (also UTC, ISO 8601) — no need to
 /// pull in a date/time crate for a day-granularity cutoff.
@@ -767,6 +829,83 @@ mod tests {
             catalog.get_by_market_id(30).is_none(),
             "market closed in 2020 must stay outside the bounded lookback window"
         );
+        server.abort();
+    }
+
+    /// Regression test for the second, distinct real-world gap: Gamma's
+    /// keyset pagination can silently drop a market (production evidence:
+    /// several batches of Neg Risk siblings, all created within the same
+    /// second, were entirely absent from the catalog days later). Once the
+    /// incremental cursor has advanced past a missed market's `updatedAt`,
+    /// `sync_incremental`'s own `is_older` check makes that market
+    /// permanently unreachable via the fast path — this proves
+    /// `reconcile_full` (which ignores the cursor) recovers it anyway, and
+    /// that doing so never disturbs the persisted incremental cursor.
+    #[tokio::test]
+    async fn full_reconciliation_recovers_a_market_the_incremental_cursor_has_passed_by() {
+        fn market(id: u64, updated_at: &str) -> Value {
+            json!({
+                "id": id.to_string(),
+                "updatedAt": updated_at,
+                "conditionId": format!("0x{}", format!("{id:02x}").repeat(32)),
+                "clobTokenIds": [id.to_string()],
+                "tags": [],
+                "events": []
+            })
+        }
+
+        async fn list_markets(State(markets): State<Arc<RwLock<Vec<Value>>>>) -> Json<Value> {
+            Json(json!({ "markets": markets.read().unwrap().clone(), "next_cursor": "" }))
+        }
+
+        // A single market that Gamma's pagination "lost": present in the
+        // active listing, but the sync will run with a cursor already past it.
+        let markets = Arc::new(RwLock::new(vec![market(10, "2026-01-01T00:00:00Z")]));
+        let app = Router::new()
+            .route("/markets/keyset", get(list_markets))
+            .with_state(markets.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let catalog = Catalog::new(Vec::new());
+        let gamma = GammaClient::new(format!("http://{address}")).unwrap();
+
+        // Simulate "the fast path already moved past this point in time" —
+        // exactly what happens after a pagination gap once real, newer
+        // markets keep advancing the cursor.
+        let stale_cursor = EnrichmentCursor {
+            updated_at: "2026-06-01T00:00:00Z".into(),
+            market_id: 999,
+        };
+        storage
+            .save_enrichment_cursor(&serde_json::to_string(&stale_cursor).unwrap())
+            .unwrap();
+
+        let cursors = CursorPair::load(&storage).unwrap();
+        sync_both(&gamma, &catalog, &cursors, 3).await.unwrap();
+        assert!(
+            catalog.get_by_market_id(10).is_none(),
+            "sanity check: the incremental path must indeed miss it, matching the real bug"
+        );
+
+        let changed = reconcile_full(&gamma, &catalog, 3).await.unwrap();
+        assert_eq!(changed, 1);
+        assert!(
+            catalog.get_by_market_id(10).is_some(),
+            "reconciliation must recover the market the incremental cursor skipped"
+        );
+        assert_eq!(
+            storage.load_enrichment_cursor().unwrap().unwrap(),
+            serde_json::to_string(&stale_cursor).unwrap(),
+            "reconciliation must never touch the persisted incremental cursor"
+        );
+
+        // Idempotent: reconciling again with the market already present
+        // finds nothing new to merge.
+        assert_eq!(reconcile_full(&gamma, &catalog, 3).await.unwrap(), 0);
         server.abort();
     }
 }

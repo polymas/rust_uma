@@ -78,7 +78,7 @@ src/
 新业务字段优先看它属于哪个域，不要在 `pipeline.rs` 里堆解析逻辑，也不要在
 `uma/events/` 里塞富化/存储逻辑。
 
-### 1.4 多路 RPC 与已知的三个"真实数据 bug"（避免重蹈覆辙）
+### 1.4 多路 RPC 与已知的四个"真实数据 bug"（避免重蹈覆辙）
 
 - `uma/rpc.rs` 支持 `WSS_RPC_LIST`（逗号分隔多个 WSS 端点赛马，去重靠
   `EventHub` 的 `(tx_hash, log_index)`），只有一个地址时自动退化为单路。生产
@@ -105,6 +105,18 @@ src/
   `updatedAt` 早停，不拉全部历史关闭市场（那些不会再产生新事件，缓存了也没
   用）。以后新增任何"缓存注定要被查询的实体"，先想清楚触发查询的时刻这个实
   体处于什么状态，不要想当然认为"活跃"等于"会被查询"。
+- **Gamma 的 keyset 翻页会静默漏项**：修完上一条后生产实测仍有约 40% miss，
+  抽样发现全部集中在"同一秒内批量创建的 Neg Risk 兄弟市场"（`updatedAt` 精确
+  到毫秒级几乎相同），高度符合"翻页边界落在并列排序键中间、部分记录被跳过"
+  的经典 keyset 分页问题。更麻烦的是：一旦增量水位推进过了这个时间点，
+  `sync_incremental` 的 `is_older` 判断会让这条市场永久不可达——快路径没有
+  "回头补漏"的能力。修复是 `run_catalog_reconcile`：独立的后台任务（不是
+  `run_catalog_sync` 循环里的一个分支，避免几十分钟的全量扫描拖慢 60s 级的
+  增量刷新），每隔 `CATALOG_RECONCILE_INTERVAL_HOURS`（默认 6 小时）忽略游标
+  做一次全量重扫，只增量合并（`catalog.upsert` 本身幂等），**绝不写回**增量
+  cursor 文件——它只负责查漏补缺，不参与、不干扰快路径的正常推进。
+  `catalog_reconcile_gaps_closed_total`（`/healthz`、`/metrics`）应该趋向于
+  0；如果长期非零，说明 Gamma 分页丢失是持续性的，不是偶发。
 
 ## 2. 测试
 
@@ -205,9 +217,11 @@ brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
 - 部署后：`curl http://43.131.1.194:8011/healthz`，关注
   `rpc_connected`、`rpc_sources_connected`（应等于配置的 WSS 路数）、
   `enrichment_hits_via_market_id_total` 是否在增长（富化没坏掉的信号）、
-  `decode_errors_total` 涨得快是正常的——UMA 的 `ProposePrice`/`DisputePrice`
-  topic 是全 Polygon 共用的，非 Polymarket 的 UMA 请求也会先收到再按 emitter
-  白名单过滤掉，这部分误差不代表故障。
+  `catalog_markets` 冷启动后是否稳定在几十万量级（活跃 + 最近关闭窗口）、
+  `catalog_reconcile_gaps_closed_total` 长期趋势（应该趋向 0，非零说明还在
+  查漏补缺）；`decode_errors_total` 涨得快是正常的——UMA 的
+  `ProposePrice`/`DisputePrice` topic 是全 Polygon 共用的，非 Polymarket 的
+  UMA 请求也会先收到再按 emitter 白名单过滤掉，这部分误差不代表故障。
 
 ## 5. 升级
 

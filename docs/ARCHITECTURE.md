@@ -44,8 +44,10 @@ flowchart TD
     subgraph ENRICH["enrichment.rs · 启动前预热"]
         direction LR
         SYNC["sync_both：活跃(closed=false)\n+ 最近关闭(滚动窗口)\nsync_catalog_before_uma / run_catalog_sync"]
+        RECONCILE["run_catalog_reconcile\n独立任务, 每 N 小时全量重扫\n忽略游标, 只增量合并, 不写回 cursor"]
         CAT[("Catalog\nby_condition_id\nmarket_to_condition")]
         SYNC --> CAT
+        RECONCILE -.->|"自愈 keyset 翻页漏项"| CAT
     end
 
     subgraph STORE["storage.rs"]
@@ -85,7 +87,7 @@ flowchart TD
     classDef void fill:#f0f0ee,stroke:#adaa9e,color:#6b6a5c,stroke-dasharray: 3 2;
     class WSS1,WSSN,HTTP,GAPI,LW,BF,DEC src;
     class DEDUP,RESOLVE,ERING,BATCH,ENC,FRING hot;
-    class SYNC,CAT,WAL,SNAP,CUR warm;
+    class SYNC,RECONCILE,CAT,WAL,SNAP,CUR warm;
     class WSAPI,HTTPAPI sink;
     class DROP void;
 

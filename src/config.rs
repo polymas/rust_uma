@@ -37,6 +37,16 @@ pub struct Config {
     /// unbounded for no benefit once past UMA's dispute window. This bounds
     /// intake to a rolling recent window instead of full history.
     pub closed_market_lookback_days: u64,
+    /// How often to re-walk the entire Gamma active + recently-closed set
+    /// from scratch (ignoring the incremental cursor) and merge any missing
+    /// markets into the catalog. Exists because Gamma's keyset pagination has
+    /// been observed to silently drop entries — most reliably reproduced with
+    /// a batch of Neg Risk sibling markets sharing a near-identical
+    /// `updatedAt` — and once the incremental cursor advances past a missed
+    /// market's timestamp, the fast path can never pick it up again. Runs as
+    /// an independent background task so it never delays the incremental
+    /// sync or the hot path.
+    pub catalog_reconcile_interval: Duration,
     pub require_market_id: bool,
     pub ws_write_timeout: Duration,
 }
@@ -127,6 +137,9 @@ impl Config {
                 "60",
             )?),
             closed_market_lookback_days: parse("CLOSED_MARKET_LOOKBACK_DAYS", "3")?,
+            catalog_reconcile_interval: Duration::from_secs(
+                parse::<u64>("CATALOG_RECONCILE_INTERVAL_HOURS", "6")? * 3600,
+            ),
             require_market_id: parse_bool("REQUIRE_MARKET_ID", true)?,
             ws_write_timeout: Duration::from_millis(parse("WS_WRITE_TIMEOUT_MS", "5000")?),
         })

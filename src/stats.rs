@@ -18,6 +18,13 @@ pub struct Stats {
     pub enrichment_hits_via_market_id: AtomicU64,
     pub enrichment_misses: AtomicU64,
     pub catalog_markets: AtomicU64,
+    /// Markets added by a from-scratch reconciliation walk that the
+    /// cursor-driven incremental sync had permanently skipped (Gamma's
+    /// keyset pagination can silently drop entries, especially within a
+    /// batch of markets created with near-identical updatedAt — see
+    /// `enrichment::run_catalog_reconcile`). Should trend toward 0 per pass;
+    /// sustained non-zero values mean the incremental sync is leaking.
+    pub catalog_reconcile_gaps_closed: AtomicU64,
     pub last_upstream_received_at_us: AtomicU64,
     pub last_broadcast_at_us: AtomicU64,
     pub subscribers: AtomicU64,

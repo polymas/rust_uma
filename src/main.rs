@@ -6,7 +6,9 @@ use std::{
 use rust_uma::{
     api::{AppState, serve},
     config::Config,
-    enrichment::{Catalog, GammaClient, run_catalog_sync, sync_catalog_before_uma},
+    enrichment::{
+        Catalog, GammaClient, run_catalog_reconcile, run_catalog_sync, sync_catalog_before_uma,
+    },
     hub::{EventHub, FrameHub},
     pipeline::{Processor, run_batcher},
     stats::Stats,
@@ -100,6 +102,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_rx.clone(),
         )),
         tokio::spawn(run_catalog_sync(
+            config.clone(),
+            gamma.clone(),
+            catalog.clone(),
+            storage.clone(),
+            stats.clone(),
+            shutdown_rx.clone(),
+        )),
+        tokio::spawn(run_catalog_reconcile(
             config.clone(),
             gamma,
             catalog.clone(),
