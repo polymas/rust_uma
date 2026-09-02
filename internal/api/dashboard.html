@@ -309,22 +309,33 @@ timeToggle.addEventListener("click", () => {
 const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50", unspecified: "—" };
 
 // Polymarket tag id -> label. 纯客户端浏览器直接拉 Polymarket 自己的公开
-// Gamma API（不经过本服务端，本服务端不做任何 tag 映射相关的事）。页面加载
-// 时拉一次，浏览器生命周期内不变；limit=1000 一页拉全（目前约 150 个 tag，
-// 该接口不提供分页游标）。拉取失败就留空对象，渲染时退化回显示原始数字 id。
-let tagLabels = {};
-async function loadTagLabels() {
+// Gamma API（不经过本服务端，本服务端不做任何 tag 映射相关的事）。
+//
+// `GET /tags?limit=...` 这个批量接口实测不可靠：不管传多大的 limit/ids，
+// 它都只返回同一批固定的~100条"精选"标签，像 id=2（Politics）这种真实市场
+// 常见的 tag 根本不在里面——批量拉全量、启动时缓存一份的思路在这个接口上
+// 行不通。能查到任意 id 的只有单个查询 `GET /tags/{id}`（例如 `/tags/2` ->
+// {"label":"Politics",...}），所以改成按事件里实际出现的 id 懒加载 + 缓存：
+// 第一次见到某个 id 才查一次，查到后写进 tagLabels 永久复用，查不到（404 或
+// 网络失败）就记入 tagFetchFailed，同样不再重试，避免同一个坏 id 反复打请求。
+const tagLabels = {};
+const tagFetchInflight = new Set();
+const tagFetchFailed = new Set();
+async function ensureTagLabel(id) {
+  if (id in tagLabels || tagFetchInflight.has(id) || tagFetchFailed.has(id)) return;
+  tagFetchInflight.add(id);
   try {
-    const res = await fetch("https://gamma-api.polymarket.com/tags?limit=1000", { cache: "no-store" });
-    if (!res.ok) return;
-    const list = await res.json();
-    for (const tag of list) tagLabels[tag.id] = tag.label;
+    const res = await fetch(`https://gamma-api.polymarket.com/tags/${id}`, { cache: "no-store" });
+    if (!res.ok) { tagFetchFailed.add(id); return; }
+    const tag = await res.json();
+    tagLabels[id] = tag.label;
     renderEvents();
   } catch (e) {
-    console.error("tag label fetch failed", e);
+    tagFetchFailed.add(id);
+  } finally {
+    tagFetchInflight.delete(id);
   }
 }
-loadTagLabels();
 
 function renderEvents() {
   if (!events.length) return;
@@ -336,6 +347,7 @@ function renderEvents() {
     const tokenIds = (ev.token_ids || []).map((id, i) =>
       i === winnerIdx ? `<b>${short(id)}</b>` : short(id)
     ).join("<br>") || "—";
+    for (const id of ev.tag_ids || []) ensureTagLabel(id); // fire-and-forget; re-renders itself once resolved
     const tags = (ev.tag_ids || []).map((id) => tagLabels[id] || id).join(", ") || "—";
     return `
     <tr>
