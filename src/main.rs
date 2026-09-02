@@ -54,7 +54,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (storage_tx, storage_rx) = mpsc::channel(config.live_buffer.max(1));
     let gamma = GammaClient::new(config.gamma_base_url.clone())?;
 
-    let changed = sync_catalog_before_uma(&gamma, &catalog, &storage).await?;
+    let changed = sync_catalog_before_uma(
+        &gamma,
+        &catalog,
+        &storage,
+        config.closed_market_lookback_days,
+    )
+    .await?;
     stats
         .catalog_markets
         .store(catalog.len() as u64, Ordering::Relaxed);

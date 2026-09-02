@@ -151,13 +151,14 @@ impl GammaClient {
         &self,
         cursor: Option<&str>,
         newest_first: bool,
+        closed: bool,
     ) -> Result<GammaPage, EnrichmentError> {
         let mut request = self
             .client
             .get(format!("{}/markets/keyset", self.base_url))
             .query(&[
                 ("limit", "100"),
-                ("closed", "false"),
+                ("closed", if closed { "true" } else { "false" }),
                 ("include_tag", "true"),
             ]);
         if newest_first {
@@ -204,21 +205,79 @@ impl EnrichmentCursor {
     }
 }
 
+/// Loads/persists the two independent cursor streams (active markets, and
+/// recently-closed markets) under one shared name so the call sites in
+/// `sync_catalog_before_uma` / `run_catalog_sync` don't repeat themselves.
+struct CursorPair {
+    active: Option<EnrichmentCursor>,
+    closed: Option<EnrichmentCursor>,
+}
+
+impl CursorPair {
+    fn load(storage: &Storage) -> Result<Self, EnrichmentError> {
+        Ok(Self {
+            active: storage
+                .load_enrichment_cursor()?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+            closed: storage
+                .load_closed_market_cursor()?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+        })
+    }
+}
+
+/// One combined sync pass: the always-cached active (closed=false) set, plus
+/// Gamma markets that closed within `closed_lookback_days` — bounded so the
+/// catalog doesn't grow to hold every market that has ever closed, while
+/// still covering the window ProposePrice/DisputePrice realistically lands
+/// in (see the `closed_market_lookback_days` doc comment on Config).
+async fn sync_both(
+    gamma: &GammaClient,
+    catalog: &Catalog,
+    cursors: &CursorPair,
+    closed_lookback_days: u64,
+) -> Result<(usize, Option<EnrichmentCursor>, Option<EnrichmentCursor>), EnrichmentError> {
+    let (changed_active, next_active) = sync_incremental(
+        gamma,
+        catalog,
+        cursors.active.as_ref(),
+        false,
+        None,
+        usize::MAX,
+    )
+    .await?;
+    let boundary = lookback_boundary_date(closed_lookback_days);
+    let (changed_closed, next_closed) = sync_incremental(
+        gamma,
+        catalog,
+        cursors.closed.as_ref(),
+        true,
+        Some(&boundary),
+        usize::MAX,
+    )
+    .await?;
+    Ok((changed_active + changed_closed, next_active, next_closed))
+}
+
 pub async fn sync_catalog_before_uma(
     gamma: &GammaClient,
     catalog: &Catalog,
     storage: &Storage,
+    closed_lookback_days: u64,
 ) -> Result<usize, EnrichmentError> {
-    let previous = storage
-        .load_enrichment_cursor()?
-        .map(|value| serde_json::from_str::<EnrichmentCursor>(&value))
-        .transpose()?;
-    let (changed, next) = sync_incremental(gamma, catalog, previous.as_ref(), usize::MAX).await?;
+    let cursors = CursorPair::load(storage)?;
+    let (changed, next_active, next_closed) =
+        sync_both(gamma, catalog, &cursors, closed_lookback_days).await?;
 
-    // The catalog must become durable before its cursor advances.
+    // The catalog must become durable before either cursor advances.
     storage.save_catalog(&catalog.snapshot())?;
-    if let Some(next) = next {
+    if let Some(next) = next_active {
         storage.save_enrichment_cursor(&serde_json::to_string(&next)?)?;
+    }
+    if let Some(next) = next_closed {
+        storage.save_closed_market_cursor(&serde_json::to_string(&next)?)?;
     }
     Ok(changed)
 }
@@ -238,18 +297,27 @@ pub async fn run_catalog_sync(
         tokio::select! {
             _ = shutdown.changed() => if *shutdown.borrow() { break; },
             _ = interval.tick() => {
-                let previous = storage.load_enrichment_cursor()
-                    .ok().flatten()
-                    .and_then(|value| serde_json::from_str::<EnrichmentCursor>(&value).ok());
-                match sync_incremental(&gamma, &catalog, previous.as_ref(), usize::MAX).await {
-                    Ok((changed, next)) if changed > 0 || next != previous => {
+                let cursors = match CursorPair::load(&storage) {
+                    Ok(cursors) => cursors,
+                    Err(error) => { warn!(%error, "loading Gamma cursors"); continue; }
+                };
+                match sync_both(&gamma, &catalog, &cursors, config.closed_market_lookback_days).await {
+                    Ok((changed, next_active, next_closed))
+                        if changed > 0 || next_active != cursors.active || next_closed != cursors.closed =>
+                    {
                         let snapshot = catalog.snapshot();
                         let persisted = storage.save_catalog(&snapshot).and_then(|_| {
-                            let Some(value) = next else { return Ok(()); };
-                            let encoded = serde_json::to_string(&value).map_err(|_| {
-                                crate::storage::StorageError::Format("enrichment cursor")
-                            })?;
-                            storage.save_enrichment_cursor(&encoded)
+                            if let Some(value) = &next_active {
+                                storage.save_enrichment_cursor(&serde_json::to_string(value).map_err(|_| {
+                                    crate::storage::StorageError::Format("enrichment cursor")
+                                })?)?;
+                            }
+                            if let Some(value) = &next_closed {
+                                storage.save_closed_market_cursor(&serde_json::to_string(value).map_err(|_| {
+                                    crate::storage::StorageError::Format("closed market cursor")
+                                })?)?;
+                            }
+                            Ok(())
                         });
                         if let Err(error) = persisted {
                             warn!(%error, "Gamma incremental catalog persistence failed");
@@ -266,17 +334,46 @@ pub async fn run_catalog_sync(
     }
 }
 
+/// `YYYY-MM-DD` for `days_ago` days before now (UTC), used as a lexicographic
+/// lower bound against Gamma's `updatedAt` (also UTC, ISO 8601) — no need to
+/// pull in a date/time crate for a day-granularity cutoff.
+fn lookback_boundary_date(days_ago: u64) -> String {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let boundary_days = now_secs / 86_400 - days_ago.min(now_secs / 86_400);
+    let (y, m, d) = civil_from_days(boundary_days as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Howard Hinnant's `civil_from_days`: days-since-1970-01-01 -> (year, month, day).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 async fn sync_incremental(
     gamma: &GammaClient,
     catalog: &Catalog,
     previous: Option<&EnrichmentCursor>,
+    closed: bool,
+    lookback_boundary: Option<&str>,
     max_pages: usize,
 ) -> Result<(usize, Option<EnrichmentCursor>), EnrichmentError> {
     let mut page_cursor: Option<String> = None;
     let mut changed = 0;
     let mut newest = previous.cloned();
     for _ in 0..max_pages.max(1) {
-        let page = gamma.keyset(page_cursor.as_deref(), true).await?;
+        let page = gamma.keyset(page_cursor.as_deref(), true, closed).await?;
         if page.markets.is_empty() {
             break;
         }
@@ -284,6 +381,10 @@ async fn sync_incremental(
         for raw in page.markets {
             let market_id = raw.id.parse::<u64>().ok();
             if previous.is_some_and(|cursor| cursor.is_older(&raw.updated_at)) {
+                reached_previous = true;
+                continue;
+            }
+            if lookback_boundary.is_some_and(|boundary| raw.updated_at.as_str() < boundary) {
                 reached_previous = true;
                 continue;
             }
@@ -454,6 +555,14 @@ mod tests {
     }
 
     #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_698), (2026, 9, 2));
+        assert_eq!(civil_from_days(20_695), (2026, 8, 30));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29)); // leap day
+    }
+
+    #[test]
     fn resolves_neg_risk_market_via_market_id_not_binary_formula() {
         // Same real market as uma::events::tests::
         // neg_risk_event_binary_formula_yields_wrong_condition_id: Gamma id
@@ -540,7 +649,7 @@ mod tests {
         let gamma = GammaClient::new(format!("http://{address}")).unwrap();
 
         assert_eq!(
-            sync_catalog_before_uma(&gamma, &catalog, &storage)
+            sync_catalog_before_uma(&gamma, &catalog, &storage, 7)
                 .await
                 .unwrap(),
             2
@@ -562,7 +671,7 @@ mod tests {
             market(1, "2026-09-01T00:00:01Z"),
         ];
         assert_eq!(
-            sync_catalog_before_uma(&gamma, &catalog, &storage)
+            sync_catalog_before_uma(&gamma, &catalog, &storage, 7)
                 .await
                 .unwrap(),
             1
@@ -577,6 +686,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second.market_id, 3);
+        server.abort();
+    }
+
+    /// Regression test for the miss-rate bug: ProposePrice/DisputePrice fire
+    /// right as a market closes, so an active-only (closed=false) catalog
+    /// systematically misses almost every real event. This proves the
+    /// closed-market sync (a) picks up a market that just closed, within the
+    /// lookback window, and (b) still excludes one that closed long before
+    /// it — the catalog isn't supposed to hold every market that has ever
+    /// closed, only a bounded recent window.
+    #[tokio::test]
+    async fn recently_closed_markets_are_cached_but_old_ones_are_not() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+
+        #[derive(Clone, Default)]
+        struct MarketsByStatus {
+            active: Arc<RwLock<Vec<Value>>>,
+            closed: Arc<RwLock<Vec<Value>>>,
+        }
+
+        async fn list_markets(
+            State(markets): State<MarketsByStatus>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            let source = if query.get("closed").map(String::as_str) == Some("true") {
+                &markets.closed
+            } else {
+                &markets.active
+            };
+            Json(json!({ "markets": source.read().unwrap().clone(), "next_cursor": "" }))
+        }
+
+        fn market(id: u64, updated_at: &str) -> Value {
+            json!({
+                "id": id.to_string(),
+                "updatedAt": updated_at,
+                "conditionId": format!("0x{}", format!("{id:02x}").repeat(32)),
+                "clobTokenIds": [id.to_string()],
+                "tags": [],
+                "events": []
+            })
+        }
+
+        let now = lookback_boundary_date(0); // today, YYYY-MM-DD
+        let today_ts = format!("{now}T12:00:00Z");
+        let state = MarketsByStatus {
+            active: Arc::new(RwLock::new(vec![market(10, &today_ts)])),
+            closed: Arc::new(RwLock::new(vec![
+                market(20, &today_ts),              // just closed: must be cached
+                market(30, "2020-01-01T00:00:00Z"), // closed ages ago: must NOT be cached
+            ])),
+        };
+        let app = Router::new()
+            .route("/markets/keyset", get(list_markets))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let catalog = Catalog::new(Vec::new());
+        let gamma = GammaClient::new(format!("http://{address}")).unwrap();
+
+        sync_catalog_before_uma(&gamma, &catalog, &storage, 3)
+            .await
+            .unwrap();
+
+        assert!(
+            catalog.get_by_market_id(10).is_some(),
+            "active market must be cached"
+        );
+        assert!(
+            catalog.get_by_market_id(20).is_some(),
+            "market closed today must be cached — this is the ProposePrice miss-rate fix"
+        );
+        assert!(
+            catalog.get_by_market_id(30).is_none(),
+            "market closed in 2020 must stay outside the bounded lookback window"
+        );
         server.abort();
     }
 }

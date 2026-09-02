@@ -18,8 +18,9 @@
   （云安全组放行 `TCP:8000-8100`），服务本身没有认证 —— 这是当前的既定状态，
   不是遗漏；如果以后要收紧访问，需要显式决定（IP 白名单 / API Key / 换回
   127.0.0.1 + 反向代理），不要自作主张改回。
-- 数据目录：服务器上是 `/var/lib/rust-uma`（`enrichment.cursor` / `uma.cursor`
-  / `catalog.bin` / `events.wal`），本地开发默认是 `./.cache`。
+- 数据目录：服务器上是 `/var/lib/rust-uma`（`enrichment.cursor` /
+  `enrichment_closed.cursor` / `uma.cursor` / `catalog.bin` / `events.wal`），
+  本地开发默认是 `./.cache`。
 
 ## 1. 开发
 
@@ -51,7 +52,7 @@ cargo run
   message、日志截图里贴出其中的 RPC 地址/token。
 - 本地验证 NegRisk/ancillary 解析这类"真实链上格式"相关的改动时，优先用
   `eth_getLogs` 抓一条真实交易做 fixture（历史上已经因为只用手写的合成样例，
-  漏掉了两个真实数据才会触发的 bug，见 1.4）。
+  漏掉了几个真实数据才会触发的 bug，见 1.4）。
 
 ### 1.3 目录约定
 
@@ -77,7 +78,7 @@ src/
 新业务字段优先看它属于哪个域，不要在 `pipeline.rs` 里堆解析逻辑，也不要在
 `uma/events/` 里塞富化/存储逻辑。
 
-### 1.4 多路 RPC 与已知的两个"真实数据 bug"（避免重蹈覆辙）
+### 1.4 多路 RPC 与已知的三个"真实数据 bug"（避免重蹈覆辙）
 
 - `uma/rpc.rs` 支持 `WSS_RPC_LIST`（逗号分隔多个 WSS 端点赛马，去重靠
   `EventHub` 的 `(tx_hash, log_index)`），只有一个地址时自动退化为单路。生产
@@ -95,6 +96,15 @@ src/
   `ancillary.rs::field_number` 已经改成按连续数字截断而不是按逗号截断，新增
   字段解析时默认"不能假设分隔符统一"，尤其是数字字段要用专门的数字截断逻辑，
   不要复用逗号分隔的 `field_value`。
+- **富化缓存只拉活跃市场，实际漏了大部分真实事件**：`ProposePrice`/
+  `DisputePrice` 绝大多数发生在市场刚"结束"、Gamma 把它标成 `closed: true`
+  的那一刻，而 Gamma 增量同步之前只查 `closed=false`——生产环境实测过 84%
+  的 miss 率，抽样全部命中"该市场此时 `closed: true`"。现在
+  `enrichment.rs::sync_both` 额外滚动缓存最近 `CLOSED_MARKET_LOOKBACK_DAYS`
+  （默认 3）天内关闭的市场，用独立的 `enrichment_closed.cursor` 水位、按
+  `updatedAt` 早停，不拉全部历史关闭市场（那些不会再产生新事件，缓存了也没
+  用）。以后新增任何"缓存注定要被查询的实体"，先想清楚触发查询的时刻这个实
+  体处于什么状态，不要想当然认为"活跃"等于"会被查询"。
 
 ## 2. 测试
 
@@ -116,7 +126,9 @@ cargo test
   回归测试（参考 `uma/events/mod.rs` 里
   `neg_risk_event_binary_formula_yields_wrong_condition_id` 的写法：注明来源
   交易哈希，交叉核对 Gamma API 返回值）。这条规则是用真金白银的教训换来的——
-  两个真实 bug 都是合成样例测试全绿、换成真实数据才暴露的。
+  前两个是合成样例测试全绿、换成真实数据才暴露的；第三个（富化覆盖率）是合成
+  测试根本无法覆盖的一类问题——数据形状是对的，但"该缓存哪些实体"这个业务判
+  断错了，只有拿生产真实流量核对命中率才能发现，见 4.4 的部署后检查清单。
 - 涉及富化/广播链路的改动，尽量补一条端到端测试（解码 → `Catalog::resolve`
   → `EventRecord::resolved_condition_id`/`to_proto`），不要只测中间某一层。
 - 不为了追求覆盖率去测无关紧要的 getter/Display；重点覆盖"链上数据形状会不会

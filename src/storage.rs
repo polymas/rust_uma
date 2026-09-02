@@ -56,6 +56,10 @@ impl Storage {
         self.dir.join("enrichment.cursor")
     }
 
+    fn closed_market_cursor_path(&self) -> PathBuf {
+        self.dir.join("enrichment_closed.cursor")
+    }
+
     fn uma_cursor_path(&self) -> PathBuf {
         self.dir.join("uma.cursor")
     }
@@ -194,6 +198,24 @@ impl Storage {
 
     pub fn save_enrichment_cursor(&self, cursor: &str) -> Result<(), StorageError> {
         atomic_write(&self.enrichment_cursor_path(), cursor.as_bytes())
+    }
+
+    /// Cursor for the separate "recently-closed Gamma markets" incremental
+    /// sync (see `enrichment::sync_both`), independent of the active-market
+    /// cursor above since the two queries (`closed=false` vs `closed=true`)
+    /// are unrelated streams.
+    pub fn load_closed_market_cursor(&self) -> Result<Option<String>, StorageError> {
+        let path = self.closed_market_cursor_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let value = fs::read_to_string(path)?;
+        let value = value.trim();
+        Ok((!value.is_empty()).then(|| value.to_owned()))
+    }
+
+    pub fn save_closed_market_cursor(&self, cursor: &str) -> Result<(), StorageError> {
+        atomic_write(&self.closed_market_cursor_path(), cursor.as_bytes())
     }
 
     pub fn load_uma_cursor(&self) -> Result<Option<u64>, StorageError> {
@@ -414,13 +436,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         storage.save_enrichment_cursor("gamma-watermark").unwrap();
+        storage
+            .save_closed_market_cursor("gamma-closed-watermark")
+            .unwrap();
         storage.save_uma_cursor(123).unwrap();
         assert_eq!(
             storage.load_enrichment_cursor().unwrap().as_deref(),
             Some("gamma-watermark")
         );
+        assert_eq!(
+            storage.load_closed_market_cursor().unwrap().as_deref(),
+            Some("gamma-closed-watermark")
+        );
         assert_eq!(storage.load_uma_cursor().unwrap(), Some(123));
         assert!(dir.path().join("enrichment.cursor").is_file());
+        assert!(dir.path().join("enrichment_closed.cursor").is_file());
         assert!(dir.path().join("uma.cursor").is_file());
     }
 }

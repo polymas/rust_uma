@@ -13,16 +13,26 @@ WSS；HTTP 仅用于查询、健康检查和指标。其实时热路径仅执行
 4. 向所有 WebSocket 客户端发布同一份预编码二进制批次；
 5. 异步追加可重放的本地状态。
 
-每次启动先读取 `.cache/enrichment.cursor`，完成 Gamma 增量目录同步并持久化；随后
-才读取 `.cache/uma.cursor`，建立订阅并补拉 UMA 区块。事件富化只按相关
-`condition_id` 查询内存 HashMap，平均时间复杂度为 O(1)。Gamma HTTP 请求、目录快照、
-文件系统 I/O、JSON 格式化和历史回补，均不会在实时 WebSocket 读取流程中同步执行。
+每次启动先读取 `.cache/enrichment.cursor`（活跃市场，`closed=false`）与
+`.cache/enrichment_closed.cursor`（最近关闭市场，`closed=true`，滚动窗口由
+`CLOSED_MARKET_LOOKBACK_DAYS` 控制，默认 3 天），完成两路 Gamma 增量目录同步
+并持久化；随后才读取 `.cache/uma.cursor`，建立订阅并补拉 UMA 区块。只缓存活
+跃市场会系统性漏掉大部分真实事件——`ProposePrice`/`DisputePrice` 绝大多数发
+生在市场刚关闭那一刻；缓存全部历史关闭市场又没有必要，早已关闭的市场不会再
+产生新事件。事件富化优先按 `market_id` 查询内存 HashMap（对任意 Adapter 类
+型都权威、平均时间复杂度 O(1)），`market_id` 缺失时才回退到链上推导的
+`condition_id` 查询。Gamma HTTP 请求、目录快照、文件系统 I/O、JSON 格式化和历
+史回补，均不会在实时 WebSocket 读取流程中同步执行。
 
 `ProposePrice` 和 `DisputePrice` 分别由独立业务解析器处理。输出通过组合结构共享链上
 日志元数据和价格请求字段。`ancillaryData` 不以原始字节数组发布，而是解析为
 `question_id`、`question`、`resolution_p1` 至 `resolution_p4`、`initializer` 和可选
-`market_id`；其中 `question_id` 为原始 ancillary bytes 的 Keccak-256，`condition_id` 为
-`keccak256(requester || question_id || uint256(2))`，不依赖 Gamma 才能获得。
+`market_id`；其中 `question_id` 为原始 ancillary bytes 的 Keccak-256。`condition_id`
+在解析阶段也会按标准二元 Adapter 公式
+`keccak256(requester || question_id || uint256(2))` 推导一份，但这个公式仅对标准
+UmaCtfAdapter 成立（对 Neg Risk 等非标准 Adapter 会得到错误值），因此对外广播的
+`condition_id` 以 `market_id` 命中 Gamma 缓存后的权威值为准，链上推导值只在
+`market_id` 缺失时作为兜底。
 
 ## 富化契约
 
@@ -86,9 +96,11 @@ GET /uma/v1/markets/:condition_id
 - API 监听地址：`127.0.0.1:8011`。
 - RPC 采集仅按事件 topic 过滤；解析后使用 `UMA_CONTRACT_ADDRESSES` 发送方白名单，
   默认包含已支持的新旧 Polygon UMA Oracle 地址。
-- `.cache` 包含两个独立水位：`enrichment.cursor` 为 Gamma 的
-  `(updatedAt, market_id)` 增量水位，`uma.cursor` 为已完成的 Polygon 区块高度。
-- 启动顺序固定为：同步富化 cursor 并落盘，加载富化缓存，再同步 UMA 区块 cursor。
+- `.cache` 包含三个独立水位：`enrichment.cursor`（活跃市场）与
+  `enrichment_closed.cursor`（最近关闭市场，窗口由 `CLOSED_MARKET_LOOKBACK_DAYS`
+  控制）均为 Gamma 的 `(updatedAt, market_id)` 增量水位，`uma.cursor` 为已完成
+  的 Polygon 区块高度。
+- 启动顺序固定为：同步两路富化 cursor 并落盘，加载富化缓存，再同步 UMA 区块 cursor。
 - 首次启动且未设置 `START_BLOCK`：根据链上区块时间戳定位最近 7 天的起始区块并
   补拉；天数由 `INITIAL_BACKFILL_DAYS` 配置。
 - 重启：先建立订阅，再通过 HTTP RPC 回补 `(uma.cursor, subscribed_head]`，同时缓冲

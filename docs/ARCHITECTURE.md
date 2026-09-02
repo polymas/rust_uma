@@ -43,7 +43,7 @@ flowchart TD
 
     subgraph ENRICH["enrichment.rs · 启动前预热"]
         direction LR
-        SYNC["sync_catalog_before_uma\n+ 周期增量 run_catalog_sync"]
+        SYNC["sync_both：活跃(closed=false)\n+ 最近关闭(滚动窗口)\nsync_catalog_before_uma / run_catalog_sync"]
         CAT[("Catalog\nby_condition_id\nmarket_to_condition")]
         SYNC --> CAT
     end
@@ -52,7 +52,7 @@ flowchart TD
         direction LR
         WAL["events.wal"]
         SNAP["catalog.bin"]
-        CUR["enrichment.cursor\numa.cursor"]
+        CUR["enrichment.cursor\nenrichment_closed.cursor\numa.cursor"]
     end
 
     subgraph API["api.rs · 对外接口"]
@@ -124,9 +124,10 @@ sequenceDiagram
     Main->>Storage: load_catalog() / load_events() / load_uma_cursor()
     Main->>Gamma: sync_catalog_before_uma()
     activate Gamma
-    Gamma->>Gamma: 读 enrichment.cursor, 增量拉 Gamma keyset
+    Gamma->>Gamma: 读 enrichment.cursor, 增量拉活跃(closed=false)市场
+    Gamma->>Gamma: 读 enrichment_closed.cursor, 增量拉最近关闭市场(滚动窗口)
     Gamma->>Storage: save_catalog() 落盘
-    Gamma->>Storage: save_enrichment_cursor() 落盘
+    Gamma->>Storage: save_enrichment_cursor() / save_closed_market_cursor() 落盘
     deactivate Gamma
     Note over Main: 此时 Catalog 已完整可查询，<br/>热路径才允许启动
     Main->>Rpc: run_rpc_loop()
@@ -154,7 +155,7 @@ flowchart TD
         direction TB
         ENV["/etc/rust-uma/rust-uma.env\n(首次部署派生, 之后手改)"]
         SVC["rust-uma.service\nUser=ubuntu · ProtectSystem=strict"]
-        STATE[("/var/lib/rust-uma\ncatalog.bin · events.wal\nenrichment.cursor · uma.cursor")]
+        STATE[("/var/lib/rust-uma\ncatalog.bin · events.wal\nenrichment[.closed].cursor · uma.cursor")]
         PORT(["0.0.0.0:8011\n云安全组放行 TCP:8000-8100"])
         ENV -.-> SVC
         SVC <--> STATE

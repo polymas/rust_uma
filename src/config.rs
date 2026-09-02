@@ -30,6 +30,13 @@ pub struct Config {
     pub max_decompressed_bytes: usize,
     pub gamma_base_url: String,
     pub gamma_refresh_interval: Duration,
+    /// How many days back to also cache recently-*closed* Gamma markets, in
+    /// addition to the always-cached active (closed=false) set. ProposePrice
+    /// mostly fires right as a market closes, so an active-only cache misses
+    /// most real events; but caching every closed market ever would grow
+    /// unbounded for no benefit once past UMA's dispute window. This bounds
+    /// intake to a rolling recent window instead of full history.
+    pub closed_market_lookback_days: u64,
     pub require_market_id: bool,
     pub ws_write_timeout: Duration,
 }
@@ -119,6 +126,7 @@ impl Config {
                 "GAMMA_REFRESH_INTERVAL_SECONDS",
                 "60",
             )?),
+            closed_market_lookback_days: parse("CLOSED_MARKET_LOOKBACK_DAYS", "3")?,
             require_market_id: parse_bool("REQUIRE_MARKET_ID", true)?,
             ws_write_timeout: Duration::from_millis(parse("WS_WRITE_TIMEOUT_MS", "5000")?),
         })

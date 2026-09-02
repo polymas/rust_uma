@@ -10,7 +10,14 @@
 - 两类事件使用独立业务解析器，并通过公共链上元数据和价格请求结构组合复用
 - `ancillaryData` 直接解析为 question、question ID、p1-p4、initializer 和可选 market ID
 - 启动时先按富化 cursor 完成 Gamma 增量缓存，再按 UMA 区块 cursor 补拉
-- UMA 事件在解析阶段从链上字段推导 `condition_id`，并以它在内存富化缓存中 O(1) 查询
+- Gamma 增量缓存包含全部活跃（`closed=false`）市场，并额外滚动缓存最近
+  `CLOSED_MARKET_LOOKBACK_DAYS`（默认 3）天内刚关闭的市场——
+  `ProposePrice`/`DisputePrice` 绝大多数发生在市场刚关闭那一刻，只缓存活跃
+  市场会系统性 miss 掉大部分真实事件；更早关闭的市场不再产生新事件，不纳入
+  缓存
+- UMA 事件解析阶段同时得到 `market_id` 和链上推导的 `condition_id`；富化优先
+  按 `market_id` 查询（对任意 Adapter 类型都成立），仅 `market_id` 缺失时才
+  回退到链上推导值
 - 只保存 `market_id / condition_id / token_ids / tag_ids`
 - `tag_ids` 合并 market 与 event tags，使用数字 ID 排序去重
 - 不包含 `outcomes`、价格数组和动态 `tick_size`
@@ -64,10 +71,12 @@ cargo run --release
 ```
 
 默认监听 `127.0.0.1:8011`，缓存目录为 `.cache/`。其中
-`enrichment.cursor` 保存 Gamma 的 `(updatedAt, market_id)` 增量水位，
-`uma.cursor` 保存已完成的 Polygon 区块高度。每次启动必须先完成富化增量同步，
-之后才建立实时订阅并补拉 UMA 数据。首次启动默认从链头时间向前精确定位 7 天的
-起始区块；可通过 `INITIAL_BACKFILL_DAYS` 调整，或用 `START_BLOCK` 显式覆盖。
+`enrichment.cursor` 保存活跃市场（`closed=false`）的 Gamma
+`(updatedAt, market_id)` 增量水位，`enrichment_closed.cursor` 独立保存最近关
+闭市场（`closed=true`）的同类水位，`uma.cursor` 保存已完成的 Polygon 区块高
+度。每次启动必须先完成两路富化增量同步，之后才建立实时订阅并补拉 UMA 数据。
+首次启动默认从链头时间向前精确定位 7 天的起始区块；可通过
+`INITIAL_BACKFILL_DAYS` 调整，或用 `START_BLOCK` 显式覆盖。
 
 ## 查询与订阅
 
