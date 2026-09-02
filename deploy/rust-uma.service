@@ -1,0 +1,23 @@
+[Unit]
+Description=Polymarket UMA Optimistic Oracle signal feed (rust-uma)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/rust-uma/rust-uma.env
+ExecStart=/opt/rust-uma/rust-uma
+Restart=always
+RestartSec=2s
+TimeoutStopSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=rust-uma
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

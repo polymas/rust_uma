@@ -1,0 +1,6 @@
+# Cross-compilation for deployment to the Linux (x86_64) production host.
+# Build on macOS with: cargo build --release --target x86_64-unknown-linux-musl
+# Toolchain: `brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl`
+# (installs a standalone musl-gcc/binutils set; no Docker required).
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-unknown-linux-musl-gcc"
