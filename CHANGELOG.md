@@ -4,16 +4,26 @@
 故障修复……即 [docs/WORKFLOW.md](docs/WORKFLOW.md) 3.1 节定义的"重要变更"）。
 日常小修小补不必进这里，git log 已经够用。
 
-条目在打 tag 推送的同一个 commit 里一起加，格式：
+条目在打 tag 推送的同一个 commit 里一起加，格式（`vX.Y.Z` 怎么定见
+[docs/WORKFLOW.md](docs/WORKFLOW.md) 3.1 节的升级规则）：
 
 ```
-## YYYY-MM-DD <tag>
+## vX.Y.Z（YYYY-MM-DD，<commit短哈希>）
 - 一句话说清楚改了什么、为什么（对下游/生产的影响）
 ```
 
-最新的写在最上面。
+最新的写在最上面。`v0.2.0` 之前的条目是旧的 `YYYYMMDD-<commit短哈希>` tag
+格式（当时还没上语义化版本号），历史记录不倒改，新条目一律用上面这个格式。
 
 <!-- 新条目加在这行下面 -->
+
+## v0.2.0（2026-09-03）
+- Tag 命名从 `YYYYMMDD-<commit短哈希>` 换成语义化版本号 `vX.Y.Z`，`Cargo.toml`
+  的 `version` 字段跟 tag 保持一致；升级规则（PATCH/MINOR/MAJOR 怎么判、
+  `0.y.z` 阶段的破坏性变更例外）写进了
+  [docs/WORKFLOW.md](docs/WORKFLOW.md) 3.1 节。这个版本号本身对应的就是
+  下面 `20260903-6fc36f8` 那次改动（`Category`/`BetType` 分类），只是补上语
+  义化版本号作为新方案的起点，没有新增代码改动。
 
 ## 2026-09-03 20260903-6fc36f8
 - `UmaEvent` 新增 `category`/`bet_type` 两个字段（一级分类：体育/电竞/政治/
