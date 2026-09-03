@@ -17,6 +17,19 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.4.0（2026-09-03，428273b）
+- `BetType` 新增三组二级下注类型：`3xxx` Crypto（触价/定档/涨跌/兜底）、
+  `4xxx` Politics（选举获胜/美联储利率决议/推文数量分档/兜底）、`5xxx`
+  Culture（夺魁登顶/票房播放量分档/兜底）——规则和测试都来自实测抓取的真实
+  Gamma 数据（Hit Price/Multi Strikes/Up or Down/Elections/Fed Rates/Tweet
+  Markets 等 tag 都是 Polymarket 自己打的）。`Category` 现在把
+  Sports/Esports/Weather/Crypto/Politics/Culture 六个分类都算"可下注"。
+- 顺带修了一个真实 bug：体育组的 "Will X win the Y?" 文本规则以前是全分类
+  共享的，会误判到措辞相似的政治选举市场上；现在按分类分组匹配，每组只用
+  自己的规则，不会跨组误判。
+- 面板"类型"/"富化"两列翻成中文（之前漏翻了）；`internal/api/llms.txt` 补
+  上 `category`/`bet_type` 的完整下游文档。
+
 ## v0.3.0（2026-09-03，e150823）
 - 富化 miss 的事件不再经 WSS 广播——没有 `token_ids` 下游拿到也没法下单，
   广播出去只是噪音；miss 事件仍然进 `EventHub` 去重环、写本地 `events.wal`、
