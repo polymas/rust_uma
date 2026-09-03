@@ -14,12 +14,19 @@ use tracing::{error, warn};
 
 use crate::{
     hub::EventHub,
-    model::{EventRecord, MarketEnrichment},
+    model::{BetType, Category, EventRecord, MarketEnrichment},
     stats::{EnrichmentStatsSnapshot, Stats},
     wire::pb,
 };
 
-const CATALOG_MAGIC: &[u8; 8] = b"UMACAT1\0";
+const CATALOG_MAGIC: &[u8; 8] = b"UMACAT2\0";
+// Previous catalog.bin format (no category/bet_type bytes per record) —
+// recognized on load so an upgrade doesn't hard-fail startup on a
+// still-`UMACAT1\0` cache from before this field existed. See "升级" in
+// docs/WORKFLOW.md: cross-version cache data must never silently
+// misdeserialize, but a clean, well-understood old-format cache is a case we
+// can self-heal from (full Gamma re-sync), not one that needs a hard error.
+const CATALOG_MAGIC_V1: &[u8; 8] = b"UMACAT1\0";
 const WAL_MAGIC: &[u8; 8] = b"UMAWAL1\0";
 const MAX_WAL_RECORD: usize = 1 << 20;
 
@@ -77,7 +84,16 @@ impl Storage {
         let mut reader = BufReader::new(File::open(path)?);
         let mut magic = [0_u8; 8];
         reader.read_exact(&mut magic)?;
-        if &magic != CATALOG_MAGIC {
+        if magic == *CATALOG_MAGIC_V1 {
+            warn!(
+                "catalog.bin is the pre-category/bet_type format ({:?}); \
+                 discarding it and re-syncing the full catalog from Gamma \
+                 instead of failing startup",
+                String::from_utf8_lossy(CATALOG_MAGIC_V1)
+            );
+            return Ok(Vec::new());
+        }
+        if magic != *CATALOG_MAGIC {
             return Err(StorageError::Format("catalog magic"));
         }
         let count = read_u32(&mut reader)? as usize;
@@ -98,11 +114,18 @@ impl Storage {
             for _ in 0..tag_count {
                 tag_ids.push(read_u32(&mut reader)?);
             }
+            let category = Category::from_proto(read_u8(&mut reader)? as i32);
+            // `BetType` values are `CCCBBB`-encoded (see proto/uma.proto) and
+            // can reach into the low hundred-thousands, so unlike `category`
+            // this doesn't fit in one byte.
+            let bet_type = BetType::from_proto(read_i32(&mut reader)?);
             markets.push(MarketEnrichment {
                 market_id,
                 condition_id,
                 token_ids,
                 tag_ids,
+                category,
+                bet_type,
             });
         }
         Ok(markets)
@@ -138,6 +161,8 @@ impl Storage {
             for tag in &market.tag_ids {
                 writer.write_all(&tag.to_be_bytes())?;
             }
+            writer.write_all(&[market.category.to_proto() as u8])?;
+            writer.write_all(&market.bet_type.to_proto().to_be_bytes())?;
         }
         writer.flush()?;
         writer.get_ref().sync_all()?;
@@ -444,6 +469,18 @@ fn temporary_path(path: &Path) -> PathBuf {
     ))
 }
 
+fn read_i32(reader: &mut impl Read) -> io::Result<i32> {
+    let mut value = [0_u8; 4];
+    reader.read_exact(&mut value)?;
+    Ok(i32::from_be_bytes(value))
+}
+
+fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
+    let mut value = [0_u8; 1];
+    reader.read_exact(&mut value)?;
+    Ok(value[0])
+}
+
 fn read_u16(reader: &mut impl Read) -> io::Result<u16> {
     let mut value = [0_u8; 2];
     reader.read_exact(&mut value)?;
@@ -486,9 +523,32 @@ mod tests {
             condition_id: [1; 32],
             token_ids: vec![[2; 32], [3; 32]],
             tag_ids: vec![1, 64, 100_021],
+            category: Category::Sports,
+            bet_type: BetType::Moneyline,
         };
         storage.save_catalog(std::slice::from_ref(&market)).unwrap();
         assert_eq!(storage.load_catalog().unwrap(), vec![market]);
+    }
+
+    #[test]
+    fn old_catalog_format_self_heals_to_an_empty_catalog_instead_of_hard_failing() {
+        // A `UMACAT1\0` file (pre category/bet_type) must not crash startup —
+        // it should be treated like "no cache yet" and trigger a full Gamma
+        // re-sync. Hand-written in the old (still-supported-for-reading)
+        // wire shape: magic, count=1, one record with no trailing
+        // category/bet_type bytes.
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CATALOG_MAGIC_V1);
+        bytes.extend_from_slice(&1_u32.to_be_bytes()); // count
+        bytes.extend_from_slice(&42_u64.to_be_bytes()); // market_id
+        bytes.extend_from_slice(&[7; 32]); // condition_id
+        bytes.extend_from_slice(&0_u16.to_be_bytes()); // token_count
+        bytes.extend_from_slice(&0_u16.to_be_bytes()); // tag_count
+        fs::write(dir.path().join("catalog.bin"), &bytes).unwrap();
+
+        assert_eq!(storage.load_catalog().unwrap(), Vec::new());
     }
 
     #[test]

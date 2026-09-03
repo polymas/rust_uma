@@ -1,0 +1,55 @@
+{
+  "_comment": "匹配/加载逻辑见 src/category.rs；每条规则是怎么从真实抓到的 Gamma/链上数据推出来的，见相关会话记录。改规则改这个文件，同时去 src/category.rs 补一条回归测试，不要绕开规则条目直接改编译后的匹配逻辑。",
+
+  "tag_rules": [
+    { "tag_id": 64, "category": "ESPORTS" },
+    { "tag_id": 1, "category": "SPORTS" },
+    { "tag_id": 84, "category": "WEATHER" },
+    { "tag_id": 2, "category": "POLITICS" },
+    { "tag_id": 21, "category": "CRYPTO" },
+    { "tag_id": 596, "category": "CULTURE" }
+  ],
+
+  "tag_bet_type_rules": [
+    { "tag_id": 104596, "bet_type": "TEMP_HIGH" },
+    { "tag_id": 104597, "bet_type": "TEMP_LOW" },
+    { "tag_id": 103041, "bet_type": "PRECIPITATION" },
+    { "tag_id": 103545, "bet_type": "PRECIPITATION" },
+    { "tag_id": 103235, "bet_type": "PRECIPITATION" },
+    { "tag_id": 106182, "bet_type": "PRECIPITATION" },
+    { "tag_id": 1313, "bet_type": "PRECIPITATION" },
+    { "tag_id": 102023, "bet_type": "STORM" },
+    { "tag_id": 85, "bet_type": "STORM" },
+    { "tag_id": 102186, "bet_type": "STORM" }
+  ],
+
+  "sports_market_type_rules": [
+    { "contains": "child_moneyline", "bet_type": "GAME_WINNER" },
+    { "contains": "moneyline", "bet_type": "MONEYLINE" },
+    { "contains": "handicap", "bet_type": "SPREAD" },
+    { "contains": "spread", "bet_type": "SPREAD" },
+    { "contains": "total", "bet_type": "OVER_UNDER" },
+    { "contains": "corners", "bet_type": "OVER_UNDER" },
+    { "contains": "completed_match", "bet_type": "SPORTS_PROP" },
+    { "contains": "to_score", "bet_type": "SPORTS_PROP" },
+    { "contains": "exact_score", "bet_type": "SPORTS_PROP" },
+    { "contains": "to_advance", "bet_type": "SPORTS_PROP" },
+    { "contains": "result", "bet_type": "MONEYLINE" },
+    { "contains": "winner", "bet_type": "MONEYLINE" }
+  ],
+
+  "question_text_rules": [
+    { "regex": "\\bSpread:|\\bHandicap\\b", "bet_type": "SPREAD" },
+    { "regex": "\\bO/U\\b|Over/Under", "bet_type": "OVER_UNDER" },
+    { "regex": "\\b(Game|Map|Set|Leg)\\s*\\d+\\s*Winner\\b", "bet_type": "GAME_WINNER" },
+    { "regex": "^[^:]+\\svs\\.?\\s[^:]+$", "bet_type": "MONEYLINE" },
+    { "regex": "highest temperature", "bet_type": "TEMP_HIGH" },
+    { "regex": "lowest temperature", "bet_type": "TEMP_LOW" },
+    { "regex": "\\bsnow\\b|precipitation|rainfall", "bet_type": "PRECIPITATION" },
+    { "regex": "hurricane|tropical storm", "bet_type": "STORM" },
+    { "regex": "^Will\\s.+\\swin\\s(the\\s)?.+\\?$", "bet_type": "OUTRIGHT" }
+  ],
+
+  "sports_fallback_bet_type": "SPORTS_PROP",
+  "weather_fallback_bet_type": "WEATHER_OTHER"
+}

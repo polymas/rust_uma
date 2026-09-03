@@ -1,4 +1,5 @@
 pub mod api;
+pub mod category;
 pub mod config;
 pub mod enrichment;
 pub mod hub;

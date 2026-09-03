@@ -504,6 +504,16 @@ struct GammaMarket {
     tags: Vec<GammaTag>,
     #[serde(default)]
     events: Vec<GammaEvent>,
+    // Both only used transiently in `compact_market` to derive
+    // `category`/`bet_type` (see `crate::category::classify`) — neither is
+    // kept on `MarketEnrichment` itself, same reasoning as the tag *labels*
+    // never being kept (see `GammaTag`): the catalog only holds what
+    // downstream classification needs, not the raw text it was computed
+    // from.
+    #[serde(default)]
+    sports_market_type: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,11 +566,18 @@ fn compact_market(raw: GammaMarket) -> Result<MarketEnrichment, EnrichmentError>
         .collect::<Vec<_>>();
     tag_ids.sort_unstable();
     tag_ids.dedup();
+    let (category, bet_type) = crate::category::classify(
+        &tag_ids,
+        raw.sports_market_type.as_deref(),
+        raw.question.as_deref(),
+    );
     Ok(MarketEnrichment {
         market_id,
         condition_id,
         token_ids,
         tag_ids,
+        category,
+        bet_type,
     })
 }
 
@@ -642,6 +659,8 @@ mod tests {
             condition_id: gamma_condition_id,
             token_ids: vec![[0x11; 32]],
             tag_ids: vec![7],
+            category: crate::model::Category::Unspecified,
+            bet_type: crate::model::BetType::Unspecified,
         }]);
 
         // Stand-in for whatever the (wrong, for this market) binary formula
@@ -670,6 +689,23 @@ mod tests {
         assert_eq!(market.market_id, 42);
         assert_eq!(market.tag_ids, vec![1, 64]);
         assert_eq!(market.token_ids.len(), 2);
+    }
+
+    #[test]
+    fn compact_market_derives_category_and_bet_type_from_real_gamma_response() {
+        // Real, unmodified body from
+        // `curl https://gamma-api.polymarket.com/markets/3931114?include_tag=true`
+        // (captured in the session that added this test) — exercises the
+        // actual `sportsMarketType`/`question` field names/casing Gamma sends,
+        // not a hand-typed guess at its shape.
+        let raw: GammaMarket = serde_json::from_str(
+            r#"{"id":"3931114","conditionId":"0xd670e99f38952e39ddf04cd4e19c0df4e8fecd7ac5dd63cb3231c14870c528f9","clobTokenIds":"[\"8221408449366099042936974108854776883972296916119694421577391243493411386529\", \"16025064474467412105709960145278891958438836213695532074918067345023077403103\"]","tags":[{"id":"1"},{"id":"100639"},{"id":"100381"},{"id":"678"}],"sportsMarketType":"moneyline","question":"New York Yankees vs. Los Angeles Angels"}"#,
+        )
+        .unwrap();
+        let market = compact_market(raw).unwrap();
+        assert_eq!(market.market_id, 3_931_114);
+        assert_eq!(market.category, crate::model::Category::Sports);
+        assert_eq!(market.bet_type, crate::model::BetType::Moneyline);
     }
 
     #[tokio::test]

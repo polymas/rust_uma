@@ -122,7 +122,7 @@
         <tr>
           <th>序号</th><th>收到于</th><th>端到端延迟</th><th>类型</th><th>方向</th>
           <th>Market ID</th><th>Condition ID</th><th>Token IDs（粗体=方向指向）</th>
-          <th>Tags</th><th>富化</th>
+          <th>Tags</th><th>分类</th><th>下注类型</th><th>富化</th>
         </tr>
       </thead>
       <tbody id="eventsBody">
@@ -184,6 +184,20 @@ const ENRICHMENT_STATUS = { 0: "unspecified", 1: "hit", 2: "miss" };
 // proto/uma.proto's UmaEvent.price_outcome doc comment for the derivation
 // (UmaCtfAdapter.sol's payout formula) and why dispute events never carry one.
 const PRICE_OUTCOME = { 0: "unspecified", 1: "token0", 2: "token1", 3: "tie" };
+// Category/BetType：proto/uma.proto 里 category=13、bet_type=14，纯本地从
+// Gamma tag/sportsMarketType/question 派生（见 src/category.rs），不查外部
+// API，跟上面几个枚举一样直接按 proto 里的顺序写死映射表。
+const CATEGORY = { 0: "unspecified", 1: "sports", 2: "esports", 3: "politics", 4: "crypto", 5: "culture", 6: "weather", 7: "other" };
+// CCCBBB 编码：千位分组 x1000 + 组内三位序号，1xxx = Sports/Esports 分组，
+// 2xxx = Weather 分组（各自带自己的兜底值 sports_prop/weather_other，不共
+// 用跨分组的兜底）——分组号是人工指定的、跟 CATEGORY 自己的枚举值无关（比如
+// Sports 和 Esports 是两个不同的 CATEGORY 值，但共用同一个 1xxx 分组，因为
+// 下注类型词汇对两者完全一样）。见 proto/uma.proto 里 BetType 的分段注释。
+const BET_TYPE = {
+  0: "unspecified",
+  1001: "moneyline", 1002: "spread", 1003: "over_under", 1004: "game_winner", 1005: "outright", 1006: "sports_prop",
+  2001: "temp_high", 2002: "temp_low", 2003: "precipitation", 2004: "storm", 2005: "weather_other",
+};
 
 function decodeUmaEvent(buf) {
   const f = decodeFields(buf);
@@ -221,6 +235,8 @@ function decodeUmaEvent(buf) {
     removed: !!val(10, 0),
     enrichment_status: ENRICHMENT_STATUS[val(11, 0)] || "unspecified",
     price_outcome: PRICE_OUTCOME[val(12, 0)] || "unspecified",
+    category: CATEGORY[val(13, 0)] || "unspecified",
+    bet_type: BET_TYPE[val(14, 0)] || "unspecified",
   };
 }
 function decodeUmaBatch(buf) {
@@ -291,6 +307,16 @@ const eventsBody = document.getElementById("eventsBody");
 const wsStatus = document.getElementById("wsStatus");
 
 const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50", unspecified: "—" };
+const CATEGORY_LABEL = {
+  unspecified: "—", sports: "体育", esports: "电竞", politics: "政治",
+  crypto: "加密", culture: "文化", weather: "天气", other: "其他",
+};
+const BET_TYPE_LABEL = {
+  unspecified: "—", moneyline: "胜负", spread: "让分", over_under: "大小分",
+  game_winner: "单局胜负", outright: "夺冠", sports_prop: "其他盘口",
+  temp_high: "最高温", temp_low: "最低温", precipitation: "降水", storm: "风暴",
+  weather_other: "其他盘口",
+};
 
 // Polymarket tag id -> label. 纯客户端浏览器直接拉 Polymarket 自己的公开
 // Gamma API（不经过本服务端，本服务端不做任何 tag 映射相关的事）。
@@ -342,29 +368,39 @@ async function ensureTagLabel(id) {
   }
 }
 
-// market_id -> slug，用于把 Condition ID 列做成指向对应 Polymarket 市场页面
+// condition_id -> slug，用于把 Condition ID 列做成指向对应 Polymarket 市场页面
 // 的链接（https://polymarket.com/market/<slug> 这个 URL 形态对单市场和
-// Neg Risk 分组里的单个市场都成立，不需要额外拿 event slug）。同样是懒加载
-// + 缓存：事件表里第一次出现某个 market_id 才查一次 Gamma 的
-// `GET /markets/{market_id}`。
+// Neg Risk 分组里的单个市场都成立，不需要额外拿 event slug）。condition_id 是
+// 权威 identity（market_id 有的场景下可能缺失/不一致），用 Gamma 的列表接口
+// `GET /markets?condition_ids=` 按 condition_id 直查；该接口默认只覆盖
+// active 市场，先查 closed=false，查不到（已结算/已关闭市场）再退化查一次
+// closed=true。同样是懒加载 + 缓存：事件表里第一次出现某个 condition_id 才
+// 查一次。
 const marketSlugs = {};
 const marketSlugInflight = new Set();
 const marketSlugFailed = new Set();
-async function ensureMarketSlug(marketId) {
-  if (!marketId) return;
-  if (marketId in marketSlugs || marketSlugInflight.has(marketId) || marketSlugFailed.has(marketId)) return;
-  marketSlugInflight.add(marketId);
+async function fetchMarketSlug(conditionId, closed) {
+  const res = await fetch(
+    `https://gamma-api.polymarket.com/markets?condition_ids=${conditionId}&limit=1&closed=${closed}`,
+    { cache: "no-store" }
+  );
+  if (!res.ok) return null;
+  const markets = await res.json();
+  return markets && markets[0] && markets[0].slug ? markets[0].slug : null;
+}
+async function ensureMarketSlug(conditionId) {
+  if (!conditionId) return;
+  if (conditionId in marketSlugs || marketSlugInflight.has(conditionId) || marketSlugFailed.has(conditionId)) return;
+  marketSlugInflight.add(conditionId);
   try {
-    const res = await fetch(`https://gamma-api.polymarket.com/markets/${marketId}`, { cache: "no-store" });
-    if (!res.ok) { marketSlugFailed.add(marketId); return; }
-    const market = await res.json();
-    if (!market || !market.slug) { marketSlugFailed.add(marketId); return; }
-    marketSlugs[marketId] = market.slug;
+    const slug = (await fetchMarketSlug(conditionId, false)) || (await fetchMarketSlug(conditionId, true));
+    if (!slug) { marketSlugFailed.add(conditionId); return; }
+    marketSlugs[conditionId] = slug;
     renderEvents();
   } catch (e) {
-    marketSlugFailed.add(marketId);
+    marketSlugFailed.add(conditionId);
   } finally {
-    marketSlugInflight.delete(marketId);
+    marketSlugInflight.delete(conditionId);
   }
 }
 
@@ -379,8 +415,8 @@ function renderEvents() {
     ).join("<br>") || "—";
     for (const id of ev.tag_ids || []) ensureTagLabel(id); // fire-and-forget; re-renders itself once resolved
     const tags = (ev.tag_ids || []).map((id) => tagLabels[id] || id).join(", ") || "—";
-    ensureMarketSlug(ev.market_id); // fire-and-forget; re-renders itself once resolved
-    const slug = marketSlugs[ev.market_id];
+    ensureMarketSlug(ev.condition_id); // fire-and-forget; re-renders itself once resolved
+    const slug = marketSlugs[ev.condition_id];
     const conditionCell = slug
       ? `<a href="https://polymarket.com/market/${slug}" target="_blank" rel="noopener noreferrer">${short(ev.condition_id)}</a>`
       : short(ev.condition_id);
@@ -395,6 +431,8 @@ function renderEvents() {
       <td title="${ev.condition_id}${slug ? ' — 点击跳转 Polymarket 市场页' : ''}">${conditionCell}</td>
       <td title="${(ev.token_ids || []).join(', ')}">${tokenIds}</td>
       <td>${tags}</td>
+      <td>${CATEGORY_LABEL[ev.category] || "—"}</td>
+      <td>${BET_TYPE_LABEL[ev.bet_type] || "—"}</td>
       <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ev.enrichment_status}</td>
     </tr>
   `;

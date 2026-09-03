@@ -96,12 +96,115 @@ impl PriceOutcome {
     }
 }
 
+/// Top-level market category, derived once at enrichment time from Gamma tag
+/// IDs — see `crate::category::classify`. See the doc comment on
+/// `UmaEvent.category` in `proto/uma.proto` for the derivation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Category {
+    Unspecified,
+    Sports,
+    Esports,
+    Politics,
+    Crypto,
+    Culture,
+    Weather,
+    Other,
+}
+
+impl Category {
+    pub fn to_proto(self) -> i32 {
+        match self {
+            Self::Unspecified => pb::Category::Unspecified as i32,
+            Self::Sports => pb::Category::Sports as i32,
+            Self::Esports => pb::Category::Esports as i32,
+            Self::Politics => pb::Category::Politics as i32,
+            Self::Crypto => pb::Category::Crypto as i32,
+            Self::Culture => pb::Category::Culture as i32,
+            Self::Weather => pb::Category::Weather as i32,
+            Self::Other => pb::Category::Other as i32,
+        }
+    }
+
+    pub fn from_proto(value: i32) -> Self {
+        match pb::Category::try_from(value).unwrap_or(pb::Category::Unspecified) {
+            pb::Category::Sports => Self::Sports,
+            pb::Category::Esports => Self::Esports,
+            pb::Category::Politics => Self::Politics,
+            pb::Category::Crypto => Self::Crypto,
+            pb::Category::Culture => Self::Culture,
+            pb::Category::Weather => Self::Weather,
+            pb::Category::Other => Self::Other,
+            pb::Category::Unspecified => Self::Unspecified,
+        }
+    }
+}
+
+/// Bet-type sub-classification, only meaningful when `Category` is
+/// `Sports`/`Esports`/`Weather` — see the doc comment on `UmaEvent.bet_type`
+/// in `proto/uma.proto`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BetType {
+    Unspecified,
+    // Sports/Esports block — see the numeric-grouping doc comment on
+    // `BetType` in proto/uma.proto.
+    Moneyline,
+    Spread,
+    OverUnder,
+    GameWinner,
+    Outright,
+    SportsProp,
+    // Weather block.
+    TempHigh,
+    TempLow,
+    Precipitation,
+    Storm,
+    WeatherOther,
+}
+
+impl BetType {
+    pub fn to_proto(self) -> i32 {
+        match self {
+            Self::Unspecified => pb::BetType::Unspecified as i32,
+            Self::Moneyline => pb::BetType::Moneyline as i32,
+            Self::Spread => pb::BetType::Spread as i32,
+            Self::OverUnder => pb::BetType::OverUnder as i32,
+            Self::GameWinner => pb::BetType::GameWinner as i32,
+            Self::Outright => pb::BetType::Outright as i32,
+            Self::SportsProp => pb::BetType::SportsProp as i32,
+            Self::TempHigh => pb::BetType::TempHigh as i32,
+            Self::TempLow => pb::BetType::TempLow as i32,
+            Self::Precipitation => pb::BetType::Precipitation as i32,
+            Self::Storm => pb::BetType::Storm as i32,
+            Self::WeatherOther => pb::BetType::WeatherOther as i32,
+        }
+    }
+
+    pub fn from_proto(value: i32) -> Self {
+        match pb::BetType::try_from(value).unwrap_or(pb::BetType::Unspecified) {
+            pb::BetType::Moneyline => Self::Moneyline,
+            pb::BetType::Spread => Self::Spread,
+            pb::BetType::OverUnder => Self::OverUnder,
+            pb::BetType::GameWinner => Self::GameWinner,
+            pb::BetType::Outright => Self::Outright,
+            pb::BetType::SportsProp => Self::SportsProp,
+            pb::BetType::TempHigh => Self::TempHigh,
+            pb::BetType::TempLow => Self::TempLow,
+            pb::BetType::Precipitation => Self::Precipitation,
+            pb::BetType::Storm => Self::Storm,
+            pb::BetType::WeatherOther => Self::WeatherOther,
+            pb::BetType::Unspecified => Self::Unspecified,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketEnrichment {
     pub market_id: u64,
     pub condition_id: [u8; 32],
     pub token_ids: Vec<[u8; 32]>,
     pub tag_ids: Vec<u32>,
+    pub category: Category,
+    pub bet_type: BetType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -166,6 +269,12 @@ impl EventRecord {
                 pb::EnrichmentStatus::Miss as i32
             },
             price_outcome: self.price_outcome.to_proto(),
+            category: enrichment
+                .map_or(Category::Unspecified, |v| v.category)
+                .to_proto(),
+            bet_type: enrichment
+                .map_or(BetType::Unspecified, |v| v.bet_type)
+                .to_proto(),
         }
     }
 
@@ -186,6 +295,8 @@ impl EventRecord {
                     .filter_map(|v| fixed::<32>(v))
                     .collect(),
                 tag_ids: value.tag_ids.clone(),
+                category: Category::from_proto(value.category),
+                bet_type: BetType::from_proto(value.bet_type),
             })
         });
         let kind = EventKind::from_proto(value.event_type)?;
@@ -272,7 +383,10 @@ pub fn uint256_decimal(value: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventRecord, MarketEnrichment, PriceOutcome, pb, test_uma_event, uint256_decimal};
+    use super::{
+        BetType, Category, EventRecord, MarketEnrichment, PriceOutcome, pb, test_uma_event,
+        uint256_decimal,
+    };
 
     #[test]
     fn formats_uint256_decimal() {
@@ -379,6 +493,8 @@ mod tests {
             condition_id: gamma_condition_id,
             token_ids: vec![[0x22; 32]],
             tag_ids: vec![100],
+            category: Category::Unspecified,
+            bet_type: BetType::Unspecified,
         }]);
         let enrichment =
             catalog.resolve(event.request().ancillary.market_id, &derived_condition_id);

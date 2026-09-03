@@ -1309,6 +1309,7 @@ dependencies = [
  "hex",
  "prost",
  "prost-build",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

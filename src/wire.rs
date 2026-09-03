@@ -36,7 +36,7 @@ pub enum WireError {
     #[error("protobuf payload exceeds configured decompressed limit")]
     Oversized,
     #[error("zstd encode failed: {0}")]
-    Zstd(#[from] std::io::Error),
+    Zstd(std::io::Error),
 }
 
 pub fn encoded_event_len(event: &EventRecord) -> usize {
@@ -63,7 +63,7 @@ pub fn encode_frame(
     let (flags, body) = if payload.len() >= config.zstd_threshold {
         (
             FLAG_ZSTD,
-            zstd::stream::encode_all(Cursor::new(&payload), 1)?,
+            zstd::stream::encode_all(Cursor::new(&payload), 1).map_err(WireError::Zstd)?,
         )
     } else {
         (0, payload.clone())

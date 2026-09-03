@@ -53,6 +53,16 @@ message UmaEvent {
   // consumers must treat any prior propose-derived decision for this
   // condition_id as no longer trustworthy until a new propose arrives.
   PriceOutcome price_outcome = 12;
+
+  // Both derived once at enrichment time (see `category::classify` and
+  // `Catalog::compact_market`) from Gamma's own `tags`/`sportsMarketType`/
+  // `question` fields — never from on-chain data. Both are
+  // *_UNSPECIFIED whenever enrichment missed (same "miss is a miss" rule as
+  // token_ids/tag_ids above), and BetType is always BET_TYPE_UNSPECIFIED
+  // unless Category is CATEGORY_SPORTS/CATEGORY_ESPORTS/CATEGORY_WEATHER —
+  // the bet-type taxonomy only applies to those.
+  Category category = 13;
+  BetType bet_type = 14;
 }
 
 enum EventType {
@@ -72,4 +82,64 @@ enum PriceOutcome {
   PRICE_OUTCOME_TOKEN0 = 1;
   PRICE_OUTCOME_TOKEN1 = 2;
   PRICE_OUTCOME_TIE = 3;
+}
+
+// Top-level market category. Derived from Gamma tag IDs — see
+// `category::classify` and `config/category_rules.json`.
+enum Category {
+  CATEGORY_UNSPECIFIED = 0;
+  CATEGORY_SPORTS = 1;
+  CATEGORY_ESPORTS = 2;
+  CATEGORY_POLITICS = 3;
+  CATEGORY_CRYPTO = 4;
+  CATEGORY_CULTURE = 5;
+  CATEGORY_WEATHER = 6;
+  CATEGORY_OTHER = 7; // known tag(s), but none matched a category above
+}
+
+// Bet-type sub-classification, only meaningful when Category is
+// CATEGORY_SPORTS/CATEGORY_ESPORTS/CATEGORY_WEATHER. Derived primarily from
+// Gamma's own `sportsMarketType`/tag fields, falling back to the market
+// `question` text when those are absent — see `category::classify`.
+//
+// Values are `CCCBBB` decimal-encoded: a 3-digit *bet-type group* (CCC,
+// 1-999) times 1000, plus a 3-digit sub-type index within that group (BBB,
+// 001-999) — e.g. 1001, 1002, ..., 2001, 2002. This is deliberately NOT the
+// same number as the paired Category enum's own value — Sports and Esports
+// are two different Category values but share one bet-type group (1xxx)
+// because the bet-type vocabulary (moneyline/spread/...) is identical for
+// both; a literal `bet_type / 1000 == category` derivation would force
+// duplicating every sports bet type under a second, redundant Esports-only
+// block for no semantic gain. Groups are hand-assigned in this comment, not
+// computed from anything:
+//   0     shared (BET_TYPE_UNSPECIFIED)
+//   1xxx  Sports + Esports
+//   2xxx  Weather
+//   3xxx  next bettable Category, if one is ever added, then 4xxx, ...
+// Each group carries its own catch-all ("known category, no specific bucket
+// fit" — BET_TYPE_SPORTS_PROP / BET_TYPE_WEATHER_OTHER) rather than sharing
+// one cross-group value, so "every BetType for group X falls in X's 1000s"
+// holds with no exceptions. Headroom (999 groups x 999 sub-types) is large
+// enough that this numbering never needs to change shape — adding a bettable
+// Category is always just picking the next unused `Nxxx`, never a
+// renumbering of anything already shipped.
+enum BetType {
+  BET_TYPE_UNSPECIFIED = 0;
+
+  // Group 1xxx: Sports + Esports
+  BET_TYPE_MONEYLINE = 1001; // single-game/match win-loss (incl. period-scoped)
+  BET_TYPE_SPREAD = 1002; // point spread / handicap
+  BET_TYPE_OVER_UNDER = 1003; // totals (points, corners, ...)
+  BET_TYPE_GAME_WINNER = 1004; // one game/map/set within a best-of series
+  BET_TYPE_OUTRIGHT = 1005; // championship/tournament winner futures
+  BET_TYPE_SPORTS_PROP = 1006; // known sports/esports bet, no more specific bucket fit
+  // 1007-1999 reserved for future Sports/Esports bet types.
+
+  // Group 2xxx: Weather
+  BET_TYPE_TEMP_HIGH = 2001; // daily high temperature
+  BET_TYPE_TEMP_LOW = 2002; // daily low temperature
+  BET_TYPE_PRECIPITATION = 2003; // snow/rain
+  BET_TYPE_STORM = 2004; // hurricane/tropical storm
+  BET_TYPE_WEATHER_OTHER = 2005; // known weather bet, no more specific bucket fit
+  // 2006-2999 reserved for future Weather bet types (wind, air quality, ...).
 }
