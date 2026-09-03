@@ -67,6 +67,40 @@ pub enum ConfigError {
     Invalid { key: &'static str, value: String },
 }
 
+/// Minimal `Config` for tests that need a `Processor`/`Config` but don't
+/// exercise config parsing itself (e.g. `pipeline.rs`'s tests) — every field
+/// is a permissive/inert default (no emitter allowlist, market_id not
+/// required, ...), not meant to resemble a real deployment.
+#[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    Config {
+        api_addr: "127.0.0.1:0".parse().unwrap(),
+        polygon_wss_url: String::new(),
+        wss_rpc_urls: Vec::new(),
+        polygon_rpc_url: String::new(),
+        contract_addresses: Vec::new(),
+        contract_address_bytes: Vec::new(),
+        data_dir: PathBuf::new(),
+        start_block: None,
+        initial_backfill_days: 0,
+        backfill_batch_blocks: 1,
+        live_buffer: 16,
+        event_ring_capacity: 16,
+        frame_ring_capacity: 16,
+        batch_max_events: 16,
+        batch_max_bytes: 1 << 16,
+        zstd_threshold: 1 << 20,
+        max_decompressed_bytes: 1 << 20,
+        gamma_base_url: String::new(),
+        gamma_refresh_interval: Duration::from_secs(60),
+        closed_market_lookback_days: 0,
+        catalog_reconcile_interval: Duration::from_secs(3600),
+        require_market_id: false,
+        ws_write_timeout: Duration::from_secs(5),
+        dashboard_token: None,
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let extra_wss_urls: Vec<String> = nonempty("WSS_RPC_LIST")

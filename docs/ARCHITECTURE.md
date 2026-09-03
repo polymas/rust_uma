@@ -38,7 +38,7 @@ flowchart TD
         FRING[("FrameHub\n预编码帧环")]
 
         DEDUP -->|新事件| RESOLVE --> ERING
-        ERING --> BATCH --> ENC --> FRING
+        ERING -->|"仅富化命中\n(miss 只落 WAL/HTTPAPI，不广播)"| BATCH --> ENC --> FRING
     end
 
     subgraph ENRICH["enrichment.rs · 启动前预热"]

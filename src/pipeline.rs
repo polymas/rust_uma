@@ -114,16 +114,18 @@ impl Processor {
             }
         } else {
             Stats::increment(&self.stats.enrichment_misses);
-            // At `warn!` (not `debug!`) deliberately: every miss is a real
-            // event broadcast downstream with empty enrichment, right now,
-            // permanently — this must be visible in production logs at the
-            // default log level, not only when someone happens to be running
-            // with RUST_LOG=debug. Carries enough to investigate without a
-            // follow-up query: market_id (or its absence — a different root
-            // cause than "market_id present but uncached"), the derived
-            // condition_id (what a standard-adapter lookup would have used),
-            // requester (which Adapter this is — helps spot Neg Risk/unknown
-            // adapter patterns), and the tx/block to cross-reference on-chain.
+            // At `warn!` (not `debug!`) deliberately: this is the only record
+            // of the event — an enrichment miss is no longer broadcast (see
+            // below, `batch_tx.send` is skipped for it), so this line and the
+            // stats counters above are the entire "local record" of it. Must
+            // be visible in production logs at the default log level, not
+            // only when someone happens to be running with RUST_LOG=debug.
+            // Carries enough to investigate without a follow-up query:
+            // market_id (or its absence — a different root cause than
+            // "market_id present but uncached"), the derived condition_id
+            // (what a standard-adapter lookup would have used), requester
+            // (which Adapter this is — helps spot Neg Risk/unknown adapter
+            // patterns), and the tx/block to cross-reference on-chain.
             warn!(
                 tx = %raw.transaction_hash,
                 block = decoded.chain().block_number,
@@ -132,7 +134,7 @@ impl Processor {
                 derived_condition_id = %hex_prefixed(&decoded.request().condition_id),
                 requester = %hex_prefixed(&decoded.request().requester),
                 source,
-                "enrichment miss: broadcasting without token_ids/tag_ids"
+                "enrichment miss: not broadcasting, logged locally only"
             );
         }
         debug!(
@@ -153,6 +155,7 @@ impl Processor {
             }
             EventKind::Dispute => PriceOutcome::Unspecified,
         };
+        let enriched = enrichment.is_some();
         let record = Arc::new(EventRecord {
             sequence,
             event: decoded,
@@ -173,7 +176,11 @@ impl Processor {
         {
             Stats::increment(&self.stats.storage_queue_dropped);
         }
-        if self.batch_tx.send(record).await.is_err() {
+        // An enrichment miss has no token_ids to act on — nothing downstream
+        // can do with it, so it stops here: dedup ring + WAL + the `warn!`
+        // above are its only record, never `batch_tx`/WSS. See the doc
+        // comment above the miss branch.
+        if enriched && self.batch_tx.send(record).await.is_err() {
             error!("batch pipeline stopped");
         }
     }
@@ -261,5 +268,125 @@ pub async fn run_batcher(
             }
             Err(error) => error!(%error, events=batch.len(), "encode WSS batch"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::test_config,
+        model::{BetType, Category, MarketEnrichment},
+        uma::events::{RpcLog, TOPIC_PROPOSE_PRICE},
+    };
+
+    fn abi_word(value: u64) -> [u8; 32] {
+        let mut word = [0_u8; 32];
+        word[24..].copy_from_slice(&value.to_be_bytes());
+        word
+    }
+
+    fn address_word(byte: u8) -> [u8; 32] {
+        let mut word = [0_u8; 32];
+        word[12..].fill(byte);
+        word
+    }
+
+    /// Minimal but genuinely ABI-decodable ProposePrice log — just enough for
+    /// `decode_signal_log` to succeed with `market_id: 42` in the ancillary
+    /// text, so these tests exercise the real decode path rather than a
+    /// hand-built `UmaEvent`. Mirrors
+    /// `uma::events::tests::log` (kept local rather than shared/exported —
+    /// this only needs "some valid propose log", not decode-correctness
+    /// coverage, which belongs to that module).
+    fn propose_log() -> RpcLog {
+        let ancillary = b"q: Will it happen? res_data: p1: 0, p2: 1, p3: 0.5, market_id: 42, initializer: 1111111111111111111111111111111111111111";
+        let offset = 6 * 32;
+        let mut data = vec![0_u8; offset + 32 + ancillary.len()];
+        data[..32].fill(0x44);
+        data[32..64].copy_from_slice(&abi_word(100));
+        data[64..96].copy_from_slice(&abi_word(offset as u64));
+        data[96..128].fill(0x55);
+        data[128..160].copy_from_slice(&abi_word(200));
+        data[160..192].copy_from_slice(&address_word(0x66));
+        data[offset..offset + 32].copy_from_slice(&abi_word(ancillary.len() as u64));
+        data[offset + 32..].copy_from_slice(ancillary);
+        RpcLog {
+            address: format!("0x{}", "aa".repeat(20)),
+            topics: vec![
+                TOPIC_PROPOSE_PRICE.into(),
+                format!("0x{}", hex::encode(address_word(1))),
+                format!("0x{}", hex::encode(address_word(2))),
+            ],
+            data: format!("0x{}", hex::encode(data)),
+            block_number: "0xa".into(),
+            block_hash: format!("0x{}", "bb".repeat(32)),
+            transaction_hash: format!("0x{}", "cc".repeat(32)),
+            transaction_index: Some("0x2".into()),
+            log_index: "0x1".into(),
+            removed: false,
+        }
+    }
+
+    /// Builds a `Processor` wired to channels the test can poll, plus the
+    /// `Catalog` it should resolve against (empty catalog => every event
+    /// misses enrichment; a catalog seeded with `market_id: 42` => hits).
+    fn build_processor(
+        catalog: Catalog,
+    ) -> (
+        Processor,
+        mpsc::Receiver<Arc<EventRecord>>,
+        mpsc::Receiver<StorageCommand>,
+    ) {
+        let (batch_tx, batch_rx) = mpsc::channel(4);
+        let (storage_tx, storage_rx) = mpsc::channel(4);
+        let processor = Processor::new(
+            Arc::new(test_config()),
+            Arc::new(catalog),
+            Arc::new(EventHub::new(16)),
+            batch_tx,
+            storage_tx,
+            Arc::new(Stats::default()),
+            0,
+        );
+        (processor, batch_rx, storage_rx)
+    }
+
+    #[tokio::test]
+    async fn enrichment_miss_is_recorded_locally_but_never_broadcast() {
+        let (processor, mut batch_rx, mut storage_rx) = build_processor(Catalog::new(Vec::new()));
+
+        processor.process(propose_log(), 1, "test").await;
+
+        // Never handed to the batcher — nothing to broadcast downstream.
+        assert!(batch_rx.try_recv().is_err());
+        // Still the "local record": written to storage (events.wal).
+        assert!(matches!(
+            storage_rx.try_recv(),
+            Ok(StorageCommand::Event(_))
+        ));
+        assert_eq!(processor.stats.enrichment_misses.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn enrichment_hit_is_broadcast() {
+        let market = MarketEnrichment {
+            market_id: 42,
+            condition_id: [9; 32],
+            token_ids: vec![[1; 32], [2; 32]],
+            tag_ids: vec![],
+            category: Category::Unspecified,
+            bet_type: BetType::Unspecified,
+        };
+        let (processor, mut batch_rx, mut storage_rx) = build_processor(Catalog::new(vec![market]));
+
+        processor.process(propose_log(), 1, "test").await;
+
+        assert!(batch_rx.try_recv().is_ok());
+        assert!(matches!(
+            storage_rx.try_recv(),
+            Ok(StorageCommand::Event(_))
+        ));
+        assert_eq!(processor.stats.enrichment_hits.load(Ordering::Relaxed), 1);
     }
 }

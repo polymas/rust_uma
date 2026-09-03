@@ -309,13 +309,17 @@ brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
   `ProposePrice`/`DisputePrice` topic 是全 Polygon 共用的，非 Polymarket 的
   UMA 请求也会先收到，解析/富化阶段自然过滤掉，这部分误差不代表故障（emitter
   白名单默认关闭，见上）。
-- 每一条富化 miss 都会在默认日志级别打一条 `WARN enrichment miss: broadcasting
-  without token_ids/tag_ids`（`pipeline.rs`），带 `market_id`/
-  `derived_condition_id`/`requester`/`tx`/`block`，不需要开 `RUST_LOG=debug`
-  就能看到：`sudo journalctl -u rust-uma.service -f | grep "enrichment miss"`。
-  这是排查"为什么这条事件没富化"的第一手数据源，比事后翻监控面板的实时推送
-  列表更直接——面板解析的是当前批次的 WSS 帧，不是事件处理那一刻的状态，且
-  只保留打开面板之后的记录。
+- 富化 miss 的事件**不会经 WSS 广播下去**（`pipeline.rs::Processor::process`
+  里 `batch_tx.send` 只在 `enriched` 为真时才调用）——没有 token_ids，下游
+  拿到也没法用，广播出去只是噪音。它仍然会入 `EventHub` 去重环、写进本地
+  `events.wal`（照样能在 `/uma/v1/ws` 之外的场景本地追溯），并且每一条都在
+  默认日志级别打一条 `WARN enrichment miss: not broadcasting, logged locally
+  only`，带 `market_id`/`derived_condition_id`/`requester`/`tx`/`block`，不
+  需要开 `RUST_LOG=debug` 就能看到：
+  `sudo journalctl -u rust-uma.service -f | grep "enrichment miss"`。这是排
+  查"为什么这条事件没富化"的第一手数据源，比事后翻监控面板更直接——而且面板
+  解析的是 WSS 帧，miss 事件现在压根不会出现在面板的实时事件表里，只能从这
+  条日志或 `enrichment_misses_total` 这类计数器排查。
 
 ## 5. 升级
 
