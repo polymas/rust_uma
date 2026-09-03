@@ -1,5 +1,5 @@
 {
-  "_comment": "匹配/加载逻辑见 src/category.rs；每条规则是怎么从真实抓到的 Gamma/链上数据推出来的，见相关会话记录。改规则改这个文件，同时去 src/category.rs 补一条回归测试，不要绕开规则条目直接改编译后的匹配逻辑。",
+  "_comment": "匹配/加载逻辑见 src/category.rs；每条规则是怎么从真实抓到的 Gamma/链上数据推出来的，见相关会话记录。改规则改这个文件，同时去 src/category.rs 补一条回归测试，不要绕开规则条目直接改编译后的匹配逻辑。bet_type_groups 按一级分类分组——每个 Category 只会用自己那一组里的 tag/sportsMarketType/question 规则，不会跟别的分类混着匹配（历史教训：体育的 OUTRIGHT 文本规则 \"Will X win the Y?\" 曾经是全局共享的，能匹配到 \"Will Sarah Huckabee Sanders win the 2028 Republican presidential nomination?\" 这种政治选举市场，把 bet_type 错判成体育组的值）。",
 
   "tag_rules": [
     { "tag_id": 64, "category": "ESPORTS" },
@@ -10,46 +10,96 @@
     { "tag_id": 596, "category": "CULTURE" }
   ],
 
-  "tag_bet_type_rules": [
-    { "tag_id": 104596, "bet_type": "TEMP_HIGH" },
-    { "tag_id": 104597, "bet_type": "TEMP_LOW" },
-    { "tag_id": 103041, "bet_type": "PRECIPITATION" },
-    { "tag_id": 103545, "bet_type": "PRECIPITATION" },
-    { "tag_id": 103235, "bet_type": "PRECIPITATION" },
-    { "tag_id": 106182, "bet_type": "PRECIPITATION" },
-    { "tag_id": 1313, "bet_type": "PRECIPITATION" },
-    { "tag_id": 102023, "bet_type": "STORM" },
-    { "tag_id": 85, "bet_type": "STORM" },
-    { "tag_id": 102186, "bet_type": "STORM" }
-  ],
-
-  "sports_market_type_rules": [
-    { "contains": "child_moneyline", "bet_type": "GAME_WINNER" },
-    { "contains": "moneyline", "bet_type": "MONEYLINE" },
-    { "contains": "handicap", "bet_type": "SPREAD" },
-    { "contains": "spread", "bet_type": "SPREAD" },
-    { "contains": "total", "bet_type": "OVER_UNDER" },
-    { "contains": "corners", "bet_type": "OVER_UNDER" },
-    { "contains": "completed_match", "bet_type": "SPORTS_PROP" },
-    { "contains": "to_score", "bet_type": "SPORTS_PROP" },
-    { "contains": "exact_score", "bet_type": "SPORTS_PROP" },
-    { "contains": "to_advance", "bet_type": "SPORTS_PROP" },
-    { "contains": "result", "bet_type": "MONEYLINE" },
-    { "contains": "winner", "bet_type": "MONEYLINE" }
-  ],
-
-  "question_text_rules": [
-    { "regex": "\\bSpread:|\\bHandicap\\b", "bet_type": "SPREAD" },
-    { "regex": "\\bO/U\\b|Over/Under", "bet_type": "OVER_UNDER" },
-    { "regex": "\\b(Game|Map|Set|Leg)\\s*\\d+\\s*Winner\\b", "bet_type": "GAME_WINNER" },
-    { "regex": "^[^:]+\\svs\\.?\\s[^:]+$", "bet_type": "MONEYLINE" },
-    { "regex": "highest temperature", "bet_type": "TEMP_HIGH" },
-    { "regex": "lowest temperature", "bet_type": "TEMP_LOW" },
-    { "regex": "\\bsnow\\b|precipitation|rainfall", "bet_type": "PRECIPITATION" },
-    { "regex": "hurricane|tropical storm", "bet_type": "STORM" },
-    { "regex": "^Will\\s.+\\swin\\s(the\\s)?.+\\?$", "bet_type": "OUTRIGHT" }
-  ],
-
-  "sports_fallback_bet_type": "SPORTS_PROP",
-  "weather_fallback_bet_type": "WEATHER_OTHER"
+  "bet_type_groups": [
+    {
+      "categories": ["SPORTS", "ESPORTS"],
+      "fallback_bet_type": "SPORTS_PROP",
+      "tag_bet_type_rules": [],
+      "sports_market_type_rules": [
+        { "contains": "child_moneyline", "bet_type": "GAME_WINNER" },
+        { "contains": "moneyline", "bet_type": "MONEYLINE" },
+        { "contains": "handicap", "bet_type": "SPREAD" },
+        { "contains": "spread", "bet_type": "SPREAD" },
+        { "contains": "total", "bet_type": "OVER_UNDER" },
+        { "contains": "corners", "bet_type": "OVER_UNDER" },
+        { "contains": "completed_match", "bet_type": "SPORTS_PROP" },
+        { "contains": "to_score", "bet_type": "SPORTS_PROP" },
+        { "contains": "exact_score", "bet_type": "SPORTS_PROP" },
+        { "contains": "to_advance", "bet_type": "SPORTS_PROP" },
+        { "contains": "result", "bet_type": "MONEYLINE" },
+        { "contains": "winner", "bet_type": "MONEYLINE" }
+      ],
+      "question_text_rules": [
+        { "regex": "\\bSpread:|\\bHandicap\\b", "bet_type": "SPREAD" },
+        { "regex": "\\bO/U\\b|Over/Under", "bet_type": "OVER_UNDER" },
+        { "regex": "\\b(Game|Map|Set|Leg)\\s*\\d+\\s*Winner\\b", "bet_type": "GAME_WINNER" },
+        { "regex": "^[^:]+\\svs\\.?\\s[^:]+$", "bet_type": "MONEYLINE" },
+        { "regex": "^Will\\s.+\\swin\\s(the\\s)?.+\\?$", "bet_type": "OUTRIGHT" }
+      ]
+    },
+    {
+      "categories": ["WEATHER"],
+      "fallback_bet_type": "WEATHER_OTHER",
+      "tag_bet_type_rules": [
+        { "tag_id": 104596, "bet_type": "TEMP_HIGH" },
+        { "tag_id": 104597, "bet_type": "TEMP_LOW" },
+        { "tag_id": 103041, "bet_type": "PRECIPITATION" },
+        { "tag_id": 103545, "bet_type": "PRECIPITATION" },
+        { "tag_id": 103235, "bet_type": "PRECIPITATION" },
+        { "tag_id": 106182, "bet_type": "PRECIPITATION" },
+        { "tag_id": 1313, "bet_type": "PRECIPITATION" },
+        { "tag_id": 102023, "bet_type": "STORM" },
+        { "tag_id": 85, "bet_type": "STORM" },
+        { "tag_id": 102186, "bet_type": "STORM" }
+      ],
+      "sports_market_type_rules": [],
+      "question_text_rules": [
+        { "regex": "highest temperature", "bet_type": "TEMP_HIGH" },
+        { "regex": "lowest temperature", "bet_type": "TEMP_LOW" },
+        { "regex": "\\bsnow\\b|precipitation|rainfall", "bet_type": "PRECIPITATION" },
+        { "regex": "hurricane|tropical storm", "bet_type": "STORM" }
+      ]
+    },
+    {
+      "categories": ["CRYPTO"],
+      "fallback_bet_type": "CRYPTO_PROP",
+      "tag_bet_type_rules": [
+        { "tag_id": 102134, "bet_type": "PRICE_TARGET" },
+        { "tag_id": 102516, "bet_type": "PRICE_THRESHOLD" },
+        { "tag_id": 102127, "bet_type": "UP_DOWN" }
+      ],
+      "sports_market_type_rules": [],
+      "question_text_rules": [
+        { "regex": "\\breach(es|ed)?\\s*\\$|\\bdip(s|ped)?\\s*to\\s*\\$", "bet_type": "PRICE_TARGET" },
+        { "regex": "price of .+ be (above|below|over|under)\\s*\\$", "bet_type": "PRICE_THRESHOLD" },
+        { "regex": "\\bUp or Down\\b", "bet_type": "UP_DOWN" }
+      ]
+    },
+    {
+      "categories": ["POLITICS"],
+      "fallback_bet_type": "POLITICS_PROP",
+      "tag_bet_type_rules": [
+        { "tag_id": 144, "bet_type": "ELECTION_WINNER" },
+        { "tag_id": 100196, "bet_type": "FED_RATE_DECISION" },
+        { "tag_id": 159, "bet_type": "FED_RATE_DECISION" },
+        { "tag_id": 972, "bet_type": "TWEET_COUNT" }
+      ],
+      "sports_market_type_rules": [],
+      "question_text_rules": [
+        { "regex": "^Will\\s.+\\swin\\s(the\\s)?.+(election|nomination|primary)\\b", "bet_type": "ELECTION_WINNER" },
+        { "regex": "\\bFed\\b.*\\binterest rates?\\b", "bet_type": "FED_RATE_DECISION" },
+        { "regex": "\\bpost\\s+[<\\d].*\\b(tweets|posts)\\b", "bet_type": "TWEET_COUNT" }
+      ]
+    },
+    {
+      "categories": ["CULTURE"],
+      "fallback_bet_type": "CULTURE_PROP",
+      "tag_bet_type_rules": [],
+      "sports_market_type_rules": [],
+      "question_text_rules": [
+        { "regex": "^Will\\s.+\\sbe\\sthe\\s.+\\?$", "bet_type": "AWARD_WINNER" },
+        { "regex": "\\bbetween\\s*[\\d,.]+\\S*\\s+and\\s+[\\d,.]+|\\b(less than|more than)\\s*[\\d,.]+\\s*(million|m|k)?\\s*(views|gross)\\b", "bet_type": "MEDIA_METRIC_RANGE" }
+      ]
+    }
+  ]
 }

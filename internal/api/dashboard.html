@@ -188,15 +188,19 @@ const PRICE_OUTCOME = { 0: "unspecified", 1: "token0", 2: "token1", 3: "tie" };
 // Gamma tag/sportsMarketType/question 派生（见 src/category.rs），不查外部
 // API，跟上面几个枚举一样直接按 proto 里的顺序写死映射表。
 const CATEGORY = { 0: "unspecified", 1: "sports", 2: "esports", 3: "politics", 4: "crypto", 5: "culture", 6: "weather", 7: "other" };
-// CCCBBB 编码：千位分组 x1000 + 组内三位序号，1xxx = Sports/Esports 分组，
-// 2xxx = Weather 分组（各自带自己的兜底值 sports_prop/weather_other，不共
-// 用跨分组的兜底）——分组号是人工指定的、跟 CATEGORY 自己的枚举值无关（比如
-// Sports 和 Esports 是两个不同的 CATEGORY 值，但共用同一个 1xxx 分组，因为
-// 下注类型词汇对两者完全一样）。见 proto/uma.proto 里 BetType 的分段注释。
+// CCCBBB 编码：千位分组 x1000 + 组内三位序号，1xxx = Sports/Esports、
+// 2xxx = Weather、3xxx = Crypto、4xxx = Politics、5xxx = Culture（各自带自
+// 己的兜底值 xxx_prop/weather_other，不共用跨分组的兜底）——分组号是人工指
+// 定的、跟 CATEGORY 自己的枚举值无关（比如 Sports 和 Esports 是两个不同的
+// CATEGORY 值，但共用同一个 1xxx 分组，因为下注类型词汇对两者完全一样）。
+// 见 proto/uma.proto 里 BetType 的分段注释。
 const BET_TYPE = {
   0: "unspecified",
   1001: "moneyline", 1002: "spread", 1003: "over_under", 1004: "game_winner", 1005: "outright", 1006: "sports_prop",
   2001: "temp_high", 2002: "temp_low", 2003: "precipitation", 2004: "storm", 2005: "weather_other",
+  3001: "price_target", 3002: "price_threshold", 3003: "up_down", 3004: "crypto_prop",
+  4001: "election_winner", 4002: "fed_rate_decision", 4003: "tweet_count", 4004: "politics_prop",
+  5001: "award_winner", 5002: "media_metric_range", 5003: "culture_prop",
 };
 
 function decodeUmaEvent(buf) {
@@ -306,6 +310,8 @@ const MAX_EVENTS = 60;
 const eventsBody = document.getElementById("eventsBody");
 const wsStatus = document.getElementById("wsStatus");
 
+const EVENT_TYPE_LABEL = { propose: "提议", dispute: "争议", unspecified: "—" };
+const ENRICHMENT_STATUS_LABEL = { hit: "命中", miss: "未命中", unspecified: "—" };
 const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50", unspecified: "—" };
 const CATEGORY_LABEL = {
   unspecified: "—", sports: "体育", esports: "电竞", politics: "政治",
@@ -316,6 +322,9 @@ const BET_TYPE_LABEL = {
   game_winner: "单局胜负", outright: "夺冠", sports_prop: "其他盘口",
   temp_high: "最高温", temp_low: "最低温", precipitation: "降水", storm: "风暴",
   weather_other: "其他盘口",
+  price_target: "到价", price_threshold: "价格阈值", up_down: "涨跌", crypto_prop: "其他盘口",
+  election_winner: "选举获胜", fed_rate_decision: "美联储利率决议", tweet_count: "推文数量", politics_prop: "其他盘口",
+  award_winner: "登顶", media_metric_range: "数据区间", culture_prop: "其他盘口",
 };
 
 // Polymarket tag id -> label. 纯客户端浏览器直接拉 Polymarket 自己的公开
@@ -425,7 +434,7 @@ function renderEvents() {
       <td>#${ev.sequence}</td>
       <td class="mono">${fmtAbsolute(ev.upstream_received_at_us)}</td>
       <td class="mono" title="端到端：从上游收到日志到这个浏览器收到 WSS 帧，含服务器处理和网络传输">${latency}</td>
-      <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${ev.event_type}</td>
+      <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${EVENT_TYPE_LABEL[ev.event_type] || "—"}</td>
       <td>${OUTCOME_LABEL[ev.price_outcome] || "—"}</td>
       <td>${ev.market_id}</td>
       <td title="${ev.condition_id}${slug ? ' — 点击跳转 Polymarket 市场页' : ''}">${conditionCell}</td>
@@ -433,7 +442,7 @@ function renderEvents() {
       <td>${tags}</td>
       <td>${CATEGORY_LABEL[ev.category] || "—"}</td>
       <td>${BET_TYPE_LABEL[ev.bet_type] || "—"}</td>
-      <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ev.enrichment_status}</td>
+      <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ENRICHMENT_STATUS_LABEL[ev.enrichment_status] || "—"}</td>
     </tr>
   `;
   }).join("");

@@ -79,6 +79,46 @@ Tag ID 使用 Polymarket 官方数字 ID。每条市场记录中不重复保存 
 一条 `dispute` 事件，就应该知道"之前那条 propose 事件给出的方向现在存疑"，而不
 是尝试从这条 dispute 事件本身再算出一个新的买入目标。
 
+## category / bet_type：一级/二级分类
+
+`UmaEvent.category`/`UmaEvent.bet_type` 是本服务对市场做的分类，纯本地从
+Gamma 的 tag/`sportsMarketType`/`question` 派生（`src/category.rs` +
+`config/category_rules.json`），不解析链上文本，也不新增任何网络请求。
+
+`category`（一级分类）：`CATEGORY_SPORTS`/`CATEGORY_ESPORTS`/
+`CATEGORY_WEATHER`/`CATEGORY_CRYPTO`/`CATEGORY_POLITICS`/`CATEGORY_CULTURE`/
+`CATEGORY_OTHER`（已知 tag，但不属于前面任何一类）/`CATEGORY_UNSPECIFIED`
+（没有富化上，或市场确实没打任何已知 tag）。
+
+`bet_type`（二级下注类型）数值按 `CCCBBB` 编码——千位是分组号，同一个
+`category` 的 `bet_type` 一定落在同一个千位区间里，且每个分组都有自己的
+"已知类目/无更具体盘口"兜底值（不共用跨分组兜底）：
+
+- `1xxx` Sports + Esports：`MONEYLINE`（单场胜负，含分段胜负）/`SPREAD`
+  （让分/让局）/`OVER_UNDER`（大小分）/`GAME_WINNER`（系列赛单局胜负，如
+  "game 1 winner"）/`OUTRIGHT`（夺冠期货盘）/`SPORTS_PROP`（兜底）。
+- `2xxx` Weather：`TEMP_HIGH`（最高温）/`TEMP_LOW`（最低温）/
+  `PRECIPITATION`（降雪/降雨）/`STORM`（飓风/热带风暴）/`WEATHER_OTHER`
+  （兜底）。
+- `3xxx` Crypto：`PRICE_TARGET`（"reach $X"/"dip to $X" 触价盘，不分方向）/
+  `PRICE_THRESHOLD`（某个具体日期"高于/低于 $X"的定档盘，常见一组多档）/
+  `UP_DOWN`（周期性涨跌二选一）/`CRYPTO_PROP`（兜底：代币上线、FDV 等）。
+- `4xxx` Politics：`ELECTION_WINNER`（选举/提名获胜，一个候选人一个市场）/
+  `FED_RATE_DECISION`（某次 FOMC 会议的利率决议，一个可能结果一个市场）/
+  `TWEET_COUNT`（公众人物某窗口期发帖数量分档，Polymarket 常设市场家族）/
+  `POLITICS_PROP`（兜底）。
+- `5xxx` Culture：`AWARD_WINNER`（"will X be the Y"式夺魁/登顶，如票房冠
+  军、榜单第一）/`MEDIA_METRIC_RANGE`（票房/播放量等指标分档）/
+  `CULTURE_PROP`（兜底）。
+- `BET_TYPE_UNSPECIFIED`（=0）：`category` 是 `CATEGORY_UNSPECIFIED`/
+  `CATEGORY_OTHER`（没有对应的下注类型词表），或者虽然是可下注类目但一点
+  信号都拿不到（`sportsMarketType`/`question` 都是空）。
+
+匹配严格按 `category` 分组作用域，不会跨组：每个分组只用自己那一组的
+tag/`sportsMarketType`/文本规则，不存在"某个分组的文本规则碰巧也命中了另一
+个分组的问题措辞，把值分类错到别的分组"这种情况——完整判定逻辑和真实数据
+来源见 `src/category.rs`。
+
 ## WebSocket
 
 端点：

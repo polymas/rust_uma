@@ -139,9 +139,9 @@ impl Category {
     }
 }
 
-/// Bet-type sub-classification, only meaningful when `Category` is
-/// `Sports`/`Esports`/`Weather` — see the doc comment on `UmaEvent.bet_type`
-/// in `proto/uma.proto`.
+/// Bet-type sub-classification — see the doc comment on `UmaEvent.bet_type`
+/// in `proto/uma.proto` for which `Category` each block belongs to and why
+/// matching is always scoped to one group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BetType {
     Unspecified,
@@ -159,6 +159,20 @@ pub enum BetType {
     Precipitation,
     Storm,
     WeatherOther,
+    // Crypto block.
+    PriceTarget,
+    PriceThreshold,
+    UpDown,
+    CryptoProp,
+    // Politics block.
+    ElectionWinner,
+    FedRateDecision,
+    TweetCount,
+    PoliticsProp,
+    // Culture block.
+    AwardWinner,
+    MediaMetricRange,
+    CultureProp,
 }
 
 impl BetType {
@@ -176,6 +190,17 @@ impl BetType {
             Self::Precipitation => pb::BetType::Precipitation as i32,
             Self::Storm => pb::BetType::Storm as i32,
             Self::WeatherOther => pb::BetType::WeatherOther as i32,
+            Self::PriceTarget => pb::BetType::PriceTarget as i32,
+            Self::PriceThreshold => pb::BetType::PriceThreshold as i32,
+            Self::UpDown => pb::BetType::UpDown as i32,
+            Self::CryptoProp => pb::BetType::CryptoProp as i32,
+            Self::ElectionWinner => pb::BetType::ElectionWinner as i32,
+            Self::FedRateDecision => pb::BetType::FedRateDecision as i32,
+            Self::TweetCount => pb::BetType::TweetCount as i32,
+            Self::PoliticsProp => pb::BetType::PoliticsProp as i32,
+            Self::AwardWinner => pb::BetType::AwardWinner as i32,
+            Self::MediaMetricRange => pb::BetType::MediaMetricRange as i32,
+            Self::CultureProp => pb::BetType::CultureProp as i32,
         }
     }
 
@@ -192,6 +217,17 @@ impl BetType {
             pb::BetType::Precipitation => Self::Precipitation,
             pb::BetType::Storm => Self::Storm,
             pb::BetType::WeatherOther => Self::WeatherOther,
+            pb::BetType::PriceTarget => Self::PriceTarget,
+            pb::BetType::PriceThreshold => Self::PriceThreshold,
+            pb::BetType::UpDown => Self::UpDown,
+            pb::BetType::CryptoProp => Self::CryptoProp,
+            pb::BetType::ElectionWinner => Self::ElectionWinner,
+            pb::BetType::FedRateDecision => Self::FedRateDecision,
+            pb::BetType::TweetCount => Self::TweetCount,
+            pb::BetType::PoliticsProp => Self::PoliticsProp,
+            pb::BetType::AwardWinner => Self::AwardWinner,
+            pb::BetType::MediaMetricRange => Self::MediaMetricRange,
+            pb::BetType::CultureProp => Self::CultureProp,
             pb::BetType::Unspecified => Self::Unspecified,
         }
     }

@@ -97,10 +97,16 @@ enum Category {
   CATEGORY_OTHER = 7; // known tag(s), but none matched a category above
 }
 
-// Bet-type sub-classification, only meaningful when Category is
-// CATEGORY_SPORTS/CATEGORY_ESPORTS/CATEGORY_WEATHER. Derived primarily from
-// Gamma's own `sportsMarketType`/tag fields, falling back to the market
-// `question` text when those are absent — see `category::classify`.
+// Bet-type sub-classification. Meaningful for every Category except
+// CATEGORY_UNSPECIFIED/CATEGORY_OTHER (those have no defined bet-type
+// vocabulary — see the per-Category group list below). Derived primarily
+// from Gamma's own `sportsMarketType`/tag fields, falling back to the market
+// `question` text when those are absent — see `category::classify`. Matching
+// is always scoped to the one group for the event's own Category (see
+// `category::BetTypeGroup`) — a Politics question happening to read like
+// "Will X win the Y?" must never resolve to the Sports group's
+// BET_TYPE_OUTRIGHT just because the text patterns look similar; each group
+// only ever sees its own tag/text rules.
 //
 // Values are `CCCBBB` decimal-encoded: a 3-digit *bet-type group* (CCC,
 // 1-999) times 1000, plus a 3-digit sub-type index within that group (BBB,
@@ -115,7 +121,10 @@ enum Category {
 //   0     shared (BET_TYPE_UNSPECIFIED)
 //   1xxx  Sports + Esports
 //   2xxx  Weather
-//   3xxx  next bettable Category, if one is ever added, then 4xxx, ...
+//   3xxx  Crypto
+//   4xxx  Politics
+//   5xxx  Culture
+//   6xxx  next bettable Category, if one is ever added, then 7xxx, ...
 // Each group carries its own catch-all ("known category, no specific bucket
 // fit" — BET_TYPE_SPORTS_PROP / BET_TYPE_WEATHER_OTHER) rather than sharing
 // one cross-group value, so "every BetType for group X falls in X's 1000s"
@@ -142,4 +151,24 @@ enum BetType {
   BET_TYPE_STORM = 2004; // hurricane/tropical storm
   BET_TYPE_WEATHER_OTHER = 2005; // known weather bet, no more specific bucket fit
   // 2006-2999 reserved for future Weather bet types (wind, air quality, ...).
+
+  // Group 3xxx: Crypto
+  BET_TYPE_PRICE_TARGET = 3001; // will the asset ever touch $X by/within a window (either direction — "reach"/"dip to")
+  BET_TYPE_PRICE_THRESHOLD = 3002; // will the asset be above/below $X at one specific point in time (a dated strike, often one of several)
+  BET_TYPE_UP_DOWN = 3003; // will the asset close up or down over a period (usually daily)
+  BET_TYPE_CRYPTO_PROP = 3004; // known crypto bet, no more specific bucket fit (token launches, FDV, legislation, ...)
+  // 3005-3999 reserved for future Crypto bet types.
+
+  // Group 4xxx: Politics
+  BET_TYPE_ELECTION_WINNER = 4001; // will X win an election/nomination/primary (one market per candidate)
+  BET_TYPE_FED_RATE_DECISION = 4002; // Fed rate decision at a given FOMC meeting (one market per possible move)
+  BET_TYPE_TWEET_COUNT = 4003; // will a public figure post N-M times in a window (recurring Polymarket market family)
+  BET_TYPE_POLITICS_PROP = 4004; // known political bet, no more specific bucket fit
+  // 4005-4999 reserved for future Politics bet types.
+
+  // Group 5xxx: Culture
+  BET_TYPE_AWARD_WINNER = 5001; // will X be [the year's/an award's] top Y (box office, chart, ...; one market per nominee)
+  BET_TYPE_MEDIA_METRIC_RANGE = 5002; // will a release's metric (box office gross, view count, ...) land in a given range
+  BET_TYPE_CULTURE_PROP = 5003; // known culture bet, no more specific bucket fit
+  // 5004-5999 reserved for future Culture bet types.
 }

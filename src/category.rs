@@ -25,9 +25,9 @@ static RULES: LazyLock<CompiledRules> = LazyLock::new(|| CompiledRules::parse(RU
 /// safe to call from the enrichment background sync, never from the
 /// propose/dispute hot path.
 ///
-/// `bet_type` is only ever non-`Unspecified` when `category` resolves to
-/// `Sports`/`Esports`/`Weather` — the bet-type taxonomy doesn't apply to any
-/// other category.
+/// `bet_type` is `Unspecified` for any `Category` without a `BetTypeGroup` in
+/// `config/category_rules.json` (currently: `Unspecified`/`Other`) — the
+/// bet-type taxonomy doesn't apply there.
 pub fn classify(
     tag_ids: &[u32],
     sports_market_type: Option<&str>,
@@ -35,31 +35,40 @@ pub fn classify(
 ) -> (Category, BetType) {
     let rules = &*RULES;
     let category = rules.category_for(tag_ids);
-    let bet_type = if matches!(
-        category,
-        Category::Sports | Category::Esports | Category::Weather
-    ) {
-        rules.bet_type_for(category, tag_ids, sports_market_type, question)
-    } else {
-        BetType::Unspecified
-    };
+    let bet_type = rules
+        .bet_type_groups
+        .iter()
+        .find(|group| group.categories.contains(&category))
+        .map_or(BetType::Unspecified, |group| {
+            group.bet_type_for(tag_ids, sports_market_type, question)
+        });
     (category, bet_type)
 }
 
 struct CompiledRules {
     tag_rules: Vec<(u32, Category)>,
+    bet_type_groups: Vec<BetTypeGroup>,
+}
+
+/// One `BetType` numeric block (see the doc comment on `BetType` in
+/// proto/uma.proto) and the rules that resolve into it. Matching is always
+/// scoped to a single group — `classify` picks the group whose `categories`
+/// contains the event's resolved `Category` first, then only that group's
+/// own tag/sportsMarketType/question rules ever run. This is deliberate, not
+/// an optimization: two groups' text rules can otherwise look similar enough
+/// to collide (the Sports group's "Will X win the Y?" pattern also reads
+/// like a Politics election-winner question) and a flat, ungrouped rule list
+/// would let one group's value leak onto another `Category`'s events.
+struct BetTypeGroup {
+    categories: Vec<Category>,
     tag_bet_type_rules: Vec<(u32, BetType)>,
     // Pre-lowercased "contains" needles, matched against a lowercased
-    // `sports_market_type`.
+    // `sports_market_type`. Empty for every group except Sports/Esports —
+    // Gamma's `sportsMarketType` field is never populated for any other
+    // category.
     sports_market_type_rules: Vec<(String, BetType)>,
     question_text_rules: Vec<(Regex, BetType)>,
-    // Deliberately one fallback per Category rather than one shared value —
-    // see the numeric-grouping doc comment on `BetType` in proto/uma.proto:
-    // a shared fallback would let e.g. a Weather market's bet_type land
-    // outside the Weather numeric block, breaking "every BetType for
-    // category X falls in X's block".
-    sports_fallback_bet_type: BetType,
-    weather_fallback_bet_type: BetType,
+    fallback_bet_type: BetType,
 }
 
 impl CompiledRules {
@@ -70,6 +79,38 @@ impl CompiledRules {
             .tag_rules
             .into_iter()
             .map(|rule| (rule.tag_id, parse_category(&rule.category)))
+            .collect();
+        let bet_type_groups = raw
+            .bet_type_groups
+            .into_iter()
+            .map(BetTypeGroup::parse)
+            .collect();
+        Self {
+            tag_rules,
+            bet_type_groups,
+        }
+    }
+
+    fn category_for(&self, tag_ids: &[u32]) -> Category {
+        for &(tag_id, category) in &self.tag_rules {
+            if tag_ids.contains(&tag_id) {
+                return category;
+            }
+        }
+        if tag_ids.is_empty() {
+            Category::Unspecified
+        } else {
+            Category::Other
+        }
+    }
+}
+
+impl BetTypeGroup {
+    fn parse(raw: RawBetTypeGroup) -> Self {
+        let categories = raw
+            .categories
+            .iter()
+            .map(|name| parse_category(name))
             .collect();
         let tag_bet_type_rules = raw
             .tag_bet_type_rules
@@ -99,31 +140,16 @@ impl CompiledRules {
             })
             .collect();
         Self {
-            tag_rules,
+            categories,
             tag_bet_type_rules,
             sports_market_type_rules,
             question_text_rules,
-            sports_fallback_bet_type: parse_bet_type(&raw.sports_fallback_bet_type),
-            weather_fallback_bet_type: parse_bet_type(&raw.weather_fallback_bet_type),
-        }
-    }
-
-    fn category_for(&self, tag_ids: &[u32]) -> Category {
-        for &(tag_id, category) in &self.tag_rules {
-            if tag_ids.contains(&tag_id) {
-                return category;
-            }
-        }
-        if tag_ids.is_empty() {
-            Category::Unspecified
-        } else {
-            Category::Other
+            fallback_bet_type: parse_bet_type(&raw.fallback_bet_type),
         }
     }
 
     fn bet_type_for(
         &self,
-        category: Category,
         tag_ids: &[u32],
         sports_market_type: Option<&str>,
         question: Option<&str>,
@@ -133,25 +159,20 @@ impl CompiledRules {
                 return bet_type;
             }
         }
-        let fallback = if category == Category::Weather {
-            self.weather_fallback_bet_type
-        } else {
-            self.sports_fallback_bet_type
-        };
         if let Some(sports_market_type) = sports_market_type {
             let lower = sports_market_type.to_lowercase();
             return self
                 .sports_market_type_rules
                 .iter()
                 .find(|(needle, _)| lower.contains(needle.as_str()))
-                .map_or(fallback, |(_, bet_type)| *bet_type);
+                .map_or(self.fallback_bet_type, |(_, bet_type)| *bet_type);
         }
         if let Some(question) = question {
             return self
                 .question_text_rules
                 .iter()
                 .find(|(regex, _)| regex.is_match(question))
-                .map_or(fallback, |(_, bet_type)| *bet_type);
+                .map_or(self.fallback_bet_type, |(_, bet_type)| *bet_type);
         }
         BetType::Unspecified
     }
@@ -160,17 +181,22 @@ impl CompiledRules {
 #[derive(Deserialize)]
 struct RawRules {
     tag_rules: Vec<RawTagCategoryRule>,
-    tag_bet_type_rules: Vec<RawTagBetTypeRule>,
-    sports_market_type_rules: Vec<RawContainsRule>,
-    question_text_rules: Vec<RawRegexRule>,
-    sports_fallback_bet_type: String,
-    weather_fallback_bet_type: String,
+    bet_type_groups: Vec<RawBetTypeGroup>,
 }
 
 #[derive(Deserialize)]
 struct RawTagCategoryRule {
     tag_id: u32,
     category: String,
+}
+
+#[derive(Deserialize)]
+struct RawBetTypeGroup {
+    categories: Vec<String>,
+    tag_bet_type_rules: Vec<RawTagBetTypeRule>,
+    sports_market_type_rules: Vec<RawContainsRule>,
+    question_text_rules: Vec<RawRegexRule>,
+    fallback_bet_type: String,
 }
 
 #[derive(Deserialize)]
@@ -212,12 +238,23 @@ fn parse_bet_type(name: &str) -> BetType {
         "OVER_UNDER" => BetType::OverUnder,
         "GAME_WINNER" => BetType::GameWinner,
         "OUTRIGHT" => BetType::Outright,
+        "SPORTS_PROP" => BetType::SportsProp,
         "TEMP_HIGH" => BetType::TempHigh,
         "TEMP_LOW" => BetType::TempLow,
         "PRECIPITATION" => BetType::Precipitation,
         "STORM" => BetType::Storm,
-        "SPORTS_PROP" => BetType::SportsProp,
         "WEATHER_OTHER" => BetType::WeatherOther,
+        "PRICE_TARGET" => BetType::PriceTarget,
+        "PRICE_THRESHOLD" => BetType::PriceThreshold,
+        "UP_DOWN" => BetType::UpDown,
+        "CRYPTO_PROP" => BetType::CryptoProp,
+        "ELECTION_WINNER" => BetType::ElectionWinner,
+        "FED_RATE_DECISION" => BetType::FedRateDecision,
+        "TWEET_COUNT" => BetType::TweetCount,
+        "POLITICS_PROP" => BetType::PoliticsProp,
+        "AWARD_WINNER" => BetType::AwardWinner,
+        "MEDIA_METRIC_RANGE" => BetType::MediaMetricRange,
+        "CULTURE_PROP" => BetType::CultureProp,
         "UNSPECIFIED" => BetType::Unspecified,
         other => panic!("config/category_rules.json: unknown bet_type {other:?}"),
     }
@@ -245,14 +282,35 @@ mod tests {
     }
 
     #[test]
-    fn known_non_bettable_tag_is_other_with_unspecified_bet_type() {
-        // tag 2 = Politics; presence of a question that would otherwise read
-        // as "moneyline" text must not leak a bet_type into a non-sports
-        // category.
+    fn category_with_no_bet_type_group_stays_unspecified_despite_matching_text() {
+        // Category::Other has no BetTypeGroup in config/category_rules.json
+        // at all — an unmapped tag plus a question that would otherwise read
+        // as Sports "moneyline" text must not leak a bet_type in from
+        // anywhere; there's no group for `classify` to even look in.
         assert_eq!(
-            classify(&[2], None, Some("Trump vs. Harris")),
-            (Category::Politics, BetType::Unspecified)
+            classify(&[999_999], None, Some("Team A vs. Team B")),
+            (Category::Other, BetType::Unspecified)
         );
+    }
+
+    #[test]
+    fn politics_election_text_never_resolves_to_the_sports_groups_outright() {
+        // Regression for a real bug caught during review, before this ever
+        // shipped: the Sports/Esports group's `^Will\s.+\swin\s(the\s)?.+\?$`
+        // OUTRIGHT text rule also matches election-winner questions like this
+        // one — when `question_text_rules` was one flat list shared across
+        // all categories, this classified as (Politics, Outright), a Sports
+        // group (1xxx) value leaking onto a Politics-categorized event. Rules
+        // are now scoped per `BetTypeGroup` (see its doc comment) so this
+        // must resolve within the Politics group only.
+        let (category, bet_type) = classify(
+            &[2],
+            None,
+            Some("Will Sarah Huckabee Sanders win the 2028 Republican presidential nomination?"),
+        );
+        assert_eq!(category, Category::Politics);
+        assert_ne!(bet_type, BetType::Outright);
+        assert_eq!(bet_type, BetType::ElectionWinner);
     }
 
     #[test]
@@ -456,6 +514,178 @@ mod tests {
                 Some("Will fewer than 950 tornadoes occur in the United States in 2026?")
             ),
             (Category::Weather, BetType::WeatherOther)
+        );
+    }
+
+    // Crypto/Politics/Culture fixtures below are all real Gamma markets
+    // fetched live via `curl https://gamma-api.polymarket.com/markets/<id>`
+    // in the session that added this test, same as the sports/weather ones
+    // above.
+
+    #[test]
+    fn dip_to_price_tag_is_price_target_under_crypto_category() {
+        // https://gamma-api.polymarket.com/markets/701502
+        // "Will Bitcoin dip to $45,000 by December 31, 2026?", tags include
+        // 21 (Crypto) and 102134 (Hit Price).
+        assert_eq!(
+            classify(&[21, 102134], None, None),
+            (Category::Crypto, BetType::PriceTarget)
+        );
+    }
+
+    #[test]
+    fn reach_price_tag_is_also_price_target_regardless_of_direction() {
+        // https://gamma-api.polymarket.com/markets/4052446
+        // "Will Ethereum reach $3,200 in September?" — same "Hit Price" tag
+        // as the dip case above; direction (reach up vs. dip down) doesn't
+        // split into separate bet types, same as Sports SPREAD not splitting
+        // by which side is favored.
+        assert_eq!(
+            classify(&[21, 102134], None, None),
+            (Category::Crypto, BetType::PriceTarget)
+        );
+    }
+
+    #[test]
+    fn multi_strikes_tag_is_price_threshold_under_crypto_category() {
+        // https://gamma-api.polymarket.com/markets/3932599
+        // "Will the price of Bitcoin be above $76,000 on September 3?", tags
+        // include 21 (Crypto) and 102516 (Multi Strikes).
+        assert_eq!(
+            classify(&[21, 102516], None, None),
+            (Category::Crypto, BetType::PriceThreshold)
+        );
+    }
+
+    #[test]
+    fn up_or_down_tag_is_up_down_under_crypto_category() {
+        // https://gamma-api.polymarket.com/markets/4061808
+        // "Bitcoin Up or Down on September 3?", tags include 21 (Crypto) and
+        // 102127 (Up or Down).
+        assert_eq!(
+            classify(&[21, 102127], None, None),
+            (Category::Crypto, BetType::UpDown)
+        );
+    }
+
+    #[test]
+    fn crypto_market_with_no_matching_signal_falls_back_to_crypto_prop() {
+        // https://gamma-api.polymarket.com/markets/920402
+        // "Variational FDV above $800M one day after launch?" — tagged
+        // Crypto plus subject-specific tags (Pre-Market, Variational, FDV),
+        // none of which are bet-type tags.
+        assert_eq!(
+            classify(
+                &[21, 102368, 102802, 139],
+                None,
+                Some("Variational FDV above $800M one day after launch?")
+            ),
+            (Category::Crypto, BetType::CryptoProp)
+        );
+    }
+
+    #[test]
+    fn elections_tag_is_election_winner_under_politics_category() {
+        // https://gamma-api.polymarket.com/markets/561982
+        // "Will Sarah Huckabee Sanders win the 2028 Republican presidential
+        // nomination?", tags include 2 (Politics) and 144 (Elections).
+        assert_eq!(
+            classify(&[2, 144], None, None),
+            (Category::Politics, BetType::ElectionWinner)
+        );
+    }
+
+    #[test]
+    fn fed_rates_tag_is_fed_rate_decision_under_politics_category() {
+        // https://gamma-api.polymarket.com/markets/2252245
+        // "Will the Fed increase interest rates by 25 bps after the
+        // September 2026 meeting?", tags include 2 (Politics) and 100196
+        // (Fed Rates).
+        assert_eq!(
+            classify(&[2, 100196], None, None),
+            (Category::Politics, BetType::FedRateDecision)
+        );
+    }
+
+    #[test]
+    fn tweet_markets_tag_is_tweet_count_under_politics_category() {
+        // https://gamma-api.polymarket.com/markets/3866126
+        // "Will Elon Musk post 160-179 tweets from August 28 to September 4,
+        // 2026?", tags include 596 (Culture), 2 (Politics), and 972 (Tweet
+        // Markets) — Politics wins the Category tie-break (checked before
+        // Culture in tag_rules).
+        assert_eq!(
+            classify(&[2, 596, 972], None, None),
+            (Category::Politics, BetType::TweetCount)
+        );
+    }
+
+    #[test]
+    fn politics_market_with_no_matching_signal_falls_back_to_politics_prop() {
+        // https://gamma-api.polymarket.com/markets/665374
+        // "Will the U.S. invade Iran before 2027?" — tagged Politics plus
+        // subject tags (Iran, Trump, Middle East, ...), none bet-type tags.
+        assert_eq!(
+            classify(
+                &[2, 78, 126, 154, 180],
+                None,
+                Some("Will the U.S. invade Iran before 2027?")
+            ),
+            (Category::Politics, BetType::PoliticsProp)
+        );
+    }
+
+    #[test]
+    fn be_the_pattern_is_award_winner_under_culture_category() {
+        // https://gamma-api.polymarket.com/markets/678416
+        // "Will Avengers: Doomsday be the top grossing movie of 2026?" and
+        // https://gamma-api.polymarket.com/markets/1130721 "Will Morgan
+        // Wallen be the Billboard #1 top artist in 2026?" — both tagged
+        // Culture with only subject-specific tags (Movies, Music, ...), no
+        // dedicated award-family tag, so this is a text-only match.
+        assert_eq!(
+            classify(
+                &[596],
+                None,
+                Some("Will Avengers: Doomsday be the top grossing movie of 2026?")
+            ),
+            (Category::Culture, BetType::AwardWinner)
+        );
+        assert_eq!(
+            classify(
+                &[596],
+                None,
+                Some("Will Morgan Wallen be the Billboard #1 top artist in 2026?")
+            ),
+            (Category::Culture, BetType::AwardWinner)
+        );
+    }
+
+    #[test]
+    fn metric_range_text_is_media_metric_range_under_culture_category() {
+        // https://gamma-api.polymarket.com/markets/3916931 "Will the total
+        // domestic gross for Spider-Man: Brand New Day be between 940m and
+        // 950m by September 30?" — also text-only, no dedicated tag.
+        assert_eq!(
+            classify(
+                &[596],
+                None,
+                Some(
+                    "Will the total domestic gross for Spider-Man: Brand New Day be between 940m and 950m by September 30?"
+                )
+            ),
+            (Category::Culture, BetType::MediaMetricRange)
+        );
+    }
+
+    #[test]
+    fn culture_market_with_no_matching_signal_falls_back_to_culture_prop() {
+        // https://gamma-api.polymarket.com/markets/703258
+        // "Will Jesus Christ return before 2027?" — tagged Culture only,
+        // question doesn't match the award-winner or metric-range patterns.
+        assert_eq!(
+            classify(&[596], None, Some("Will Jesus Christ return before 2027?")),
+            (Category::Culture, BetType::CultureProp)
         );
     }
 }

@@ -708,6 +708,24 @@ mod tests {
         assert_eq!(market.bet_type, crate::model::BetType::Moneyline);
     }
 
+    #[test]
+    fn compact_market_derives_crypto_category_and_bet_type_from_real_gamma_response() {
+        // Real, unmodified body from
+        // `curl https://gamma-api.polymarket.com/markets/701502?include_tag=true`
+        // (captured in the session that added this test) — Gamma's
+        // `sportsMarketType` is absent entirely for crypto markets (unlike
+        // weather, where it's present but `null`), so this also exercises
+        // `compact_market` with that field genuinely missing from the JSON.
+        let raw: GammaMarket = serde_json::from_str(
+            r#"{"id":"701502","conditionId":"0x024b68f77bfc019341ee3db8f57c103334e4b9430bba4746d8c94aafd8b36fee","clobTokenIds":"[\"9894510651052373088408067031031513212801618531203062911959630395716258202132\", \"20326394798700413571801660749437036272627203479853632032510011746755865615562\"]","tags":[{"id":"21"},{"id":"235"},{"id":"1312"},{"id":"102134"},{"id":"102536"},{"id":"102458"}],"question":"Will Bitcoin dip to $45,000 by December 31, 2026?"}"#,
+        )
+        .unwrap();
+        let market = compact_market(raw).unwrap();
+        assert_eq!(market.market_id, 701_502);
+        assert_eq!(market.category, crate::model::Category::Crypto);
+        assert_eq!(market.bet_type, crate::model::BetType::PriceTarget);
+    }
+
     #[tokio::test]
     async fn startup_sync_persists_cursor_then_only_applies_increment() {
         type Markets = Arc<RwLock<Vec<Value>>>;
