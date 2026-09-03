@@ -17,6 +17,19 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.3.0（2026-09-03，e150823）
+- 富化 miss 的事件不再经 WSS 广播——没有 `token_ids` 下游拿到也没法下单，
+  广播出去只是噪音；miss 事件仍然进 `EventHub` 去重环、写本地 `events.wal`、
+  计入 `enrichment_misses_total`，并打一条 `WARN` 日志（原文案改成
+  "not broadcasting, logged locally only"，跟实际行为对齐）。触发原因：观
+  察到几条最近的 miss，是这次服务重启期间 Gamma 目录还没同步完那个窗口触
+  发的，属于预期内的短暂现象，之前会被当成"广播了但没有 token_ids"的噪音
+  事件推给下游。
+- `pipeline.rs` 补了两条测试（之前完全没有测试）：miss 不进 `batch_tx` 但仍
+  写 storage，hit 正常广播。
+- `docs/WORKFLOW.md`/`internal/api/llms.txt`/`docs/ARCHITECTURE.md` 三处同步
+  更新，之前都写着"miss 也会广播"。
+
 ## v0.2.0（2026-09-03）
 - Tag 命名从 `YYYYMMDD-<commit短哈希>` 换成语义化版本号 `vX.Y.Z`，`Cargo.toml`
   的 `version` 字段跟 tag 保持一致；升级规则（PATCH/MINOR/MAJOR 怎么判、
