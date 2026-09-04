@@ -17,6 +17,20 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.5.0（2026-09-04，655c555）
+- `UmaEvent` 新增 `neg_risk` 字段（纯加法），原样透传 Gamma 市场记录自己的
+  `negRisk` 布尔值——同一个已经在拉的 `/markets/keyset` 响应体里本来就有这
+  个字段，零新增请求。`catalog.bin` 魔数随之升到 `UMACAT3`。
+- 顺带修了排查这次改动时发现的一个真实 bug：`catalog.bin` 旧格式自愈套路
+  （认到旧魔数就丢弃、触发全量重同步）只丢了 catalog，没清掉
+  `enrichment.cursor`/`enrichment_closed.cursor` 两个增量游标——游标是重启
+  前几秒才落盘的、几乎最新，导致"自愈"后的全量重同步实际几乎不拉数据，内
+  存 catalog 静默留空，`/healthz` 照样是 `ok`，真正补救要等
+  `run_catalog_reconcile` 的全量重扫（默认 6 小时一次）。也就是说任何一次
+  存储格式升级部署后，最长可能有 6 小时富化系统性 miss（不广播）且没有报
+  错信号。现在 `discard_stale_catalog` 丢弃旧格式 catalog 时把两个游标一并
+  删掉，让下一次同步是真正的全量冷启动。
+
 ## v0.4.0（2026-09-03，428273b）
 - `BetType` 新增三组二级下注类型：`3xxx` Crypto（触价/定档/涨跌/兜底）、
   `4xxx` Politics（选举获胜/美联储利率决议/推文数量分档/兜底）、`5xxx`
