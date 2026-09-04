@@ -256,6 +256,18 @@ struct DashboardData {
     latest_block: u64,
     event_ring_oldest_sequence: u64,
     event_ring_latest_sequence: u64,
+    /// Per-source ("wss[N]" racer tag, or "backfill") dedup race tallies —
+    /// "抢达率": how often each upstream feed's copy of an event was the
+    /// fastest one to actually get stored. See `Stats::source_race`. Sorted by
+    /// `source` for a stable dashboard row order across polls.
+    rpc_source_race: Vec<SourceRace>,
+}
+
+#[derive(Serialize)]
+struct SourceRace {
+    source: String,
+    received: u64,
+    won: u64,
 }
 
 /// Requires `?token=` to exactly match `DASHBOARD_TOKEN`. An unset
@@ -315,6 +327,23 @@ async fn dashboard_data(
         latest_block: state.stats.latest_block.load(Ordering::Relaxed),
         event_ring_oldest_sequence: oldest,
         event_ring_latest_sequence: latest,
+        rpc_source_race: {
+            let map = state
+                .stats
+                .source_race
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut list: Vec<SourceRace> = map
+                .iter()
+                .map(|(source, tally)| SourceRace {
+                    source: source.clone(),
+                    received: tally.received,
+                    won: tally.won,
+                })
+                .collect();
+            list.sort_by(|a, b| a.source.cmp(&b.source));
+            list
+        },
     }))
 }
 

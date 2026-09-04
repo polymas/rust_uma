@@ -544,6 +544,17 @@ async function tick() {
     ["最新区块", data.latest_block],
   ]));
 
+  // 多路 RPC 赛马：每个源交付的可解码日志数 vs. 抢先入库次数（"抢达率"）。
+  // received 里包含丢给去重的重复份数，所以 won/received 就是胜率；
+  // received 为 0（刚重启，该源还没交付过）时不算百分比，显示 "—"。
+  const raceRows = (data.rpc_source_race || []).length
+    ? data.rpc_source_race.map((r) => {
+        const pct = r.received ? (r.won / r.received * 100) : null;
+        return [r.source, r.received ? `${r.won}/${r.received}（${pct.toFixed(1)}%）` : "—", pct !== null && pct >= 50 ? "ok" : ""];
+      })
+    : [["暂无数据", "—"]];
+  grid.appendChild(card("多路 RPC 赛马抢达率", "", raceRows));
+
   grid.appendChild(card("富化 (Catalog)", hitPct > 95 ? "ok" : (hitPct > 80 ? "" : "bad"), [
     ["缓存市场数", data.catalog_markets],
     ["命中总数", data.enrichment_hits_total],

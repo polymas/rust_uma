@@ -66,8 +66,9 @@ impl Processor {
     }
 
     /// `source` identifies which upstream feed delivered this log (a WSS racer
-    /// index/tag, or "backfill"). It is only used for tracing/verification —
-    /// deduplication and correctness never depend on it.
+    /// index/tag, or "backfill"). It's only used for tracing/verification and
+    /// the `Stats::source_race` win-rate tally — deduplication and correctness
+    /// never depend on it.
     pub async fn process(&self, raw: RpcLog, received_at_us: u64, source: &str) {
         Stats::increment(&self.stats.rpc_logs_received);
         self.stats
@@ -94,6 +95,7 @@ impl Processor {
         };
         if self.events.contains(&key) {
             Stats::increment(&self.stats.duplicates);
+            self.stats.record_source_race(source, false);
             return;
         }
         // Resolve enrichment by market_id first: Gamma's condition_id is
@@ -164,8 +166,10 @@ impl Processor {
         });
         if !self.events.insert(record.clone()) {
             Stats::increment(&self.stats.duplicates);
+            self.stats.record_source_race(source, false);
             return;
         }
+        self.stats.record_source_race(source, true);
         Stats::increment(&self.stats.events_decoded);
         Stats::set_max(&self.stats.latest_block, block_number);
 
@@ -388,5 +392,34 @@ mod tests {
             Ok(StorageCommand::Event(_))
         ));
         assert_eq!(processor.stats.enrichment_hits.load(Ordering::Relaxed), 1);
+    }
+
+    /// Two racers deliver the same log; whichever wins the dedup race (here,
+    /// "wss[0]" — first to call `process`) gets credited a win, the loser
+    /// only a delivery. Exercises `Stats::record_source_race`'s three call
+    /// sites in `Processor::process` end to end, not just the helper itself.
+    #[tokio::test]
+    async fn source_race_credits_the_winner_and_not_the_duplicate() {
+        let market = MarketEnrichment {
+            market_id: 42,
+            condition_id: [9; 32],
+            token_ids: vec![[1; 32], [2; 32]],
+            tag_ids: vec![],
+            category: Category::Unspecified,
+            bet_type: BetType::Unspecified,
+        };
+        let (processor, mut batch_rx, _storage_rx) = build_processor(Catalog::new(vec![market]));
+
+        processor.process(propose_log(), 1, "wss[0]").await;
+        processor.process(propose_log(), 2, "wss[1]").await;
+
+        assert!(batch_rx.try_recv().is_ok()); // only the winner's copy is broadcast
+        assert!(batch_rx.try_recv().is_err());
+
+        let race = processor.stats.source_race.lock().unwrap();
+        assert_eq!(race["wss[0]"].received, 1);
+        assert_eq!(race["wss[0]"].won, 1);
+        assert_eq!(race["wss[1]"].received, 1);
+        assert_eq!(race["wss[1]"].won, 0);
     }
 }

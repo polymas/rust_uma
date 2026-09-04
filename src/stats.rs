@@ -1,6 +1,24 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 use serde::{Deserialize, Serialize};
+
+/// One upstream feed's outcome tally in the multi-WSS "赛马" race — how many
+/// decodable logs it delivered vs. how many of those it was the fastest copy
+/// to win the `(tx_hash, log_index)` dedup race for (see
+/// `pipeline::Processor::process`). Dashboard-only ("抢达率" — win rate);
+/// never used for correctness, and not persisted across restarts (like most
+/// of `Stats`, it's a live-process snapshot).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SourceRaceStats {
+    pub received: u64,
+    pub won: u64,
+}
 
 /// The subset of `Stats` that survives a restart — see
 /// `storage::{load_enrichment_stats, save_enrichment_stats}`. Deliberately
@@ -68,6 +86,13 @@ pub struct Stats {
     /// all connections. Dashboard-only counter for consumption throughput.
     pub ws_frames_sent: AtomicU64,
     pub ws_bytes_sent: AtomicU64,
+    /// Per-source (`"wss[N]"` racer tag, or `"backfill"`) race tallies — see
+    /// `SourceRaceStats`. Keyed by the same `source` string `Processor::process`
+    /// receives, so the key set isn't known statically (racer count comes from
+    /// `Config::wss_rpc_urls`, which can change between deploys) — hence a
+    /// `Mutex<HashMap>` rather than fixed `AtomicU64` fields. Each hold is O(1)
+    /// with no I/O, same pattern as `Processor::recent_enrichment`.
+    pub source_race: Mutex<HashMap<String, SourceRaceStats>>,
 }
 
 impl Stats {
@@ -81,6 +106,22 @@ impl Stats {
         let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(1))
         });
+    }
+
+    /// Records one source's outcome in the dedup race for a single decoded
+    /// log: always tallies a delivery, and a win only if `won` (this source's
+    /// copy was the one that actually got stored — see call sites in
+    /// `pipeline::Processor::process`).
+    pub fn record_source_race(&self, source: &str, won: bool) {
+        let mut map = self
+            .source_race
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let entry = map.entry(source.to_owned()).or_default();
+        entry.received += 1;
+        if won {
+            entry.won += 1;
+        }
     }
 
     pub fn set_max(value: &AtomicU64, candidate: u64) {
