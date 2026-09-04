@@ -63,6 +63,19 @@ message UmaEvent {
   // the bet-type taxonomy only applies to those.
   Category category = 13;
   BetType bet_type = 14;
+
+  // Whether this market is a Polymarket "Neg Risk" market (Gamma's own
+  // `negRisk` flag, carried through unchanged from `MarketEnrichment` — see
+  // `Catalog::compact_market`). Never derived on-chain: the requester address
+  // *could* be used to infer it (the Neg Risk UMA CTF Adapter is a distinct
+  // contract from the standard binary UmaCtfAdapter), but that's a
+  // reverse-engineered signal, not an authoritative one — Gamma already
+  // classifies this for every market, so enrichment is the single source of
+  // truth, same as category/bet_type above. Always false when enrichment
+  // missed (same "miss is a miss" rule as the other enrichment-derived
+  // fields), so this must not be read as "definitely not Neg Risk" on a
+  // MISS status — check enrichment_status first.
+  bool neg_risk = 15;
 }
 
 enum EventType {

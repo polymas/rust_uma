@@ -19,14 +19,14 @@ use crate::{
     wire::pb,
 };
 
-const CATALOG_MAGIC: &[u8; 8] = b"UMACAT2\0";
-// Previous catalog.bin format (no category/bet_type bytes per record) —
-// recognized on load so an upgrade doesn't hard-fail startup on a
-// still-`UMACAT1\0` cache from before this field existed. See "升级" in
+const CATALOG_MAGIC: &[u8; 8] = b"UMACAT3\0";
+// Previous catalog.bin formats — recognized on load so an upgrade doesn't
+// hard-fail startup on a cache written before a field existed. See "升级" in
 // docs/WORKFLOW.md: cross-version cache data must never silently
 // misdeserialize, but a clean, well-understood old-format cache is a case we
 // can self-heal from (full Gamma re-sync), not one that needs a hard error.
-const CATALOG_MAGIC_V1: &[u8; 8] = b"UMACAT1\0";
+const CATALOG_MAGIC_V1: &[u8; 8] = b"UMACAT1\0"; // no category/bet_type bytes per record
+const CATALOG_MAGIC_V2: &[u8; 8] = b"UMACAT2\0"; // no neg_risk byte per record
 const WAL_MAGIC: &[u8; 8] = b"UMAWAL1\0";
 const MAX_WAL_RECORD: usize = 1 << 20;
 
@@ -85,13 +85,10 @@ impl Storage {
         let mut magic = [0_u8; 8];
         reader.read_exact(&mut magic)?;
         if magic == *CATALOG_MAGIC_V1 {
-            warn!(
-                "catalog.bin is the pre-category/bet_type format ({:?}); \
-                 discarding it and re-syncing the full catalog from Gamma \
-                 instead of failing startup",
-                String::from_utf8_lossy(CATALOG_MAGIC_V1)
-            );
-            return Ok(Vec::new());
+            return self.discard_stale_catalog("pre-category/bet_type", CATALOG_MAGIC_V1);
+        }
+        if magic == *CATALOG_MAGIC_V2 {
+            return self.discard_stale_catalog("pre-neg_risk", CATALOG_MAGIC_V2);
         }
         if magic != *CATALOG_MAGIC {
             return Err(StorageError::Format("catalog magic"));
@@ -119,6 +116,7 @@ impl Storage {
             // can reach into the low hundred-thousands, so unlike `category`
             // this doesn't fit in one byte.
             let bet_type = BetType::from_proto(read_i32(&mut reader)?);
+            let neg_risk = read_u8(&mut reader)? != 0;
             markets.push(MarketEnrichment {
                 market_id,
                 condition_id,
@@ -126,9 +124,54 @@ impl Storage {
                 tag_ids,
                 category,
                 bet_type,
+                neg_risk,
             });
         }
         Ok(markets)
+    }
+
+    /// Self-heal path for an old `catalog.bin` format: log, discard it, and
+    /// return an empty catalog so startup proceeds instead of hard-failing.
+    ///
+    /// Critically, this also deletes the two incremental-sync cursor files
+    /// (`enrichment.cursor` / `enrichment_closed.cursor`), not just the
+    /// catalog. `sync_catalog_before_uma` only walks Gamma pages newer than
+    /// the persisted cursor watermark — if a cursor survives while the
+    /// catalog it was scoped to gets wiped, the boot-time sync silently does
+    /// almost no work (the cursor is typically only seconds stale, from the
+    /// run that just stopped) and the service starts back up with an
+    /// effectively empty in-memory catalog that only self-corrects up to
+    /// `catalog_reconcile_interval` (6h by default) later, via
+    /// `run_catalog_reconcile`'s from-scratch walk. That's hours of
+    /// near-total enrichment miss — no `token_ids`, nothing broadcast — for
+    /// every real event during the window, silently, with `/healthz` still
+    /// reporting `ok`. Deleting the cursors here makes the discarded catalog
+    /// and the cursors that describe its sync progress fail together, so
+    /// the very next `sync_catalog_before_uma` does a genuine full walk, the
+    /// way "discarding it and re-syncing" is supposed to read.
+    fn discard_stale_catalog(
+        &self,
+        reason: &str,
+        magic: &[u8; 8],
+    ) -> Result<Vec<MarketEnrichment>, StorageError> {
+        warn!(
+            "catalog.bin is the {reason} format ({:?}); discarding it and its \
+             incremental sync cursors so the next sync does a full Gamma \
+             re-sync, instead of failing startup or silently booting with an \
+             empty catalog",
+            String::from_utf8_lossy(magic)
+        );
+        for path in [
+            self.enrichment_cursor_path(),
+            self.closed_market_cursor_path(),
+        ] {
+            if let Err(error) = fs::remove_file(&path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(error.into());
+            }
+        }
+        Ok(Vec::new())
     }
 
     pub fn save_catalog(&self, markets: &[MarketEnrichment]) -> Result<(), StorageError> {
@@ -163,6 +206,7 @@ impl Storage {
             }
             writer.write_all(&[market.category.to_proto() as u8])?;
             writer.write_all(&market.bet_type.to_proto().to_be_bytes())?;
+            writer.write_all(&[market.neg_risk as u8])?;
         }
         writer.flush()?;
         writer.get_ref().sync_all()?;
@@ -525,6 +569,7 @@ mod tests {
             tag_ids: vec![1, 64, 100_021],
             category: Category::Sports,
             bet_type: BetType::Moneyline,
+            neg_risk: true,
         };
         storage.save_catalog(std::slice::from_ref(&market)).unwrap();
         assert_eq!(storage.load_catalog().unwrap(), vec![market]);
@@ -548,7 +593,130 @@ mod tests {
         bytes.extend_from_slice(&0_u16.to_be_bytes()); // tag_count
         fs::write(dir.path().join("catalog.bin"), &bytes).unwrap();
 
+        // A cursor left over from before the restart, as production always
+        // has one once the service has run for a while.
+        storage.save_enrichment_cursor("stale-watermark").unwrap();
+        storage
+            .save_closed_market_cursor("stale-watermark")
+            .unwrap();
+
         assert_eq!(storage.load_catalog().unwrap(), Vec::new());
+
+        // Regression: a cursor surviving a discarded catalog makes the next
+        // `sync_catalog_before_uma` think it's already caught up and skip
+        // almost every market — see `discard_stale_catalog`'s doc comment.
+        // The self-heal must clear both cursors too, not just the catalog.
+        assert_eq!(
+            storage.load_enrichment_cursor().unwrap(),
+            None,
+            "stale cursor must not survive a discarded catalog"
+        );
+        assert_eq!(
+            storage.load_closed_market_cursor().unwrap(),
+            None,
+            "stale closed-market cursor must not survive a discarded catalog"
+        );
+    }
+
+    #[test]
+    fn v2_catalog_format_self_heals_to_an_empty_catalog_instead_of_hard_failing() {
+        // A `UMACAT2\0` file (category/bet_type present, no neg_risk byte)
+        // must not crash startup either — same self-heal contract as the V1
+        // case above, one version later. Hand-written in the old
+        // (still-supported-for-reading) wire shape: magic, count=1, one
+        // record with no trailing neg_risk byte.
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CATALOG_MAGIC_V2);
+        bytes.extend_from_slice(&1_u32.to_be_bytes()); // count
+        bytes.extend_from_slice(&42_u64.to_be_bytes()); // market_id
+        bytes.extend_from_slice(&[7; 32]); // condition_id
+        bytes.extend_from_slice(&0_u16.to_be_bytes()); // token_count
+        bytes.extend_from_slice(&0_u16.to_be_bytes()); // tag_count
+        bytes.push(Category::Sports.to_proto() as u8); // category
+        bytes.extend_from_slice(&BetType::Moneyline.to_proto().to_be_bytes()); // bet_type
+        fs::write(dir.path().join("catalog.bin"), &bytes).unwrap();
+        storage.save_enrichment_cursor("stale-watermark").unwrap();
+        storage
+            .save_closed_market_cursor("stale-watermark")
+            .unwrap();
+
+        assert_eq!(storage.load_catalog().unwrap(), Vec::new());
+        assert_eq!(
+            storage.load_enrichment_cursor().unwrap(),
+            None,
+            "stale cursor must not survive a discarded catalog"
+        );
+        assert_eq!(
+            storage.load_closed_market_cursor().unwrap(),
+            None,
+            "stale closed-market cursor must not survive a discarded catalog"
+        );
+    }
+
+    /// End-to-end proof of the actual production sequence in `main.rs`
+    /// (`load_catalog` then `sync_catalog_before_uma`) against a real,
+    /// running Gamma stand-in: an old-format `catalog.bin` plus a cursor
+    /// already past a mock market must still result in that market being
+    /// synced, not silently skipped. Before `discard_stale_catalog` cleared
+    /// the cursors, this reproduced with `catalog.len() == 0` after boot —
+    /// the exact failure mode described in its doc comment.
+    #[tokio::test]
+    async fn boot_sync_recovers_fully_after_a_catalog_format_self_heal() {
+        use axum::{Json, Router, extract::State, routing::get};
+        use serde_json::{Value, json};
+        use std::sync::{Arc as StdArc, RwLock};
+
+        fn market(id: u64, updated_at: &str) -> Value {
+            json!({
+                "id": id.to_string(),
+                "updatedAt": updated_at,
+                "conditionId": format!("0x{}", format!("{id:02x}").repeat(32)),
+                "clobTokenIds": [id.to_string()],
+                "tags": [],
+                "events": []
+            })
+        }
+        async fn list_markets(State(markets): State<StdArc<RwLock<Vec<Value>>>>) -> Json<Value> {
+            Json(json!({ "markets": markets.read().unwrap().clone(), "next_cursor": "" }))
+        }
+
+        let markets = StdArc::new(RwLock::new(vec![market(1, "2026-01-01T00:00:00Z")]));
+        let app = Router::new()
+            .route("/markets/keyset", get(list_markets))
+            .with_state(markets.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        // Old-format catalog.bin (V2), plus a cursor already past the mock
+        // market — exactly what a real host has moments before a restart.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CATALOG_MAGIC_V2);
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        fs::write(dir.path().join("catalog.bin"), &bytes).unwrap();
+        storage
+            .save_enrichment_cursor(r#"{"updated_at":"2026-06-01T00:00:00Z","market_id":999}"#)
+            .unwrap();
+
+        let catalog_rows = storage.load_catalog().unwrap();
+        assert_eq!(catalog_rows.len(), 0, "sanity: old format was discarded");
+        let catalog = crate::enrichment::Catalog::new(catalog_rows);
+        let gamma = crate::enrichment::GammaClient::new(format!("http://{address}")).unwrap();
+        crate::enrichment::sync_catalog_before_uma(&gamma, &catalog, &storage, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            catalog.len(),
+            1,
+            "boot sync must recover the mock market once the stale cursor is cleared"
+        );
+        server.abort();
     }
 
     #[test]

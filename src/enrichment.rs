@@ -504,6 +504,8 @@ struct GammaMarket {
     tags: Vec<GammaTag>,
     #[serde(default)]
     events: Vec<GammaEvent>,
+    #[serde(default)]
+    neg_risk: bool,
     // Both only used transiently in `compact_market` to derive
     // `category`/`bet_type` (see `crate::category::classify`) — neither is
     // kept on `MarketEnrichment` itself, same reasoning as the tag *labels*
@@ -578,6 +580,7 @@ fn compact_market(raw: GammaMarket) -> Result<MarketEnrichment, EnrichmentError>
         tag_ids,
         category,
         bet_type,
+        neg_risk: raw.neg_risk,
     })
 }
 
@@ -661,6 +664,7 @@ mod tests {
             tag_ids: vec![7],
             category: crate::model::Category::Unspecified,
             bet_type: crate::model::BetType::Unspecified,
+            neg_risk: true,
         }]);
 
         // Stand-in for whatever the (wrong, for this market) binary formula
@@ -706,6 +710,7 @@ mod tests {
         assert_eq!(market.market_id, 3_931_114);
         assert_eq!(market.category, crate::model::Category::Sports);
         assert_eq!(market.bet_type, crate::model::BetType::Moneyline);
+        assert!(!market.neg_risk, "this real market is not Neg Risk");
     }
 
     #[test]
@@ -724,6 +729,26 @@ mod tests {
         assert_eq!(market.market_id, 701_502);
         assert_eq!(market.category, crate::model::Category::Crypto);
         assert_eq!(market.bet_type, crate::model::BetType::PriceTarget);
+        assert!(!market.neg_risk, "this real market is not Neg Risk");
+    }
+
+    #[test]
+    fn compact_market_carries_neg_risk_flag_from_real_gamma_response() {
+        // Real, unmodified body from
+        // `curl https://gamma-api.polymarket.com/markets/907474?include_tag=true`
+        // (captured in the session that added this field) — same market as
+        // `resolves_neg_risk_market_via_market_id_not_binary_formula` above
+        // and `uma::events::tests::neg_risk_event_binary_formula_yields_wrong_condition_id`,
+        // confirmed there to be a genuine Neg Risk market via its adapter
+        // requester address; this proves Gamma's own `negRisk` flag for the
+        // same market reads `true` and survives `compact_market` unchanged.
+        let raw: GammaMarket = serde_json::from_str(
+            r#"{"id":"907474","conditionId":"0xa50547851bf565603ad7e866d9d2aa2c6c2ee77b2d390e581bf2e8a53b466902","clobTokenIds":["17475510683200848732023427231607713644344302760946880422689479764378729943963","82234437478180534939203909772091271039341484839669360098313580187608349272477"],"tags":[{"id":"2"}],"negRisk":true}"#,
+        )
+        .unwrap();
+        let market = compact_market(raw).unwrap();
+        assert_eq!(market.market_id, 907_474);
+        assert!(market.neg_risk);
     }
 
     #[tokio::test]

@@ -381,6 +381,7 @@ mod tests {
             tag_ids: vec![],
             category: Category::Unspecified,
             bet_type: BetType::Unspecified,
+            neg_risk: false,
         };
         let (processor, mut batch_rx, mut storage_rx) = build_processor(Catalog::new(vec![market]));
 
@@ -407,6 +408,7 @@ mod tests {
             tag_ids: vec![],
             category: Category::Unspecified,
             bet_type: BetType::Unspecified,
+            neg_risk: false,
         };
         let (processor, mut batch_rx, _storage_rx) = build_processor(Catalog::new(vec![market]));
 

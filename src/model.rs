@@ -241,6 +241,10 @@ pub struct MarketEnrichment {
     pub tag_ids: Vec<u32>,
     pub category: Category,
     pub bet_type: BetType,
+    /// Polymarket's "Neg Risk" flag, taken as-is from Gamma's `negRisk` — see
+    /// the doc comment on `UmaEvent.neg_risk` in proto/uma.proto for why this
+    /// is enrichment-only, never derived on-chain.
+    pub neg_risk: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -311,6 +315,7 @@ impl EventRecord {
             bet_type: enrichment
                 .map_or(BetType::Unspecified, |v| v.bet_type)
                 .to_proto(),
+            neg_risk: enrichment.is_some_and(|v| v.neg_risk),
         }
     }
 
@@ -333,6 +338,7 @@ impl EventRecord {
                 tag_ids: value.tag_ids.clone(),
                 category: Category::from_proto(value.category),
                 bet_type: BetType::from_proto(value.bet_type),
+                neg_risk: value.neg_risk,
             })
         });
         let kind = EventKind::from_proto(value.event_type)?;
@@ -531,6 +537,12 @@ mod tests {
             tag_ids: vec![100],
             category: Category::Unspecified,
             bet_type: BetType::Unspecified,
+            // Real value for this market: `curl
+            // https://gamma-api.polymarket.com/markets/907474` returns
+            // `"negRisk": true` (captured in the session that added this
+            // field) — this is the same Neg Risk market this test already
+            // uses to prove the condition_id resolution path.
+            neg_risk: true,
         }]);
         let enrichment =
             catalog.resolve(event.request().ancillary.market_id, &derived_condition_id);
@@ -551,5 +563,9 @@ mod tests {
         // Real captured price for this tx was 0 (word 3 of the log data is
         // all zeros) -> per UmaCtfAdapter's payout convention that's token_ids[1].
         assert_eq!(proto.price_outcome, pb::PriceOutcome::Token1 as i32);
+        assert!(
+            proto.neg_risk,
+            "Gamma's real negRisk for market 907474 is true"
+        );
     }
 }

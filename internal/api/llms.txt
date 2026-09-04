@@ -119,6 +119,18 @@ tag/`sportsMarketType`/文本规则，不存在"某个分组的文本规则碰�
 个分组的问题措辞，把值分类错到别的分组"这种情况——完整判定逻辑和真实数据
 来源见 `src/category.rs`。
 
+## neg_risk：是否 Neg Risk 市场
+
+`UmaEvent.neg_risk` 原样透传 Gamma 市场记录自己的 `negRisk` 布尔字段，不做
+任何本地判断或链上推导——虽然链上 `requester`（adapter 合约地址）理论上也能
+反推出这个信息（Neg Risk 市场走的是与标准二元 `UmaCtfAdapter` 不同的独立
+adapter 合约），但那只是"能反推、不权威"的信号，Gamma 自己的分类才是唯一
+真相来源，跟 `condition_id` 优先信 Gamma 而不信链上二元公式是同一个理由。
+
+`neg_risk` 只在 `enrichment_status=ENRICHMENT_STATUS_HIT` 时有意义；富化
+miss 时恒为 `false`（跟其它富化字段一样遵守"miss 就是 miss"，不代表这条市
+场真的不是 Neg Risk）。
+
 ## WebSocket
 
 端点：
