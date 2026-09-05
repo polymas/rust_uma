@@ -122,11 +122,11 @@
         <tr>
           <th>序号</th><th>收到于</th><th>端到端延迟</th><th>类型</th><th>方向</th>
           <th>Market ID</th><th>Condition ID</th><th>Token IDs（粗体=方向指向）</th>
-          <th>Tags</th><th>分类</th><th>下注类型</th><th>富化</th>
+          <th>Tags</th><th>分类</th><th>下注类型</th><th>Neg Risk</th><th>富化</th>
         </tr>
       </thead>
       <tbody id="eventsBody">
-        <tr><td colspan="10" style="color:var(--dim)">等待新事件…</td></tr>
+        <tr><td colspan="13" style="color:var(--dim)">等待新事件…</td></tr>
       </tbody>
     </table>
   </div>
@@ -241,6 +241,7 @@ function decodeUmaEvent(buf) {
     price_outcome: PRICE_OUTCOME[val(12, 0)] || "unspecified",
     category: CATEGORY[val(13, 0)] || "unspecified",
     bet_type: BET_TYPE[val(14, 0)] || "unspecified",
+    neg_risk: !!val(15, 0),
   };
 }
 function decodeUmaBatch(buf) {
@@ -442,6 +443,7 @@ function renderEvents() {
       <td>${tags}</td>
       <td>${CATEGORY_LABEL[ev.category] || "—"}</td>
       <td>${BET_TYPE_LABEL[ev.bet_type] || "—"}</td>
+      <td title="富化 miss 时 neg_risk 恒为 false，不代表这个市场确实不是 Neg Risk——见 proto/uma.proto">${ev.enrichment_status === 'hit' ? (ev.neg_risk ? "是" : "否") : "—"}</td>
       <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ENRICHMENT_STATUS_LABEL[ev.enrichment_status] || "—"}</td>
     </tr>
   `;
