@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -60,7 +60,7 @@ pub async fn run_rpc_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let http = match HttpRpc::new(config.polygon_rpc_url.clone()) {
-        Ok(client) => client,
+        Ok(client) => Arc::new(client),
         Err(error) => {
             warn!(%error, "cannot initialize HTTP RPC client");
             return;
@@ -77,7 +77,8 @@ pub async fn run_rpc_loop(
             tokio::spawn(live_worker(
                 index,
                 url,
-                config.live_buffer,
+                config.clone(),
+                http.clone(),
                 processor.clone(),
                 stats.clone(),
                 any_connected_tx.clone(),
@@ -120,29 +121,65 @@ pub async fn run_rpc_loop(
     }
 }
 
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A session that stayed up at least this long counts as healthy: the next
+/// reconnect starts over at the initial delay instead of continuing the
+/// exponential climb.
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
+
+/// Delay to sleep before the next reconnect attempt, and the escalated
+/// value to carry into the attempt after that. Exponential only across
+/// *consecutive* quick failures — a healthy session resets the climb, so a
+/// provider's routine connection rotation weeks apart never accumulates
+/// into a permanent 30s outage per drop (which, with the racers behind a
+/// shared edge, is a permanent event gap when both drop together).
+fn reconnect_backoff(current: Duration, session_lasted: Duration) -> (Duration, Duration) {
+    let delay = if session_lasted >= HEALTHY_SESSION {
+        RECONNECT_BACKOFF_INITIAL
+    } else {
+        current
+    };
+    (delay, (delay * 2).min(RECONNECT_BACKOFF_MAX))
+}
+
 /// One racer's forever-reconnecting live subscription.
+#[allow(clippy::too_many_arguments)]
 async fn live_worker(
     index: usize,
     url: String,
-    live_buffer: usize,
+    config: Arc<Config>,
+    http: Arc<HttpRpc>,
     processor: Arc<Processor>,
     stats: Arc<Stats>,
     any_connected: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let source = format!("wss[{index}]");
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = RECONNECT_BACKOFF_INITIAL;
+    let mut sessions = 0_u64;
     loop {
         if *shutdown.borrow() {
             break;
         }
+        let started = Instant::now();
+        // Not the first session => a reconnect: fill whatever this racer
+        // missed while it was down (see `run_live_session`).
+        let gap_fill = (sessions > 0).then(|| GapFill {
+            index,
+            config: config.clone(),
+            http: http.clone(),
+            processor: processor.clone(),
+            stats: stats.clone(),
+        });
         match run_live_session(
             &source,
             &url,
-            live_buffer,
+            config.live_buffer,
             &processor,
             &stats,
             &any_connected,
+            gap_fill,
             shutdown.clone(),
         )
         .await
@@ -151,16 +188,78 @@ async fn live_worker(
             Ok(()) => warn!(source, "Polygon live subscription ended; reconnecting"),
             Err(error) => warn!(%error, source, "Polygon live subscription failed; reconnecting"),
         }
+        sessions += 1;
         mark_source_disconnected(&stats);
         Stats::increment(&stats.rpc_reconnects);
+        let (delay, next) = reconnect_backoff(backoff, started.elapsed());
+        backoff = next;
         tokio::select! {
             _ = shutdown.changed() => if *shutdown.borrow() { break; },
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(delay) => {}
         }
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
+/// Everything a reconnecting racer needs to catch up on the blocks that
+/// went by while it was disconnected.
+struct GapFill {
+    index: usize,
+    config: Arc<Config>,
+    http: Arc<HttpRpc>,
+    processor: Arc<Processor>,
+    stats: Arc<Stats>,
+}
+
+impl GapFill {
+    /// Spawned, never awaited by the live loop: the reconnected subscription
+    /// must start draining immediately, not sit behind HTTP round trips —
+    /// the catch-up runs beside it and `EventHub` dedup absorbs the
+    /// overlap, exactly like the startup backfill. Only needed when *every*
+    /// racer was down at once (otherwise the others covered the gap and
+    /// this is a few cheap, fully-deduplicated `eth_getLogs`), but that is
+    /// precisely the case that used to be a permanent hole: backfill ran
+    /// once at startup and nothing ever re-walked a live outage.
+    fn spawn(self) {
+        let from = self
+            .stats
+            .latest_block
+            .load(Ordering::Relaxed)
+            .saturating_add(1);
+        if from <= 1 {
+            return; // nothing observed yet; the startup backfill owns the range
+        }
+        let source = format!("gapfill[{}]", self.index);
+        tokio::spawn(async move {
+            let head = match self.http.latest_block().await {
+                Ok(head) => head,
+                Err(error) => {
+                    warn!(%error, source, "gap-fill after reconnect: cannot read head");
+                    return;
+                }
+            };
+            if from > head {
+                return;
+            }
+            match backfill_range(
+                &self.http,
+                &self.processor,
+                from,
+                head,
+                self.config.backfill_batch_blocks,
+                &source,
+            )
+            .await
+            {
+                Ok(()) => info!(from, to = head, source, "gap-fill after reconnect complete"),
+                Err(error) => {
+                    warn!(%error, from, to = head, source, "gap-fill after reconnect failed")
+                }
+            }
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_live_session(
     source: &str,
     url: &str,
@@ -168,6 +267,7 @@ async fn run_live_session(
     processor: &Arc<Processor>,
     stats: &Arc<Stats>,
     any_connected: &watch::Sender<bool>,
+    gap_fill: Option<GapFill>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), RpcError> {
     let (mut live, reader) =
@@ -175,6 +275,11 @@ async fn run_live_session(
     mark_source_connected(stats);
     any_connected.send_replace(true);
     info!(source, "Polygon signal subscription connected");
+    // Subscribed first, then catch up: the new subscription bounds the gap
+    // from above, so nothing between "last seen" and "now" can slip past.
+    if let Some(gap_fill) = gap_fill {
+        gap_fill.spawn();
+    }
 
     loop {
         tokio::select! {
@@ -237,7 +342,7 @@ async fn run_backfill(
         )
     };
 
-    if let Some(mut cursor) = from
+    if let Some(cursor) = from
         && cursor <= subscribed_head
     {
         info!(
@@ -245,23 +350,46 @@ async fn run_backfill(
             to = subscribed_head,
             "starting signal backfill after live subscription"
         );
-        while cursor <= subscribed_head {
-            let end = cursor
-                .saturating_add(config.backfill_batch_blocks.max(1) - 1)
-                .min(subscribed_head);
-            let mut logs = http.get_logs(cursor, end).await?;
-            logs.sort_unstable_by_key(|log| {
-                (
-                    parse_hex_u64(&log.block_number, "blockNumber").unwrap_or_default(),
-                    parse_hex_u64(&log.log_index, "logIndex").unwrap_or_default(),
-                )
-            });
-            for log in logs {
-                processor.process(log, now_us(), "backfill").await;
-            }
-            processor.checkpoint(end);
-            cursor = end.saturating_add(1);
+        backfill_range(
+            http,
+            processor,
+            cursor,
+            subscribed_head,
+            config.backfill_batch_blocks,
+            "backfill",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Walks `[from, to]` in `batch_blocks`-sized `eth_getLogs` calls, feeding
+/// every log through the normal `Processor` path (dedup included) and
+/// checkpointing each completed batch. Shared by the one-shot startup
+/// backfill and the per-reconnect gap-fill.
+async fn backfill_range(
+    http: &HttpRpc,
+    processor: &Arc<Processor>,
+    from: u64,
+    to: u64,
+    batch_blocks: u64,
+    source: &str,
+) -> Result<(), RpcError> {
+    let mut cursor = from;
+    while cursor <= to {
+        let end = cursor.saturating_add(batch_blocks.max(1) - 1).min(to);
+        let mut logs = http.get_logs(cursor, end).await?;
+        logs.sort_unstable_by_key(|log| {
+            (
+                parse_hex_u64(&log.block_number, "blockNumber").unwrap_or_default(),
+                parse_hex_u64(&log.log_index, "logIndex").unwrap_or_default(),
+            )
+        });
+        for log in logs {
+            processor.process(log, now_us(), source).await;
         }
+        processor.checkpoint(end);
+        cursor = end.saturating_add(1);
     }
     Ok(())
 }
@@ -488,6 +616,98 @@ mod tests {
             client.first_block_at_or_after(555, 0, 100).await.unwrap(),
             56
         );
+        server.abort();
+    }
+
+    #[test]
+    fn backoff_escalates_across_quick_failures_and_resets_after_a_healthy_session() {
+        let quick = Duration::from_millis(200);
+        let (d1, next) = reconnect_backoff(RECONNECT_BACKOFF_INITIAL, quick);
+        assert_eq!(d1, Duration::from_secs(1));
+        let (d2, next) = reconnect_backoff(next, quick);
+        assert_eq!(d2, Duration::from_secs(2));
+        let (d3, next) = reconnect_backoff(next, quick);
+        assert_eq!(d3, Duration::from_secs(4));
+        // Keeps climbing but caps.
+        let (_, capped) = (0..10).fold((d3, next), |(_, n), _| reconnect_backoff(n, quick));
+        assert_eq!(capped, RECONNECT_BACKOFF_MAX);
+        // A long healthy session drops straight back to the initial delay,
+        // regardless of how high the climb had gotten.
+        let (delay, next) = reconnect_backoff(capped, HEALTHY_SESSION);
+        assert_eq!(delay, RECONNECT_BACKOFF_INITIAL);
+        assert_eq!(next, RECONNECT_BACKOFF_INITIAL * 2);
+    }
+
+    /// `backfill_range` must cover the whole inclusive range in
+    /// `batch_blocks`-sized `eth_getLogs` windows with no gap and no
+    /// overlap, and checkpoint the last block — this is what the
+    /// per-reconnect gap-fill relies on to turn a live outage into a
+    /// late delivery rather than a permanent hole.
+    #[tokio::test]
+    async fn backfill_range_walks_every_block_once_in_batches() {
+        use std::sync::Mutex;
+
+        use crate::{
+            config::test_config, enrichment::Catalog, hub::EventHub, storage::StorageCommand,
+        };
+
+        type Windows = Arc<Mutex<Vec<(u64, u64)>>>;
+        async fn rpc(
+            axum::extract::State(windows): axum::extract::State<Windows>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            assert_eq!(request["method"], "eth_getLogs");
+            let hex = |key: &str| {
+                u64::from_str_radix(
+                    request["params"][0][key]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap()
+            };
+            windows
+                .lock()
+                .unwrap()
+                .push((hex("fromBlock"), hex("toBlock")));
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": []}))
+        }
+
+        let windows: Windows = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(rpc))
+            .with_state(windows.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = HttpRpc::new(format!("http://{address}")).unwrap();
+
+        let (batch_tx, _batch_rx) = mpsc::channel(4);
+        let (storage_tx, mut storage_rx) = mpsc::channel(16);
+        let processor = Arc::new(Processor::new(
+            Arc::new(test_config()),
+            Arc::new(Catalog::new(Vec::new())),
+            Arc::new(EventHub::new(16)),
+            batch_tx,
+            storage_tx,
+            Arc::new(Stats::default()),
+            0,
+        ));
+
+        backfill_range(&client, &processor, 100, 125, 10, "gapfill[0]")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *windows.lock().unwrap(),
+            vec![(100, 109), (110, 119), (120, 125)]
+        );
+        let mut checkpoints = Vec::new();
+        while let Ok(StorageCommand::Checkpoint(block)) = storage_rx.try_recv() {
+            checkpoints.push(block);
+        }
+        assert_eq!(checkpoints, vec![109, 119, 125]);
         server.abort();
     }
 }

@@ -22,7 +22,7 @@ flowchart TD
     subgraph INGEST["uma/rpc.rs · 采集"]
         direction LR
         LW["live_worker × N\n(每路独立永久重连)"]
-        BF["run_backfill\n(一次性, 仅 HTTP)"]
+        BF["backfill_range (仅 HTTP)\n启动时一次 + 每次重连后补拉断线窗口"]
     end
 
     DEC["uma/events/\ndecode_signal_log\nProposePrice / DisputePrice"]
@@ -137,6 +137,7 @@ sequenceDiagram
     Live-->>Rpc: 任一 worker 订阅成功 (any_connected)
     Rpc->>Rpc: run_backfill()（一次性，HTTP，从 uma.cursor 或近 7 天边界开始）
     Note over Live,Rpc: 补拉与实时并行；重叠事件靠<br/>(tx_hash, log_index) 去重，不丢不重
+    Live->>Live: 某路断线重连成功后 spawn gap-fill<br/>(latest_block+1 .. 新链头, 不阻塞实时流)
     Main->>Api: serve() 开始对外提供 HTTP/WSS
 ```
 

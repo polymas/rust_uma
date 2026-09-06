@@ -88,8 +88,22 @@ src/
 
 - `uma/rpc.rs` 支持 `WSS_RPC_LIST`（逗号分隔多个 WSS 端点赛马，去重靠
   `EventHub` 的 `(tx_hash, log_index)`），只有一个地址时自动退化为单路。生产
-  机上目前只配了一路，后续要加节点直接编辑服务器 `/etc/rust-uma/rust-uma.env`
+  机上目前配了两路，后续要加节点直接编辑服务器 `/etc/rust-uma/rust-uma.env`
   的 `WSS_RPC_LIST` 并重启服务，不用重新部署二进制。
+- **重连退避会复位，重连后会补拉断线窗口**（`live_worker`）：退避只在连续快速
+  失败之间指数增长，一次健康会话（≥30s）之后回到 1s——之前的实现从不复位，
+  几周里几次供应商例行断连就会把每路的重连等待永久堆到 30s。重连成功后
+  spawn 一个 gap-fill（`latest_block+1` 到新链头的 `eth_getLogs`，走正常
+  `Processor` 去重，不阻塞实时流）。两路赛马正常时另一路会兜底、补拉全是重
+  复，但两路同时断（同一 CDN 边缘）时这段窗口以前是永久漏事件（补拉只在启
+  动时跑一次）。`rpc_reconnects_total` 涨了之后，看日志
+  `gap-fill after reconnect complete` 确认补拉跑了。
+- **catalog 落盘不占 tokio worker**（`enrichment.rs::persist_catalog`）：
+  `Catalog::snapshot()` 只克隆 `Arc`（持读锁几毫秒），排序/序列化/fsync/游标
+  写入整体放 `spawn_blocking`。生产只有 2 个 worker，以前每分钟一次几百毫秒
+  的同步落盘直接挡热路径；且 Linux std `RwLock` 写者优先，长 snapshot 后面
+  排一个 reconcile 的 `upsert` 就会把热路径的 `resolve` 读锁一起挡住。
+  同步日志里带 `snapshot_ms`/`save_ms`，部署后看真实数字。
 - **`condition_id` 不能对所有 Adapter 无条件用二元公式推导**：Neg Risk 市场
   的 `keccak256(ancillary_data)` 只是一个 `requestId`，不是公式里的
   `questionId`，算出来的 `condition_id` 会和 Gamma 权威值不一致。现在的做法
