@@ -17,6 +17,23 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.6.0（2026-09-06，95af0bb）
+- 延迟分析后的两项热路径周边优化。**catalog 落盘不再占 tokio worker**：
+  `Catalog::snapshot()` 改为只克隆 `Arc`（持读锁从几十毫秒降到几毫秒），排
+  序/序列化 46MB/fsync/游标写入整体放 `spawn_blocking`（新的
+  `persist_catalog`，三个调用点统一走它，"catalog 先落盘、游标后推进"不变）。
+  生产只有 2 个 worker，之前每分钟一次几百毫秒的同步落盘直接挡热路径，且
+  Linux std `RwLock` 写者优先，长 snapshot 后排一个 reconcile 的 `upsert`
+  会把热路径 `resolve` 的读锁一起挡住。同步日志新增 `snapshot_ms`/`save_ms`。
+- **重连退避复位 + 重连后补拉断线窗口**（`uma/rpc.rs::live_worker`）：之前
+  backoff 只翻倍从不复位，几次供应商例行断连后每路重连永久等 30s；且补拉只
+  在启动跑一次，两路同时断线的窗口内事件会永久漏掉。现在会话跑满 30s 视为健
+  康、下次重连回到 1s；重连订阅成功后 spawn gap-fill（`latest_block+1` 到新
+  链头，走正常 `Processor` 去重，不阻塞实时流，来源 `gapfill[N]`）。
+- `internal/api/llms.txt` 新增「延迟相关的下游建议」：就近部署（服务在法兰
+  克福）、客户端 TCP_NODELAY、读循环不阻塞、按帧处理、延迟口径（不要用区块
+  时间戳，实测超前真实时间 0.6~1.4s）等。服务端发送方向的 Nagle 本次未改。
+
 ## v0.5.0（2026-09-04，655c555）
 - `UmaEvent` 新增 `neg_risk` 字段（纯加法），原样透传 Gamma 市场记录自己的
   `negRisk` 布尔值——同一个已经在拉的 `/markets/keyset` 响应体里本来就有这
