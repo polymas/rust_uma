@@ -1,4 +1,5 @@
 use std::{
+    borrow::Borrow,
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Write},
@@ -174,10 +175,22 @@ impl Storage {
         Ok(Vec::new())
     }
 
-    pub fn save_catalog(&self, markets: &[MarketEnrichment]) -> Result<(), StorageError> {
+    /// Blocking: sorts, serializes, fsyncs and renames. Generic over the
+    /// element type so callers can hand over `Catalog::snapshot()`'s
+    /// `Arc<MarketEnrichment>`s (pointer clones, no deep copy under the
+    /// catalog lock) as well as plain `MarketEnrichment` rows. Run it via
+    /// `spawn_blocking` from async code — at production scale (~350k
+    /// markets, ~46 MB) this holds a thread for tens to hundreds of ms.
+    pub fn save_catalog<M: Borrow<MarketEnrichment>>(
+        &self,
+        markets: &[M],
+    ) -> Result<(), StorageError> {
         let path = self.catalog_path();
         let temp = temporary_path(&path);
-        let mut ordered = markets.iter().collect::<Vec<_>>();
+        let mut ordered = markets
+            .iter()
+            .map(Borrow::borrow)
+            .collect::<Vec<&MarketEnrichment>>();
         ordered.sort_unstable_by_key(|market| market.market_id);
         let file = File::create(&temp)?;
         let mut writer = BufWriter::new(file);

@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
+    io,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use reqwest::Client;
@@ -10,7 +11,12 @@ use thiserror::Error;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::{config::Config, model::MarketEnrichment, stats::Stats, storage::Storage};
+use crate::{
+    config::Config,
+    model::MarketEnrichment,
+    stats::Stats,
+    storage::{Storage, StorageError},
+};
 
 #[derive(Default)]
 struct CatalogIndexes {
@@ -103,13 +109,20 @@ impl Catalog {
         self.len() == 0
     }
 
-    pub fn snapshot(&self) -> Vec<MarketEnrichment> {
+    /// Pointer clones only (`Arc` refcount bumps), so the read lock is held
+    /// for a few ms at production scale rather than the tens of ms a deep
+    /// copy of ~350k rows (two `Vec`s each) used to cost. That matters
+    /// beyond throughput: Linux's std `RwLock` parks new readers while a
+    /// writer is queued, so a long snapshot with a concurrent `upsert`
+    /// (the reconcile task) waiting behind it stalls the hot path's
+    /// `resolve()` for the whole hold.
+    pub fn snapshot(&self) -> Vec<Arc<MarketEnrichment>> {
         self.indexes
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .by_condition
             .values()
-            .map(|market| market.as_ref().clone())
+            .cloned()
             .collect()
     }
 }
@@ -228,6 +241,53 @@ impl CursorPair {
     }
 }
 
+/// How long `persist_catalog` spent in each of its two phases, surfaced on
+/// the sync/reconcile log lines so production numbers are visible without
+/// a profiler.
+#[derive(Clone, Copy, Debug)]
+pub struct PersistTimings {
+    pub snapshot: Duration,
+    pub save: Duration,
+}
+
+/// Makes the catalog durable, then (only then) the cursors — the "catalog
+/// before cursor" invariant every caller relies on.
+///
+/// Everything blocking (sort, serialize ~46 MB, fsync, rename, plus the
+/// cursor writes) runs on the blocking pool via `spawn_blocking`, never on
+/// a runtime worker: production has two workers total, and a worker pinned
+/// for hundreds of ms once a minute is a direct hot-path tail-latency hit
+/// (the live reader / batcher / WSS sessions all need a free worker).
+async fn persist_catalog(
+    storage: &Storage,
+    catalog: &Catalog,
+    active_cursor: Option<String>,
+    closed_cursor: Option<String>,
+) -> Result<PersistTimings, EnrichmentError> {
+    let started = Instant::now();
+    let snapshot = catalog.snapshot();
+    let snapshot_elapsed = started.elapsed();
+
+    let storage = storage.clone();
+    let started = Instant::now();
+    tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+        storage.save_catalog(&snapshot)?;
+        if let Some(value) = active_cursor {
+            storage.save_enrichment_cursor(&value)?;
+        }
+        if let Some(value) = closed_cursor {
+            storage.save_closed_market_cursor(&value)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| StorageError::Io(io::Error::other(error)))??;
+    Ok(PersistTimings {
+        snapshot: snapshot_elapsed,
+        save: started.elapsed(),
+    })
+}
+
 /// One combined sync pass: the always-cached active (closed=false) set, plus
 /// Gamma markets that closed within `closed_lookback_days` — bounded so the
 /// catalog doesn't grow to hold every market that has ever closed, while
@@ -272,13 +332,22 @@ pub async fn sync_catalog_before_uma(
         sync_both(gamma, catalog, &cursors, closed_lookback_days).await?;
 
     // The catalog must become durable before either cursor advances.
-    storage.save_catalog(&catalog.snapshot())?;
-    if let Some(next) = next_active {
-        storage.save_enrichment_cursor(&serde_json::to_string(&next)?)?;
-    }
-    if let Some(next) = next_closed {
-        storage.save_closed_market_cursor(&serde_json::to_string(&next)?)?;
-    }
+    let timings = persist_catalog(
+        storage,
+        catalog,
+        next_active
+            .map(|next| serde_json::to_string(&next))
+            .transpose()?,
+        next_closed
+            .map(|next| serde_json::to_string(&next))
+            .transpose()?,
+    )
+    .await?;
+    info!(
+        snapshot_ms = timings.snapshot.as_millis(),
+        save_ms = timings.save.as_millis(),
+        "catalog persisted at startup"
+    );
     Ok(changed)
 }
 
@@ -305,26 +374,36 @@ pub async fn run_catalog_sync(
                     Ok((changed, next_active, next_closed))
                         if changed > 0 || next_active != cursors.active || next_closed != cursors.closed =>
                     {
-                        let snapshot = catalog.snapshot();
-                        let persisted = storage.save_catalog(&snapshot).and_then(|_| {
-                            if let Some(value) = &next_active {
-                                storage.save_enrichment_cursor(&serde_json::to_string(value).map_err(|_| {
-                                    crate::storage::StorageError::Format("enrichment cursor")
-                                })?)?;
+                        let cursors = next_active
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()
+                            .and_then(|active| {
+                                next_closed
+                                    .as_ref()
+                                    .map(serde_json::to_string)
+                                    .transpose()
+                                    .map(|closed| (active, closed))
+                            });
+                        let persisted = match cursors {
+                            Ok((active, closed)) => persist_catalog(&storage, &catalog, active, closed).await,
+                            Err(error) => Err(error.into()),
+                        };
+                        let timings = match persisted {
+                            Ok(timings) => timings,
+                            Err(error) => {
+                                warn!(%error, "Gamma incremental catalog persistence failed");
+                                continue;
                             }
-                            if let Some(value) = &next_closed {
-                                storage.save_closed_market_cursor(&serde_json::to_string(value).map_err(|_| {
-                                    crate::storage::StorageError::Format("closed market cursor")
-                                })?)?;
-                            }
-                            Ok(())
-                        });
-                        if let Err(error) = persisted {
-                            warn!(%error, "Gamma incremental catalog persistence failed");
-                            continue;
-                        }
+                        };
                         stats.catalog_markets.store(catalog.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        info!(changed, markets=catalog.len(), "Gamma incremental catalog sync complete");
+                        info!(
+                            changed,
+                            markets = catalog.len(),
+                            snapshot_ms = timings.snapshot.as_millis(),
+                            save_ms = timings.save.as_millis(),
+                            "Gamma incremental catalog sync complete"
+                        );
                     }
                     Ok(_) => {}
                     Err(error) => warn!(%error, "Gamma recent catalog refresh failed"),
@@ -368,8 +447,14 @@ pub async fn run_catalog_reconcile(
             _ = interval.tick() => {
                 match reconcile_full(&gamma, &catalog, config.closed_market_lookback_days).await {
                     Ok(changed) if changed > 0 => {
-                        if let Err(error) = storage.save_catalog(&catalog.snapshot()) {
-                            warn!(%error, "persist catalog after reconciliation");
+                        // Never writes the incremental cursors — see the doc comment above.
+                        match persist_catalog(&storage, &catalog, None, None).await {
+                            Ok(timings) => info!(
+                                snapshot_ms = timings.snapshot.as_millis(),
+                                save_ms = timings.save.as_millis(),
+                                "catalog persisted after reconciliation"
+                            ),
+                            Err(error) => warn!(%error, "persist catalog after reconciliation"),
                         }
                         stats.catalog_markets.store(catalog.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         stats.catalog_reconcile_gaps_closed.fetch_add(changed as u64, std::sync::atomic::Ordering::Relaxed);
