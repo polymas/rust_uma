@@ -223,7 +223,8 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 只留给 edge。edge 原样转发本文描述的二进制帧（帧头、子协议、序号语义完全一致），
 本地帧环支持 `_replay=<0..4096|all>` 回放。接入方式：
 
-1. `GET https://uma-console.chainee.space/api/v1/nodes`（公开）→
+1. `GET https://uma-console.chainee.space/api/v1/nodes`（公开；带正常 `User-Agent`，
+   `Python-urllib` 默认 UA 会被 Cloudflare 拦成 403）→
    `{"nodes":[{"node_id","url","weight","clients"}],"subprotocol","path","ttl_s"}`，
    只含正在服务的节点，按剩余容量降序；取 `nodes[0]`，失败顺延，每 `ttl_s` 秒重拉。
 2. 连 `url`，子协议 `uma.pb.v1`，token 二选一：`?token=<secret>` 或
