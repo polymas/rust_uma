@@ -29,6 +29,7 @@ use super::{
 };
 
 const CLUSTER_LLMS: &str = include_str!("../../internal/console/llms_cluster.txt");
+const UMA_PROTO: &str = include_str!("../../proto/uma.proto");
 const INDEX_HTML: &str = include_str!("../../internal/console/index.html");
 const HEARTBEAT_BODY_LIMIT: usize = 64 * 1024;
 
@@ -37,6 +38,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/llms.txt", get(llms))
+        .route("/uma.proto", get(proto))
         .route("/api/v1/nodes", get(public_nodes))
         .route(
             "/api/v1/nodes/heartbeat",
@@ -121,6 +123,19 @@ async fn healthz(State(state): State<SharedState>) -> Json<Health> {
 async fn llms(State(state): State<SharedState>) -> Response {
     let body = llms_text(&state, CLUSTER_LLMS).await;
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
+
+/// 下游解码帧用的 protobuf schema，与 tinyuma 编帧用的是同一份源文件。
+async fn proto() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_owned()),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_owned()),
+            (header::CACHE_CONTROL, "public, max-age=300".to_owned()),
+        ],
+        UMA_PROTO,
+    )
+        .into_response()
 }
 
 async fn public_nodes(State(state): State<SharedState>) -> Response {

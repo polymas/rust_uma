@@ -152,7 +152,8 @@ Sec-WebSocket-Protocol: uma.pb.v1
 12      ...   Protobuf UmaBatch 载荷，可选使用 Zstd level 1 压缩
 ```
 
-Protobuf schema 位于 `proto/uma.proto`。小于 4096 字节的载荷不压缩；更大的载荷
+Protobuf schema 位于仓库 `proto/uma.proto`，下游可直接下载
+`https://uma-console.chainee.space/uma.proto`（同一份文件）。小于 4096 字节的载荷不压缩；更大的载荷
 使用 Zstd level 1。每个批次最多包含 64 个事件，或压缩前不超过 32 KiB。这些值
 均可配置。
 
