@@ -6,3 +6,4 @@ AGENTS.md
 .cache/
 codex.md
 .claude/TODO.local.md
+.env.*
