@@ -231,6 +231,8 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
    `Authorization: Bearer <secret>`。token 由控制台签发。
 3. 关闭码：1008 慢客户端或 token 失效（先检查 token 再重连）；1012 节点摘流
    （立刻重拉列表换节点）；握手 503 表示摘流中或已满，换下一个。
+4. 存活：超过 90s 没收到任何消息（含 Ping）就视为死连接，断开后重拉列表再连，
+   重连加 0–5s 随机抖动；`_replay` 建议 ≤50。
 
 完整契约见 `https://uma-console.chainee.space/llms.txt`（集群段 + 本文原文）。
 
