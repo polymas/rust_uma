@@ -388,7 +388,7 @@ function renderNodes(p) {
     return `<tr>
       <td title="${esc(n.url)}\n版本 ${esc(h.version)} ${esc(h.commit)}\n来源 IP ${esc(n.remote_ip)}">${esc(h.node_id)}<div class="dim">${esc((h.advertise_host || n.remote_ip))}</div></td>
       <td><span class="badge ${statusClass(n.status)}" title="${esc(n.status)}">${STATUS_LABEL[n.status] || esc(n.status)}</span>${flags ? `<div class="dim">${esc(flags)}</div>` : ""}</td>
-      <td class="${clientsCls}">${fmtNum(h.clients)}/${fmtNum(h.max_clients)}<div class="${rejectCls || "dim"}">累计拒绝 ${fmtNum(h.clients_rejected_total)}</div></td>
+      <td class="${clientsCls}">${fmtNum(h.clients)}/${fmtNum(h.max_clients)}<div class="${rejectCls || "dim"}" title="token 错/缺 ${fmtNum(h.rejected_token_total)} · 摘流中 ${fmtNum(h.rejected_draining_total)} · 已满 ${fmtNum(h.rejected_full_total)} · 无子协议 ${fmtNum(h.rejected_subprotocol_total)} · _replay 非法 ${fmtNum(h.rejected_replay_total)}">累计拒绝 ${fmtNum(h.clients_rejected_total)}</div></td>
       <td class="${lagCls}">${lag == null ? "-" : lag}<div class="dim">序号 ${fmtNum(h.last_event_sequence)}</div></td>
       <td><span class="${lagUsCls}">${fmtUs(h.upstream_lag_last_us)}</span> / ${fmtUs(h.upstream_lag_max_us)}</td>
       <td>${fmtNum(h.frames_total)} / ${fmtBytes(h.bytes_total)}<div class="dim">帧环 ${fmtNum(h.ring_frames)}/${fmtNum(h.ring_capacity)} · <span class="${badCls}">坏帧 ${fmtNum(h.bad_frames_total)}</span></div></td>

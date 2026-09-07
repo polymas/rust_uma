@@ -96,8 +96,11 @@ async fn websocket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let reject = |status: StatusCode, msg: &'static str| {
+    let ip = client_ip(&headers, peer);
+    let reject = |status: StatusCode, msg: &'static str, counter: &std::sync::atomic::AtomicU64| {
         state.stats.clients_rejected.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
+        warn!(%ip, port = peer.port(), status = status.as_u16(), reason = msg, "handshake rejected");
         (status, msg).into_response()
     };
     let secret = query
@@ -106,13 +109,26 @@ async fn websocket(
         .or_else(|| bearer(&headers).map(str::to_owned))
         .unwrap_or_default();
     let Some(token_id) = state.auth.check(&secret) else {
-        return reject(StatusCode::UNAUTHORIZED, "invalid or missing token");
+        let msg = if secret.is_empty() {
+            "missing token"
+        } else {
+            "invalid token"
+        };
+        return reject(StatusCode::UNAUTHORIZED, msg, &state.stats.rejected_token);
     };
     if state.stats.draining.load(Ordering::Relaxed) {
-        return reject(StatusCode::SERVICE_UNAVAILABLE, "draining");
+        return reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "draining",
+            &state.stats.rejected_draining,
+        );
     }
     if state.hub.clients() >= state.config.max_clients {
-        return reject(StatusCode::SERVICE_UNAVAILABLE, "node full");
+        return reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node full",
+            &state.stats.rejected_full,
+        );
     }
     let offered = headers
         .get(header::SEC_WEBSOCKET_PROTOCOL)
@@ -122,13 +138,19 @@ async fn websocket(
         return reject(
             StatusCode::BAD_REQUEST,
             "Sec-WebSocket-Protocol: uma.pb.v1 is required",
+            &state.stats.rejected_subprotocol,
         );
     }
     let replay = match parse_replay(query.replay.as_deref()) {
         Some(n) => n,
-        None => return reject(StatusCode::BAD_REQUEST, "invalid _replay (0..=4096 or all)"),
+        None => {
+            return reject(
+                StatusCode::BAD_REQUEST,
+                "invalid _replay (0..=4096 or all)",
+                &state.stats.rejected_replay,
+            );
+        }
     };
-    let ip = client_ip(&headers, peer);
     let port = peer.port();
     ws.protocols([SUBPROTOCOL])
         .on_upgrade(move |socket| session(socket, state, ip, port, token_id, replay))
