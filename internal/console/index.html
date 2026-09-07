@@ -41,6 +41,7 @@
   button { background:transparent; color:var(--accent); border:1px solid var(--border); border-radius:4px; padding:1px 6px; font:inherit; font-size:11px; cursor:pointer; margin-right:3px; }
   button:hover { border-color:var(--accent); } button.danger { color:var(--bad); }
   input { background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:3px 6px; font:inherit; }
+  .legend { gap:10px; }
   .bar { display:flex; gap:6px; align-items:center; margin:0; color:var(--dim); font-size:11px; flex-wrap:wrap; }
   #secret { background:var(--panel); border:1px solid var(--warn); border-radius:6px; padding:6px 10px; margin:0; display:none; flex:0 0 auto; }
   #secret code { color:var(--warn); user-select:all; word-break:break-all; }
@@ -60,6 +61,7 @@
 <div class="top">
   <h1>uma console</h1>
   <div id="meta">加载中…</div>
+  <div class="bar legend"><span class="ok">■ 绿=健康</span><span class="bad">■ 红=需处理</span><span>■ 白=信息</span><span class="help" style="position:static;display:inline-block">?<span class="tip"><b>红</b>：连接断开、有节点不在服务、序号滞后、累计型错误/丢弃/踢除在最近 2 分钟内增长、命中率低于 80%、延迟超过 1s、有业务下游绕过 edge 直连 tinyuma。<b>绿</b>：已连接、全部在服务、滞后为 0、命中率高于 95%、延迟低于 500ms、直连数恰好等于 edge 数 + console。<b>白</b>：纯计数与速率，看趋势即可。累计型指标（重连、解码错误、未命中、慢客户端）只在"最近有增长"时标红，历史遗留的非零值不标。</span></span></div>
   <div class="bar" style="margin-left:auto">
     <span>admin token</span><input id="admin" type="password" size="22" placeholder="管理动作需要">
     <button id="saveadmin">保存到本机</button><span id="adminstate"></span>
@@ -249,8 +251,18 @@ const fmtNum = (n) => (n == null ? "-" : Number(n).toLocaleString("en-US"));
 const ts = (ms) => (ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 19) : "-");
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 function short(hex) { return hex && hex.length > 14 ? hex.slice(0, 8) + "…" + hex.slice(-6) : hex; }
-const statusClass = (s) => ({ serving:"ok", full:"warn", not_ready:"warn", draining:"warn", disabled:"dim", stale:"bad" }[s] || "");
+const statusClass = (s) => ({ serving:"ok", full:"bad", not_ready:"bad", draining:"bad", disabled:"dim", stale:"bad" }[s] || "");
 const STATUS_LABEL = { serving:"服务中", full:"已满", not_ready:"未就绪", draining:"摘流中", disabled:"已禁用", stale:"失联" };
+// 累计型指标：只在"最近 2 分钟内有增长"时标红。lastSeen 记上一次的值，alerts 记最近一次增长的时刻。
+const lastSeen = {}, alerts = {}; const ALERT_HOLD_MS = 120000;
+function grew(key, value) {
+  if (value == null) return false;
+  if (key in lastSeen && value > lastSeen[key]) alerts[key] = Date.now();
+  lastSeen[key] = value;
+  return alerts[key] != null && Date.now() - alerts[key] < ALERT_HOLD_MS;
+}
+const redIfGrew = (key, value) => (grew(key, value) ? "bad" : "");
+const rangeCls = (v, goodMax, badMin) => (v == null ? "" : v <= goodMax ? "ok" : v >= badMin ? "bad" : "");
 
 // ---------- admin token ----------
 let adminToken = "";
@@ -276,67 +288,77 @@ function card(title, dotClass, rows, help) {
 }
 function renderUpstream(p) {
   const u = p.upstream || {}, data = u.dashboard, h = u.healthz || {};
-  $("upmeta").textContent = (u.ok ? "" : "抓取失败：" + (u.error || "") + " · ") + "console 抓取于 " + fmtAgoMs(u.fetched_at_ms, p.now_ms) + " · 实时转发 " + (p.feed.connected ? "已连接" : "断开") + " · 已转发 " + fmtNum(p.feed.frames_total) + " 帧 · 在看 " + p.feed.viewers + " 人";
+  $("upmeta").innerHTML = (u.ok ? "" : `<span class="bad">抓取失败：${esc(u.error || "")}</span> · `) + "console 抓取于 " + fmtAgoMs(u.fetched_at_ms, p.now_ms) + " · 实时转发 " + (p.feed.connected ? '<span class="ok">已连接</span>' : '<span class="bad">断开</span>') + " · 已转发 " + fmtNum(p.feed.frames_total) + " 帧 · 在看 " + p.feed.viewers + " 人";
   const grid = $("grid"); grid.innerHTML = "";
   if (!data) {
     grid.appendChild(card("tinyuma /healthz", h.rpc_connected ? "ok" : "bad", Object.entries(h).slice(0, 14).map(([k, v]) => [k, esc(typeof v === "object" ? JSON.stringify(v) : v)]), "console 没配 tinyuma 的 DASHBOARD_TOKEN 时只能看到公开的 /healthz 字段。"));
-    grid.appendChild(card("提示", "", [["dashboard-data", "未配置 CONSOLE_UPSTREAM_DASHBOARD_TOKEN，只有 healthz", "warn"]]));
+    grid.appendChild(card("提示", "", [["dashboard-data", "未配置 CONSOLE_UPSTREAM_DASHBOARD_TOKEN，只有 healthz", "bad"]]));
     return;
   }
   const at = u.fetched_at_ms;
   const seconds = prev && at > prevAt ? (at - prevAt) / 1000 : 0;
   const rate = (key) => { if (!prev || !seconds) return 0; const d = data[key] - prev[key]; return d > 0 ? d / seconds : 0; };
   const rpcOk = data.rpc_connected;
+  const srcCls = data.rpc_sources_connected === 0 ? "bad" : data.rpc_sources_connected < data.rpc_sources_configured ? "bad" : "ok";
+  const lastUpstreamMs = data.last_upstream_received_at_us ? Date.now() - data.last_upstream_received_at_us / 1000 : Infinity;
+  const lastBroadcastMs = data.last_broadcast_at_us ? Date.now() - data.last_broadcast_at_us / 1000 : Infinity;
+  const expectedDirect = p.nodes.length + 1; // 6 台 edge + console 的 feed
   const hitPct = (data.enrichment_hits_total + data.enrichment_misses_total) > 0 ? data.enrichment_hits_total / (data.enrichment_hits_total + data.enrichment_misses_total) * 100 : 100;
   const recentPct = data.enrichment_recent_total > 0 ? data.enrichment_recent_hits / data.enrichment_recent_total * 100 : 100;
   grid.appendChild(card("RPC 上游收发", rpcOk ? "ok" : "bad", [
     ["连接状态", rpcOk ? "已连接" : "断开", rpcOk ? "ok" : "bad"],
-    ["活跃源 / 配置源", `${data.rpc_sources_connected} / ${data.rpc_sources_configured}`],
-    ["累计重连", data.rpc_reconnects_total, data.rpc_reconnects_total > 0 ? "warn" : ""],
+    ["活跃源 / 配置源", `${data.rpc_sources_connected} / ${data.rpc_sources_configured}`, srcCls],
+    ["累计重连", data.rpc_reconnects_total, redIfGrew("rpc_reconnects", data.rpc_reconnects_total)],
     ["接收速率", fmtRate(rate("rpc_bytes_received_total"))],
     ["累计接收", fmtBytes(data.rpc_bytes_received_total)],
     ["累计发送", fmtBytes(data.rpc_bytes_sent_total)],
     ["日志接收速率", rate("rpc_logs_received_total").toFixed(2) + " 条/s"],
     ["日志接收总数", data.rpc_logs_received_total],
     ["最新区块", data.latest_block],
-  ], "tinyuma 到 Polygon RPC 的采集侧。<b>活跃源/配置源</b>：多路 WSS 订阅中当前在线的路数。<b>累计重连</b>：任何一路断线重连都计一次，持续增长说明供应商不稳。<b>接收速率/日志接收速率</b>：按 console 两次抓取之间的差分算出的 eth_subscribe 日志流量。<b>最新区块</b>：最近一次看到的区块高度，长时间不动就是链上没新日志或订阅假死。"));
-  const raceRows = (data.rpc_source_race || []).length ? data.rpc_source_race.map((r) => { const pct = r.received ? r.won / r.received * 100 : null; return [r.source, r.received ? `${r.won}/${r.received}（${pct.toFixed(1)}%）` : "—", pct !== null && pct >= 50 ? "ok" : ""]; }) : [["暂无数据", "—"]];
-  grid.appendChild(card("多路 RPC 赛马抢达率", "", raceRows, "同一条链上日志会从每一路 WSS 各到一份，先到的入库、后到的被去重丢弃。<b>won/received</b>：该路交付的日志里有多少次是第一个到的。某一路长期接近 0% 说明它总比别人慢，可以换掉；backfill 是断线补拉，不参与实时赛马。"));
-  grid.appendChild(card("富化 (Catalog)", hitPct > 95 ? "ok" : (hitPct > 80 ? "" : "bad"), [
-    ["缓存市场数", data.catalog_markets],
+  ], "tinyuma 到 Polygon RPC 的采集侧。<b>活跃源/配置源</b>：多路 WSS 订阅中当前在线的路数。<b>累计重连</b>：任何一路断线重连都计一次，持续增长说明供应商不稳。<b>接收速率/日志接收速率</b>：按 console 两次抓取之间的差分算出的 eth_subscribe 日志流量。<b>最新区块</b>：最近一次看到的区块高度，长时间不动就是链上没新日志或订阅假死。<br><b>颜色</b>：连接状态/活跃源全在线为绿，任一路掉线为红；累计重连最近 2 分钟内增长为红。"));
+  const raceRows = (data.rpc_source_race || []).length ? data.rpc_source_race.map((r) => { const pct = r.received ? r.won / r.received * 100 : null; const cls = pct === null ? "" : pct >= 50 ? "ok" : (r.received >= 200 && pct < 5 && r.source !== "backfill") ? "bad" : ""; return [r.source, r.received ? `${r.won}/${r.received}（${pct.toFixed(1)}%）` : "—", cls]; }) : [["暂无数据", "—", "bad"]];
+  grid.appendChild(card("多路 RPC 赛马抢达率", "", raceRows, "同一条链上日志会从每一路 WSS 各到一份，先到的入库、后到的被去重丢弃。<b>won/received</b>：该路交付的日志里有多少次是第一个到的。某一路长期接近 0% 说明它总比别人慢，可以换掉；backfill 是断线补拉，不参与实时赛马。<br><b>颜色</b>：抢达率 ≥50% 绿；交付过 200 条以上但抢达率 <5% 为红（该路一直比别人慢）。"));
+  grid.appendChild(card("富化 (Catalog)", recentPct > 95 ? "ok" : (recentPct > 80 ? "" : "bad"), [
+    ["缓存市场数", data.catalog_markets, data.catalog_markets > 0 ? "" : "bad"],
     ["命中总数", data.enrichment_hits_total],
     ["其中 via market_id", data.enrichment_hits_via_market_id_total],
-    ["未命中总数", data.enrichment_misses_total, data.enrichment_misses_total > 0 ? "warn" : ""],
-    ["总命中率（跨重启累计）", hitPct.toFixed(2) + "%", hitPct > 95 ? "ok" : (hitPct > 80 ? "warn" : "bad")],
-    [`近${data.enrichment_recent_total}例命中率`, recentPct.toFixed(2) + "%", recentPct > 95 ? "ok" : (recentPct > 80 ? "warn" : "bad")],
-    ["自愈补齐总数", data.catalog_reconcile_gaps_closed_total, data.catalog_reconcile_gaps_closed_total > 0 ? "warn" : ""],
-  ], "把链上 UMA 事件映射到 Polymarket 市场（token id、分类、下注类型、Neg Risk）的内存缓存。<b>缓存市场数</b>：Gamma 同步下来的市场总数。<b>命中/未命中</b>：事件能否在缓存里找到市场；未命中的事件不会广播给下游。<b>近 N 例命中率</b>：滚动窗口，比累计值更能反映当前状态。<b>自愈补齐</b>：定期全量重扫补上 keyset 翻页漏掉的市场，持续增长说明 Gamma 增量同步在漏。"));
-  grid.appendChild(card("热路径 / 事件", "", [
+    ["未命中总数", data.enrichment_misses_total, redIfGrew("enrich_miss", data.enrichment_misses_total)],
+    ["总命中率（跨重启累计）", hitPct.toFixed(2) + "%", hitPct > 95 ? "ok" : (hitPct > 80 ? "" : "bad")],
+    [`近${data.enrichment_recent_total}例命中率`, recentPct.toFixed(2) + "%", recentPct > 95 ? "ok" : (recentPct > 80 ? "" : "bad")],
+    ["自愈补齐总数", data.catalog_reconcile_gaps_closed_total, redIfGrew("reconcile", data.catalog_reconcile_gaps_closed_total)],
+  ], "把链上 UMA 事件映射到 Polymarket 市场（token id、分类、下注类型、Neg Risk）的内存缓存。<b>缓存市场数</b>：Gamma 同步下来的市场总数。<b>命中/未命中</b>：事件能否在缓存里找到市场；未命中的事件不会广播给下游。<b>近 N 例命中率</b>：滚动窗口，比累计值更能反映当前状态。<b>自愈补齐</b>：定期全量重扫补上 keyset 翻页漏掉的市场，持续增长说明 Gamma 增量同步在漏。<br><b>颜色</b>：命中率 >95% 绿、<80% 红；未命中/自愈补齐最近 2 分钟内增长为红。"));
+  const hotCls = grew("decode_err", data.decode_errors_total) || grew("storage_drop", data.storage_queue_dropped_total) || lastUpstreamMs > 1800000 ? "bad" : lastUpstreamMs < 600000 ? "ok" : "";
+  grid.appendChild(card("热路径 / 事件", hotCls, [
     ["已解码事件总数", data.events_decoded_total],
-    ["解码错误总数", data.decode_errors_total, data.decode_errors_total > 0 ? "bad" : ""],
+    ["解码错误总数", data.decode_errors_total, redIfGrew("decode_err", data.decode_errors_total)],
     ["去重丢弃总数", data.duplicates_total],
     ["事件环", `#${data.event_ring_oldest_sequence} → #${data.event_ring_latest_sequence}`],
-    ["最近一次上游收到", fmtAgo(data.last_upstream_received_at_us)],
-    ["最近一次广播", fmtAgo(data.last_broadcast_at_us)],
-    ["存储队列丢弃总数", data.storage_queue_dropped_total, data.storage_queue_dropped_total > 0 ? "warn" : ""],
-  ], "从解码到广播的延迟敏感路径。<b>已解码事件</b>：ProposePrice/DisputePrice 解析成功数。<b>解码错误</b>：应恒为 0，否则合约事件格式变了。<b>去重丢弃</b>：多路赛马的重复份数，正常会一直涨。<b>事件环</b>：内存里可供 after_sequence 续传的序号范围。<b>最近一次上游收到/广播</b>：两者差值就是热路径处理耗时。<b>存储队列丢弃</b>：WAL 写入跟不上，应恒为 0。"));
-  grid.appendChild(card("直连 tinyuma 的 WSS", data.subscribers > 0 ? "ok" : "", [
-    ["当前连接数", data.subscribers, data.subscribers > p.nodes.length + 1 ? "warn" : ""],
-    ["慢客户端断开总数", data.slow_clients_dropped_total, data.slow_clients_dropped_total > 0 ? "warn" : ""],
+    ["最近一次上游收到", fmtAgo(data.last_upstream_received_at_us), lastUpstreamMs < 600000 ? "ok" : lastUpstreamMs > 1800000 ? "bad" : ""],
+    ["最近一次广播", fmtAgo(data.last_broadcast_at_us), lastBroadcastMs < 600000 ? "ok" : lastBroadcastMs > 1800000 ? "bad" : ""],
+    ["存储队列丢弃总数", data.storage_queue_dropped_total, redIfGrew("storage_drop", data.storage_queue_dropped_total)],
+  ], "从解码到广播的延迟敏感路径。<b>已解码事件</b>：ProposePrice/DisputePrice 解析成功数。<b>解码错误</b>：应恒为 0，否则合约事件格式变了。<b>去重丢弃</b>：多路赛马的重复份数，正常会一直涨。<b>事件环</b>：内存里可供 after_sequence 续传的序号范围。<b>最近一次上游收到/广播</b>：两者差值就是热路径处理耗时。<b>存储队列丢弃</b>：WAL 写入跟不上，应恒为 0。<br><b>颜色</b>：最近上游收到/广播 10 分钟内为绿、超过 30 分钟为红（链上长时间没有 UMA 事件也会红，先看 RPC 卡）；解码错误/存储丢弃最近 2 分钟内增长为红。"));
+  const directCls = data.subscribers === expectedDirect ? "ok" : "bad";
+  grid.appendChild(card("直连 tinyuma 的 WSS", directCls, [
+    ["当前连接数", `${data.subscribers}（应为 ${expectedDirect}）`, directCls],
+    ["慢客户端断开总数", data.slow_clients_dropped_total, redIfGrew("tiny_slow", data.slow_clients_dropped_total)],
     ["下发速率", fmtRate(rate("ws_bytes_sent_total"))],
     ["下发帧速率", rate("ws_frames_sent_total").toFixed(2) + " 帧/s"],
     ["累计下发字节", fmtBytes(data.ws_bytes_sent_total)],
     ["累计下发帧数", data.ws_frames_sent_total],
-  ], "直接连在 tinyuma 上的 WebSocket 订阅者。集群上线后应只剩 6 台 edge 加 console 的面板转发共 7 个，超过说明还有业务下游在直连法兰克福，应改连香港 edge。<b>慢客户端断开</b>：跟不上广播被 1013 踢掉的次数。<b>下发速率/帧速率</b>：按抓取差分计算。"));
+  ], "直接连在 tinyuma 上的 WebSocket 订阅者。集群上线后应只剩 6 台 edge 加 console 的面板转发共 7 个，超过说明还有业务下游在直连法兰克福，应改连香港 edge。<b>慢客户端断开</b>：跟不上广播被 1013 踢掉的次数。<b>下发速率/帧速率</b>：按抓取差分计算。<br><b>颜色</b>：当前连接数恰好等于 edge 数 + 1（console 的转发）为绿，多了说明有业务下游绕过 edge 直连，少了说明有 edge 掉线，都为红。"));
   const edgeClients = p.nodes.reduce((s, n) => s + (n.heartbeat.clients || 0), 0);
   const serving = p.nodes.filter((n) => n.status === "serving").length;
-  grid.appendChild(card("扇出集群汇总", serving > 0 ? "ok" : "bad", [
-    ["服务中 / 已知节点", `${serving} / ${p.nodes.length}`, serving > 0 ? "ok" : "bad"],
+  const maxLag = Math.max(0, ...p.nodes.map((n) => u.latest_sequence - n.heartbeat.last_event_sequence));
+  const maxLagUs = Math.max(0, ...p.nodes.map((n) => n.heartbeat.upstream_lag_last_us));
+  const edgeSlow = p.nodes.reduce((s, n) => s + n.heartbeat.slow_clients_disconnected_total, 0);
+  const servingCls = p.nodes.length > 0 && serving === p.nodes.length ? "ok" : "bad";
+  grid.appendChild(card("扇出集群汇总", servingCls === "bad" || maxLag > 0 ? "bad" : "ok", [
+    ["服务中 / 已知节点", `${serving} / ${p.nodes.length}`, servingCls],
     ["业务下游连接总数", edgeClients],
-    ["最大序号滞后", Math.max(0, ...p.nodes.map((n) => u.latest_sequence - n.heartbeat.last_event_sequence))],
-    ["最大上游延迟(实时帧)", fmtUs(Math.max(0, ...p.nodes.map((n) => n.heartbeat.upstream_lag_last_us)))],
-    ["慢客户端摘除总数", p.nodes.reduce((s, n) => s + n.heartbeat.slow_clients_disconnected_total, 0)],
-  ], "香港 edge 集群的合计。<b>serving/已知</b>：能接客的节点数（失联、禁用、摘流、未就绪、已满都不算）。<b>业务下游连接总数</b>：所有 edge 上的客户端之和。<b>最大序号滞后</b>：各节点最后事件序号与 tinyuma 最新序号的最大差值，正常为 0，持续大于 0 说明某节点上游断了。<b>最大上游延迟</b>：帧从 tinyuma 发出到 edge 收到的物理传输时间（法兰克福→香港约 200ms，只统计实时帧）。<b>慢客户端摘除</b>：各 edge 因客户端队列满而 1008 踢掉的累计数。"));
+    ["最大序号滞后", maxLag, maxLag === 0 ? "ok" : "bad"],
+    ["最大上游延迟(实时帧)", fmtUs(maxLagUs), rangeCls(maxLagUs, 500000, 1000000)],
+    ["慢客户端摘除总数", edgeSlow, redIfGrew("edge_slow", edgeSlow)],
+  ], "香港 edge 集群的合计。<b>serving/已知</b>：能接客的节点数（失联、禁用、摘流、未就绪、已满都不算）。<b>业务下游连接总数</b>：所有 edge 上的客户端之和。<b>最大序号滞后</b>：各节点最后事件序号与 tinyuma 最新序号的最大差值，正常为 0，持续大于 0 说明某节点上游断了。<b>最大上游延迟</b>：帧从 tinyuma 发出到 edge 收到的物理传输时间（法兰克福→香港约 200ms，只统计实时帧）。<b>慢客户端摘除</b>：各 edge 因客户端队列满而 1008 踢掉的累计数。<br><b>颜色</b>：全部节点服务中为绿否则红；最大序号滞后 0 绿否则红；上游延迟 <500ms 绿、>1s 红；慢客户端摘除最近 2 分钟内增长为红。"));
   if (at > prevAt) { prev = data; prevAt = at; }
 }
 
@@ -346,21 +368,29 @@ function renderNodes(p) {
   $("nodesmeta").textContent = `服务中 ${p.nodes.filter((n) => n.status === "serving").length} / 已知 ${p.nodes.length} · 心跳超 ${p.stale_after_ms/1000}s 判失联`;
   const rows = p.nodes.map((n) => {
     const h = n.heartbeat; const lag = latest ? latest - h.last_event_sequence : null;
-    const lagCls = lag == null ? "dim" : lag <= 0 ? "ok" : lag < 5 ? "warn" : "bad";
+    const lagCls = lag == null ? "dim" : lag <= 0 ? "ok" : "bad";
+    const nid = h.node_id;
+    const clientsCls = h.clients >= h.max_clients ? "bad" : h.clients >= h.max_clients * 0.9 ? "bad" : "";
+    const lagUsCls = h.upstream_connected ? rangeCls(h.upstream_lag_last_us, 500000, 1000000) : "";
+    const slowCls = redIfGrew(`slow:${nid}`, h.slow_clients_disconnected_total);
+    const fanoutCls = h.fanout_max_us >= 5000 ? "bad" : h.fanout_max_us < 1000 ? "ok" : "";
+    const badCls = redIfGrew(`bad:${nid}`, h.bad_frames_total);
+    const reconnCls = redIfGrew(`reconn:${nid}`, h.upstream_reconnects_total);
+    const rejectCls = redIfGrew(`reject:${nid}`, h.clients_rejected_total);
     const beat = p.now_ms - n.last_seen_ms;
     const flags = [n.disabled ? "已禁用" : "", n.desired_drain ? "已下发摘流" : "", h.draining ? "节点摘流中" : ""].filter(Boolean).join(" · ");
     const actions = `<button data-n="${esc(h.node_id)}" data-a="${n.desired_drain ? "undrain" : "drain"}">${n.desired_drain ? "取消摘流" : "摘流"}</button><button data-n="${esc(h.node_id)}" data-a="${n.disabled ? "enable" : "disable"}">${n.disabled ? "启用" : "禁用"}</button><button class="danger" data-n="${esc(h.node_id)}" data-a="forget">移除</button>`;
     return `<tr>
       <td title="${esc(n.url)}\n版本 ${esc(h.version)} ${esc(h.commit)}\n来源 IP ${esc(n.remote_ip)}">${esc(h.node_id)}<div class="dim">${esc((h.advertise_host || n.remote_ip))}</div></td>
       <td><span class="badge ${statusClass(n.status)}" title="${esc(n.status)}">${STATUS_LABEL[n.status] || esc(n.status)}</span>${flags ? `<div class="dim">${esc(flags)}</div>` : ""}</td>
-      <td>${fmtNum(h.clients)}/${fmtNum(h.max_clients)}<div class="dim">累计拒绝 ${fmtNum(h.clients_rejected_total)}</div></td>
+      <td class="${clientsCls}">${fmtNum(h.clients)}/${fmtNum(h.max_clients)}<div class="${rejectCls || "dim"}">累计拒绝 ${fmtNum(h.clients_rejected_total)}</div></td>
       <td class="${lagCls}">${lag == null ? "-" : lag}<div class="dim">序号 ${fmtNum(h.last_event_sequence)}</div></td>
-      <td>${fmtUs(h.upstream_lag_last_us)} / ${fmtUs(h.upstream_lag_max_us)}</td>
-      <td>${fmtNum(h.frames_total)} / ${fmtBytes(h.bytes_total)}<div class="dim">帧环 ${fmtNum(h.ring_frames)}/${fmtNum(h.ring_capacity)} · 坏帧 ${fmtNum(h.bad_frames_total)}</div></td>
-      <td class="${h.slow_clients_disconnected_total ? "warn" : ""}">${fmtNum(h.slow_clients_disconnected_total)}</td>
-      <td>${fmtUs(h.fanout_max_us)}<div class="dim">最近 ${fmtUs(h.fanout_last_us)}</div></td>
-      <td class="${h.upstream_connected ? "ok" : "bad"}">${h.upstream_connected ? "已连接" : "断开"}<div class="dim">重连 ${fmtNum(h.upstream_reconnects_total)} · 最近帧 ${fmtAgoMs(h.last_frame_at_ms, p.now_ms)}</div></td>
-      <td class="${beat > p.stale_after_ms ? "bad" : ""}" title="token 版本 ${h.tokens_version} · ${esc(h.version)} ${esc(h.commit)}">${(beat/1000).toFixed(1)}s 前<div class="dim">v${esc(h.commit)} · tok${h.tokens_version}</div></td>
+      <td><span class="${lagUsCls}">${fmtUs(h.upstream_lag_last_us)}</span> / ${fmtUs(h.upstream_lag_max_us)}</td>
+      <td>${fmtNum(h.frames_total)} / ${fmtBytes(h.bytes_total)}<div class="dim">帧环 ${fmtNum(h.ring_frames)}/${fmtNum(h.ring_capacity)} · <span class="${badCls}">坏帧 ${fmtNum(h.bad_frames_total)}</span></div></td>
+      <td class="${slowCls}">${fmtNum(h.slow_clients_disconnected_total)}</td>
+      <td class="${fanoutCls}">${fmtUs(h.fanout_max_us)}<div class="dim">最近 ${fmtUs(h.fanout_last_us)}</div></td>
+      <td class="${h.upstream_connected ? "ok" : "bad"}">${h.upstream_connected ? "已连接" : "断开"}<div class="dim"><span class="${reconnCls}">重连 ${fmtNum(h.upstream_reconnects_total)}</span> · 最近帧 ${fmtAgoMs(h.last_frame_at_ms, p.now_ms)}</div></td>
+      <td class="${beat > p.stale_after_ms ? "bad" : "ok"}" title="token 版本 ${h.tokens_version} · ${esc(h.version)} ${esc(h.commit)}">${(beat/1000).toFixed(1)}s 前<div class="dim">v${esc(h.commit)} · tok${h.tokens_version}</div></td>
       <td><input data-note="${esc(h.node_id)}" value="${esc(n.note)}" size="8" placeholder="备注"></td>
       <td>${actions}</td></tr>`;
   });
@@ -373,7 +403,7 @@ function renderTokens(p) {
     const dist = Object.entries(t.nodes || {}).map(([k, v]) => `${esc(k)}:${v}`).join(" ");
     return `<tr><td title="id ${esc(t.id)} · 前缀 ${esc(t.prefix)}… · 创建于 ${esc(ts(t.created_at_ms))} UTC">${esc(t.name)}<div class="dim">${esc(t.id)} · ${esc(t.prefix)}…</div></td>
       <td><span class="badge ${t.enabled ? "ok" : "dim"}">${t.enabled ? "启用" : "已禁用"}</span></td>
-      <td>${fmtNum(t.clients)}</td><td class="dim">${dist || "-"}</td>
+      <td class="${t.clients > 0 ? "ok" : ""}">${fmtNum(t.clients)}</td><td class="dim">${dist || "-"}</td>
       <td><button data-t="${esc(t.id)}" data-a="${t.enabled ? "disable" : "enable"}">${t.enabled ? "禁用" : "启用"}</button><button class="danger" data-t="${esc(t.id)}" data-a="delete">删除</button></td></tr>`;
   });
   $("tokens").innerHTML = rows.join("") || '<tr><td colspan="5" class="empty">还没有 token</td></tr>';
@@ -536,7 +566,7 @@ function renderEvents() {
     return `<tr>
       <td>#${ev.sequence}</td>
       <td class="mono">${fmtAbsolute(ev.upstream_received_at_us)}</td>
-      <td class="mono" title="端到端：从 tinyuma 收到链上日志到这个浏览器收到帧（经 console 转发）">${latency}</td>
+      <td class="mono ${latencyUs > 30e6 || latencyUs < 0 ? "" : latencyUs < 1500000 ? "ok" : latencyUs > 3000000 ? "bad" : ""}" title="端到端：从 tinyuma 收到链上日志到这个浏览器收到帧（经 console 转发）；<1.5s 绿，>3s 红">${latency}</td>
       <td class="${ev.event_type === 'dispute' ? 'bad' : ''}">${EVENT_TYPE_LABEL[ev.event_type] || "—"}</td>
       <td>${OUTCOME_LABEL[ev.price_outcome] || "—"}</td>
       <td>${ev.market_id}</td>
@@ -546,7 +576,7 @@ function renderEvents() {
       <td>${CATEGORY_LABEL[ev.category] || "—"}</td>
       <td>${BET_TYPE_LABEL[ev.bet_type] || "—"}</td>
       <td title="富化 miss 时 neg_risk 恒为 false">${ev.enrichment_status === 'hit' ? (ev.neg_risk ? "是" : "否") : "—"}</td>
-      <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'warn'}">${ENRICHMENT_STATUS_LABEL[ev.enrichment_status] || "—"}</td>
+      <td class="${ev.enrichment_status === 'hit' ? 'ok' : 'bad'}">${ENRICHMENT_STATUS_LABEL[ev.enrichment_status] || "—"}</td>
     </tr>`;
   }).join("");
 }
