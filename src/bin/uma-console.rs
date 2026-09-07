@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use rust_uma::console::{
-    COMMIT, ConsoleConfig, ConsoleState, VERSION, now_ms,
+    COMMIT, ConsoleConfig, ConsoleState, VERSION,
+    feed::{Feed, run_feed},
+    now_ms,
     registry::Registry,
     server,
     tokens::TokenStore,
@@ -44,12 +46,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         registry,
         tokens,
         upstream: UpstreamCache::default(),
+        feed: Feed::default(),
         http: reqwest::Client::builder().build()?,
         started_at_ms: now_ms(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(run_upstream_poller(state.clone()));
+    tokio::spawn(run_feed(state.clone()));
     let server = tokio::spawn(server::serve(state, shutdown_rx));
 
     tokio::select! {

@@ -7,7 +7,10 @@ use std::{collections::BTreeMap, net::SocketAddr};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -17,7 +20,9 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use super::{
-    COMMIT, SharedState, VERSION, now_ms,
+    COMMIT, SharedState, VERSION,
+    feed::FeedStatus,
+    now_ms,
     registry::{Directive, Heartbeat, NodeView},
     tokens::TokenView,
     upstream::{UpstreamSnapshot, llms_text},
@@ -38,6 +43,7 @@ pub fn router(state: SharedState) -> Router {
             post(heartbeat).layer(DefaultBodyLimit::max(HEARTBEAT_BODY_LIMIT)),
         )
         .route("/api/v1/panel", get(panel))
+        .route("/api/v1/panel/ws", get(panel_ws))
         .route("/api/v1/admin/nodes", get(admin_nodes))
         .route("/api/v1/admin/nodes/{id}/{action}", post(admin_node_action))
         .route("/api/v1/admin/nodes/{id}/note", put(admin_node_note))
@@ -184,6 +190,7 @@ struct Panel {
     nodes: Vec<NodeView>,
     tokens: Vec<TokenUsage>,
     stale_after_ms: u64,
+    feed: FeedStatus,
 }
 
 async fn panel(
@@ -226,7 +233,50 @@ async fn panel(
         nodes,
         tokens,
         stale_after_ms: state.config.stale_after.as_millis() as u64,
+        feed: state.feed.status(),
     }))
+}
+
+/// 面板实时推送：panel token 鉴权后，先发最近的帧再接实时；浏览器慢了就断
+/// （Lagged），刷新页面即可。不是业务接口。
+async fn panel_ws(
+    State(state): State<SharedState>,
+    Query(query): Query<PanelQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    if query.token.as_deref() != Some(state.config.panel_token.as_str()) {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "invalid or missing token",
+        });
+    }
+    Ok(ws.on_upgrade(move |socket| panel_ws_session(socket, state)))
+}
+
+async fn panel_ws_session(mut socket: WebSocket, state: SharedState) {
+    let (recent, mut rx) = state.feed.subscribe();
+    for frame in recent {
+        if socket.send(Message::Binary(frame)).await.is_err() {
+            return;
+        }
+    }
+    loop {
+        tokio::select! {
+            next = rx.recv() => match next {
+                Ok(frame) => {
+                    if socket.send(Message::Binary(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+                Err(_) => return,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => {}
+            }
+        }
+    }
 }
 
 // ---------- 管理：节点 ----------
