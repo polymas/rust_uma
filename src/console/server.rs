@@ -47,6 +47,11 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/v1/admin/nodes", get(admin_nodes))
         .route("/api/v1/admin/nodes/{id}/{action}", post(admin_node_action))
         .route("/api/v1/admin/nodes/{id}/note", put(admin_node_note))
+        .route("/api/v1/admin/nodes/{id}/release", post(admin_node_release))
+        .route(
+            "/api/v1/admin/balance",
+            get(admin_balance).post(admin_balance_set),
+        )
         .route(
             "/api/v1/admin/tokens",
             get(admin_tokens).post(admin_token_create),
@@ -155,6 +160,14 @@ async fn heartbeat(
     if outcome.restarted {
         info!(node_id, "edge node restarted; cleared desired_drain");
     }
+    if outcome.release > 0 {
+        info!(
+            node_id,
+            release = outcome.release,
+            reason = outcome.release_reason,
+            "releasing clients"
+        );
+    }
     let (tokens_version, grants) = state.tokens.grants();
     let tokens = (edge_tokens_version != tokens_version).then_some(grants);
     Ok(Json(Directive {
@@ -162,6 +175,7 @@ async fn heartbeat(
         drain_batch: 0,
         drain_interval_ms: 0,
         heartbeat_seconds: 0,
+        release: outcome.release,
         tokens_version,
         tokens,
     }))
@@ -191,6 +205,7 @@ struct Panel {
     tokens: Vec<TokenUsage>,
     stale_after_ms: u64,
     feed: FeedStatus,
+    settings: super::registry::Settings,
 }
 
 async fn panel(
@@ -234,6 +249,7 @@ async fn panel(
         tokens,
         stale_after_ms: state.config.stale_after.as_millis() as u64,
         feed: state.feed.status(),
+        settings: state.registry.settings(),
     }))
 }
 
@@ -319,6 +335,58 @@ async fn admin_node_action(
 #[derive(Deserialize)]
 struct NoteBody {
     note: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseBody {
+    count: u64,
+}
+
+/// 人工让某节点释放 count 个连接（1012），按 release_batch 分批经心跳下发；
+/// count=0 取消未下发的部分。
+async fn admin_node_release(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ReleaseBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_bearer(&headers, &state.config.admin_token)?;
+    if body.count > 100_000 {
+        return Err(ApiError::bad("count too large"));
+    }
+    if !state.registry.request_release(&id, body.count) {
+        return Err(ApiError::not_found("unknown node"));
+    }
+    info!(node_id = %id, count = body.count, from = %client_ip(&headers, peer), "admin release requested");
+    Ok(Json(
+        serde_json::json!({"ok": true, "node_id": id, "pending_release": body.count}),
+    ))
+}
+
+async fn admin_balance(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<super::registry::Settings>, ApiError> {
+    require_bearer(&headers, &state.config.admin_token)?;
+    Ok(Json(state.registry.settings()))
+}
+
+#[derive(Deserialize)]
+struct BalanceBody {
+    enabled: bool,
+}
+
+async fn admin_balance_set(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<BalanceBody>,
+) -> Result<Json<super::registry::Settings>, ApiError> {
+    require_bearer(&headers, &state.config.admin_token)?;
+    state.registry.set_auto_balance(body.enabled)?;
+    info!(enabled = body.enabled, from = %client_ip(&headers, peer), "auto-balance toggled");
+    Ok(Json(state.registry.settings()))
 }
 
 async fn admin_node_note(

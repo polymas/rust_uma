@@ -7,7 +7,10 @@ use tracing::{info, warn};
 
 use crate::console::registry::{Directive, Heartbeat};
 
-use super::{COMMIT, SUBPROTOCOL, SharedState, VERSION, WS_PATH, now_ms, server::start_drain};
+use super::{
+    COMMIT, SUBPROTOCOL, SharedState, VERSION, WS_PATH, hub::CLOSE_RESTART, now_ms,
+    server::start_drain,
+};
 
 pub fn build_heartbeat(state: &SharedState) -> Heartbeat {
     let s = &state.stats;
@@ -123,6 +126,13 @@ pub fn apply(state: &SharedState, directive: Directive, interval: &mut Duration)
                 "token set updated from console"
             );
         }
+    }
+    if directive.release > 0 {
+        let released = state.hub.release(directive.release as usize, CLOSE_RESTART);
+        info!(
+            requested = directive.release,
+            released, "console asked to release clients (1012)"
+        );
     }
     if directive.drain && !state.stats.draining.load(Ordering::Relaxed) {
         info!("console requested drain");
