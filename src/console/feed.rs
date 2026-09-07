@@ -25,6 +25,8 @@ use super::{SharedState, now_ms};
 
 const SUBPROTOCOL: &str = "uma.pb.v1";
 const RECENT_FRAMES: usize = 48;
+/// 连上游时回拉这么多序号的历史，面板一打开就有最近的事件可看。
+const WARMUP_SEQUENCES: u64 = 60;
 const BROADCAST_CAPACITY: usize = 256;
 
 pub struct Feed {
@@ -103,7 +105,14 @@ pub async fn run_feed(state: SharedState) {
         }
         first = false;
         let started = tokio::time::Instant::now();
-        match session(&state, &url).await {
+        // 首次/重连都从 tinyuma 最新序号往前回拉一小段；序号未知就只要实时。
+        let latest = state.upstream.snapshot().latest_sequence;
+        let dial = if latest > WARMUP_SEQUENCES {
+            format!("{url}?after_sequence={}", latest - WARMUP_SEQUENCES)
+        } else {
+            url.clone()
+        };
+        match session(&state, &dial).await {
             Ok(()) => info!(url, "panel feed closed by upstream"),
             Err(error) => warn!(url, %error, "panel feed session ended"),
         }
