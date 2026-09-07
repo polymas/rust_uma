@@ -105,8 +105,16 @@ pub async fn run_feed(state: SharedState) {
         }
         first = false;
         let started = tokio::time::Instant::now();
-        // 首次/重连都从 tinyuma 最新序号往前回拉一小段；序号未知就只要实时。
-        let latest = state.upstream.snapshot().latest_sequence;
+        // 首次/重连都从 tinyuma 最新序号往前回拉一小段；启动时等 poller 先拿到
+        // 最新序号（最多 10s），拿不到就只要实时。
+        let mut latest = state.upstream.snapshot().latest_sequence;
+        for _ in 0..10 {
+            if latest > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            latest = state.upstream.snapshot().latest_sequence;
+        }
         let dial = if latest > WARMUP_SEQUENCES {
             format!("{url}?after_sequence={}", latest - WARMUP_SEQUENCES)
         } else {
