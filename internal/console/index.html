@@ -7,34 +7,45 @@
 <style>
   :root { color-scheme: dark; --bg:#0b0f14; --panel:#121821; --border:#1f2733; --text:#d8e1ea; --dim:#7c8a9a; --ok:#3ecf8e; --warn:#e8b339; --bad:#e5534b; --accent:#5aa9ff; }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; padding:20px; }
-  h1 { font-size:15px; font-weight:600; margin:0 0 4px; }
-  h2.sec { font-size:12px; font-weight:600; margin:22px 0 8px; color:var(--dim); text-transform:uppercase; letter-spacing:.06em; display:flex; justify-content:space-between; align-items:center; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--text); font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; padding:10px 14px; display:flex; flex-direction:column; gap:6px; overflow:hidden; }
+  .top { display:flex; align-items:center; gap:14px; flex:0 0 auto; flex-wrap:wrap; }
+  h1 { font-size:14px; font-weight:600; margin:0; }
+  h2.sec { font-size:11px; font-weight:600; margin:0 0 4px; color:var(--dim); text-transform:uppercase; letter-spacing:.06em; display:flex; justify-content:space-between; align-items:center; flex:0 0 auto; }
+  .sec-block { display:flex; flex-direction:column; min-height:0; }
+  .upstream { flex:0 0 auto; }
+  .middle { display:grid; grid-template-columns: minmax(0, 7fr) minmax(0, 3fr); gap:12px; flex:0 0 auto; max-height:34vh; min-height:0; }
+  .middle .sec-block { min-height:0; }
+  .middle .wrap { max-height: calc(34vh - 24px); }
+  .bottom { flex:1 1 auto; min-height:120px; }
+  .bottom .wrap { flex:1 1 auto; min-height:0; }
   h2.sec .hint { text-transform:none; letter-spacing:normal; font-weight:400; }
-  #meta { color:var(--dim); font-size:12px; } #meta.err { color:var(--bad); }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; }
-  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
-  .card h3 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; display:flex; align-items:center; gap:6px; }
+  #meta { color:var(--dim); font-size:11px; } #meta.err { color:var(--bad); }
+  .grid { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:8px; }
+  @media (max-width: 1250px) { .grid { grid-template-columns:repeat(3, minmax(0,1fr)); } }
+  @media (max-width: 1500px) { .card { font-size:10.5px; padding:6px 8px 5px; } .card h3 { font-size:10.5px; } }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:7px 10px 6px; min-width:0; font-size:11px; }
+  .card h3 { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--dim); margin:0 0 4px; display:flex; align-items:center; gap:6px; padding-right:18px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); flex-shrink:0; } .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
-  .row { display:flex; justify-content:space-between; padding:2px 0; border-bottom:1px dashed var(--border); gap:10px; } .row:last-child{border-bottom:none}
-  .row .k { color:var(--dim); } .row .v { font-variant-numeric:tabular-nums; text-align:right; }
+  .row { display:flex; justify-content:space-between; padding:1px 0; border-bottom:1px dashed var(--border); gap:8px; line-height:1.35; } .row:last-child{border-bottom:none}
+  .row .k { color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } .row .v { font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap; }
   .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)} .dim{color:var(--dim)}
-  .wrap { overflow:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
-  table { width:100%; border-collapse:collapse; font-size:12px; white-space:nowrap; }
-  th, td { padding:5px 10px; text-align:left; border-bottom:1px dashed var(--border); vertical-align:top; }
+  .wrap { overflow:auto; background:var(--panel); border:1px solid var(--border); border-radius:6px; }
+  table { width:100%; border-collapse:collapse; font-size:11px; white-space:nowrap; }
+  th, td { padding:3px 8px; text-align:left; border-bottom:1px dashed var(--border); vertical-align:top; line-height:1.35; }
   th { color:var(--dim); font-weight:500; position:sticky; top:0; background:var(--panel); }
   tr:last-child td { border-bottom:0; }
   td.mono { font-variant-numeric:tabular-nums; }
   td a { color:var(--text); text-decoration:underline; text-decoration-color:var(--dim); } td a:hover { color:var(--ok); }
   .badge { display:inline-block; padding:0 6px; border-radius:3px; font-size:11px; border:1px solid currentColor; }
-  button { background:transparent; color:var(--accent); border:1px solid var(--border); border-radius:4px; padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; margin-right:4px; }
+  button { background:transparent; color:var(--accent); border:1px solid var(--border); border-radius:4px; padding:1px 6px; font:inherit; font-size:11px; cursor:pointer; margin-right:3px; }
   button:hover { border-color:var(--accent); } button.danger { color:var(--bad); }
   input { background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:3px 6px; font:inherit; }
-  .bar { display:flex; gap:8px; align-items:center; margin:8px 0 0; color:var(--dim); font-size:12px; flex-wrap:wrap; }
-  #secret { background:var(--panel); border:1px solid var(--warn); border-radius:6px; padding:10px 12px; margin:10px 0; display:none; }
+  .bar { display:flex; gap:6px; align-items:center; margin:0; color:var(--dim); font-size:11px; flex-wrap:wrap; }
+  #secret { background:var(--panel); border:1px solid var(--warn); border-radius:6px; padding:6px 10px; margin:0; display:none; flex:0 0 auto; }
   #secret code { color:var(--warn); user-select:all; word-break:break-all; }
   .empty { color:var(--dim); padding:10px 12px; }
-  .events { max-height: 520px; }
+  .events { }
   .card { position: relative; }
   .help { position: absolute; top: 8px; right: 10px; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--border); color: var(--dim); font-size: 11px; line-height: 14px; text-align: center; cursor: help; user-select: none; }
   .help:hover { color: var(--accent); border-color: var(--accent); }
@@ -46,29 +57,40 @@
 </style>
 </head>
 <body>
-<h1>uma console</h1>
-<div id="meta">加载中…</div>
-<div class="bar">
-  <span>admin token</span><input id="admin" type="password" size="28" placeholder="管理动作需要">
-  <button id="saveadmin">保存到本机</button><span id="adminstate"></span>
+<div class="top">
+  <h1>uma console</h1>
+  <div id="meta">加载中…</div>
+  <div class="bar" style="margin-left:auto">
+    <span>admin token</span><input id="admin" type="password" size="22" placeholder="管理动作需要">
+    <button id="saveadmin">保存到本机</button><span id="adminstate"></span>
+  </div>
 </div>
 <div id="secret"></div>
 
+<div class="sec-block upstream">
 <h2 class="sec"><span>tinyuma（法兰克福）</span><span class="hint" id="upmeta"></span></h2>
 <div class="grid" id="grid"></div>
+</div>
 
+<div class="middle">
+<div class="sec-block">
 <h2 class="sec"><span>edge 节点（香港）<span class="help">?<span class="tip"><b>状态</b>优先级：失联（超时无心跳）&gt; 已禁用（人工）&gt; 摘流中 &gt; 未就绪（上游没连上）&gt; 已满 &gt; 服务中；只有"服务中"出现在公开节点列表。<b>序号滞后</b>：该节点最后事件序号落后 tinyuma 多少，正常 0。<b>上游延迟</b>：帧从 tinyuma 发出到本节点收到，只统计实时帧。<b>扇出耗时</b>：一次广播遍历全部客户端的最长耗时，常态应远小于 1ms。<b>慢客户端</b>：客户端队列满被 1008 踢掉的累计数。<b>摘流</b>：按批 1012 断开客户端并从列表摘除，节点重启后自动恢复；<b>禁用</b>：从列表摘除但不断已有连接，重启也保留；<b>移除</b>：从控制台删除记录，下次心跳会重新出现。</span></span></span><span class="hint" id="nodesmeta"></span></h2>
 <div class="wrap"><table><thead><tr>
-  <th>节点</th><th>状态</th><th>连接数/上限</th><th>序号滞后</th><th>上游延迟 最近/最大</th><th>帧数/字节</th>
-  <th>慢客户端</th><th>扇出耗时 最大</th><th>上游连接</th><th>地址</th><th>版本</th><th>心跳</th><th>备注</th><th>操作</th>
+  <th>节点</th><th>状态</th><th>连接数</th><th>滞后</th><th>上游延迟 最近/最大</th><th>帧数/字节</th>
+  <th>慢客户端</th><th>扇出最大</th><th>上游</th><th>心跳</th><th>备注</th><th>操作</th>
 </tr></thead><tbody id="nodes"></tbody></table></div>
+</div>
 
+<div class="sec-block">
 <h2 class="sec"><span>下游 token<span class="help">?<span class="tip">业务下游连 edge 用的凭据，由这里签发，通过心跳下发到所有 edge，edge 本地校验。<b>创建</b>后完整 secret 只显示一次。<b>禁用</b>：一个心跳周期（5s）内所有 edge 拒绝新握手并把在线连接以 1008 踢掉；<b>启用</b>恢复。<b>连接数/分布</b>：当前用该 token 连着的连接数及在哪些节点上。没有过期时间。</span></span></span></h2>
-<div class="bar" style="margin:0 0 8px"><input id="newname" placeholder="新 token 名称" size="24"><button id="create">创建 token</button></div>
 <div class="wrap"><table><thead><tr>
-  <th>ID</th><th>名称</th><th>前缀</th><th>状态</th><th>连接数</th><th>节点分布</th><th>创建时间</th><th>操作</th>
+  <th>名称</th><th>状态</th><th>连接数</th><th>节点分布</th><th>操作</th>
 </tr></thead><tbody id="tokens"></tbody></table></div>
+<div class="bar" style="margin-top:4px"><input id="newname" placeholder="新 token 名称" size="18"><button id="create">创建 token</button></div>
+</div>
+</div>
 
+<div class="sec-block bottom">
 <h2 class="sec"><span>实时推送 <span class="hint" id="wsStatus">（连接中…）</span><span class="help">?<span class="tip">console 保持一条到 tinyuma 的 ws，把帧转发给本页，浏览器里直接解 protobuf。刚打开会先收到最近几十帧的<b>回放</b>（端到端延迟列显示"回放"），之后是实时。<b>端到端延迟</b>：tinyuma 收到链上日志到本浏览器收到帧，含法兰克福→香港→Cloudflare→你的网络。<b>方向</b>：按 UMA 结算价推导该买哪个 token。<b>富化</b>未命中的事件不会广播给业务下游，这里也看不到。</span></span></span><span class="hint">console → tinyuma 的一条 ws 转发给本页；业务下游请走 edge</span></h2>
 <div class="wrap events"><table>
   <thead><tr>
@@ -78,6 +100,7 @@
   </tr></thead>
   <tbody id="eventsBody"><tr><td colspan="13" class="empty">等待新事件…</td></tr></tbody>
 </table></div>
+</div>
 
 <!-- fzstd 0.1.1 (MIT), inlined so the page has no runtime CDN dependency.
      https://github.com/101arrowz/fzstd -->
@@ -288,16 +311,16 @@ function renderUpstream(p) {
     [`近${data.enrichment_recent_total}例命中率`, recentPct.toFixed(2) + "%", recentPct > 95 ? "ok" : (recentPct > 80 ? "warn" : "bad")],
     ["自愈补齐总数", data.catalog_reconcile_gaps_closed_total, data.catalog_reconcile_gaps_closed_total > 0 ? "warn" : ""],
   ], "把链上 UMA 事件映射到 Polymarket 市场（token id、分类、下注类型、Neg Risk）的内存缓存。<b>缓存市场数</b>：Gamma 同步下来的市场总数。<b>命中/未命中</b>：事件能否在缓存里找到市场；未命中的事件不会广播给下游。<b>近 N 例命中率</b>：滚动窗口，比累计值更能反映当前状态。<b>自愈补齐</b>：定期全量重扫补上 keyset 翻页漏掉的市场，持续增长说明 Gamma 增量同步在漏。"));
-  grid.appendChild(card("热路径 / 事件处理", "", [
+  grid.appendChild(card("热路径 / 事件", "", [
     ["已解码事件总数", data.events_decoded_total],
     ["解码错误总数", data.decode_errors_total, data.decode_errors_total > 0 ? "bad" : ""],
     ["去重丢弃总数", data.duplicates_total],
-    ["事件环 (oldest→latest)", `#${data.event_ring_oldest_sequence} → #${data.event_ring_latest_sequence}`],
+    ["事件环", `#${data.event_ring_oldest_sequence} → #${data.event_ring_latest_sequence}`],
     ["最近一次上游收到", fmtAgo(data.last_upstream_received_at_us)],
     ["最近一次广播", fmtAgo(data.last_broadcast_at_us)],
     ["存储队列丢弃总数", data.storage_queue_dropped_total, data.storage_queue_dropped_total > 0 ? "warn" : ""],
   ], "从解码到广播的延迟敏感路径。<b>已解码事件</b>：ProposePrice/DisputePrice 解析成功数。<b>解码错误</b>：应恒为 0，否则合约事件格式变了。<b>去重丢弃</b>：多路赛马的重复份数，正常会一直涨。<b>事件环</b>：内存里可供 after_sequence 续传的序号范围。<b>最近一次上游收到/广播</b>：两者差值就是热路径处理耗时。<b>存储队列丢弃</b>：WAL 写入跟不上，应恒为 0。"));
-  grid.appendChild(card("下游 WSS 消费（直连 tinyuma 的，应只剩 edge + console）", data.subscribers > 0 ? "ok" : "", [
+  grid.appendChild(card("直连 tinyuma 的 WSS", data.subscribers > 0 ? "ok" : "", [
     ["当前连接数", data.subscribers, data.subscribers > p.nodes.length + 1 ? "warn" : ""],
     ["慢客户端断开总数", data.slow_clients_dropped_total, data.slow_clients_dropped_total > 0 ? "warn" : ""],
     ["下发速率", fmtRate(rate("ws_bytes_sent_total"))],
@@ -328,7 +351,7 @@ function renderNodes(p) {
     const flags = [n.disabled ? "已禁用" : "", n.desired_drain ? "已下发摘流" : "", h.draining ? "节点摘流中" : ""].filter(Boolean).join(" · ");
     const actions = `<button data-n="${esc(h.node_id)}" data-a="${n.desired_drain ? "undrain" : "drain"}">${n.desired_drain ? "取消摘流" : "摘流"}</button><button data-n="${esc(h.node_id)}" data-a="${n.disabled ? "enable" : "disable"}">${n.disabled ? "启用" : "禁用"}</button><button class="danger" data-n="${esc(h.node_id)}" data-a="forget">移除</button>`;
     return `<tr>
-      <td>${esc(h.node_id)}<div class="dim">${esc(n.remote_ip)}</div></td>
+      <td title="${esc(n.url)}\n版本 ${esc(h.version)} ${esc(h.commit)}\n来源 IP ${esc(n.remote_ip)}">${esc(h.node_id)}<div class="dim">${esc((h.advertise_host || n.remote_ip))}</div></td>
       <td><span class="badge ${statusClass(n.status)}" title="${esc(n.status)}">${STATUS_LABEL[n.status] || esc(n.status)}</span>${flags ? `<div class="dim">${esc(flags)}</div>` : ""}</td>
       <td>${fmtNum(h.clients)}/${fmtNum(h.max_clients)}<div class="dim">累计拒绝 ${fmtNum(h.clients_rejected_total)}</div></td>
       <td class="${lagCls}">${lag == null ? "-" : lag}<div class="dim">序号 ${fmtNum(h.last_event_sequence)}</div></td>
@@ -337,25 +360,23 @@ function renderNodes(p) {
       <td class="${h.slow_clients_disconnected_total ? "warn" : ""}">${fmtNum(h.slow_clients_disconnected_total)}</td>
       <td>${fmtUs(h.fanout_max_us)}<div class="dim">最近 ${fmtUs(h.fanout_last_us)}</div></td>
       <td class="${h.upstream_connected ? "ok" : "bad"}">${h.upstream_connected ? "已连接" : "断开"}<div class="dim">重连 ${fmtNum(h.upstream_reconnects_total)} · 最近帧 ${fmtAgoMs(h.last_frame_at_ms, p.now_ms)}</div></td>
-      <td>${esc(n.url)}</td>
-      <td class="dim">${esc(h.version)}<div>${esc(h.commit)}</div></td>
-      <td class="${beat > p.stale_after_ms ? "bad" : ""}">${(beat/1000).toFixed(1)}s 前<div class="dim">token 版本 ${h.tokens_version}</div></td>
-      <td><input data-note="${esc(h.node_id)}" value="${esc(n.note)}" size="10" placeholder="备注"></td>
+      <td class="${beat > p.stale_after_ms ? "bad" : ""}" title="token 版本 ${h.tokens_version} · ${esc(h.version)} ${esc(h.commit)}">${(beat/1000).toFixed(1)}s 前<div class="dim">v${esc(h.commit)} · tok${h.tokens_version}</div></td>
+      <td><input data-note="${esc(h.node_id)}" value="${esc(n.note)}" size="8" placeholder="备注"></td>
       <td>${actions}</td></tr>`;
   });
-  $("nodes").innerHTML = rows.join("") || '<tr><td colspan="14" class="empty">还没有节点心跳</td></tr>';
+  $("nodes").innerHTML = rows.join("") || '<tr><td colspan="12" class="empty">还没有节点心跳</td></tr>';
 }
 
 // ---------- token 表 ----------
 function renderTokens(p) {
   const rows = p.tokens.map((t) => {
     const dist = Object.entries(t.nodes || {}).map(([k, v]) => `${esc(k)}:${v}`).join(" ");
-    return `<tr><td>${esc(t.id)}</td><td>${esc(t.name)}</td><td class="dim">${esc(t.prefix)}…</td>
+    return `<tr><td title="id ${esc(t.id)} · 前缀 ${esc(t.prefix)}… · 创建于 ${esc(ts(t.created_at_ms))} UTC">${esc(t.name)}<div class="dim">${esc(t.id)} · ${esc(t.prefix)}…</div></td>
       <td><span class="badge ${t.enabled ? "ok" : "dim"}">${t.enabled ? "启用" : "已禁用"}</span></td>
-      <td>${fmtNum(t.clients)}</td><td class="dim">${dist || "-"}</td><td class="dim">${esc(ts(t.created_at_ms))}</td>
+      <td>${fmtNum(t.clients)}</td><td class="dim">${dist || "-"}</td>
       <td><button data-t="${esc(t.id)}" data-a="${t.enabled ? "disable" : "enable"}">${t.enabled ? "禁用" : "启用"}</button><button class="danger" data-t="${esc(t.id)}" data-a="delete">删除</button></td></tr>`;
   });
-  $("tokens").innerHTML = rows.join("") || '<tr><td colspan="8" class="empty">还没有 token</td></tr>';
+  $("tokens").innerHTML = rows.join("") || '<tr><td colspan="5" class="empty">还没有 token</td></tr>';
 }
 
 document.addEventListener("click", async (e) => {
@@ -504,9 +525,9 @@ function renderEvents() {
   if (!events.length) return;
   eventsBody.innerHTML = events.map(ev => {
     const latencyUs = ev.received_at_client_us - ev.upstream_received_at_us;
-    const latency = latencyUs > 30e6 ? '<span class="dim">回放</span>' : fmtDuration(latencyUs);
+    const latency = latencyUs > 30e6 ? '<span class="dim">回放</span>' : latencyUs < 0 ? '<span class="dim" title="本机时钟比 tinyuma 慢，算不出正值">时钟偏差</span>' : fmtDuration(latencyUs);
     const winnerIdx = ev.price_outcome === "token0" ? 0 : ev.price_outcome === "token1" ? 1 : -1;
-    const tokenIds = (ev.token_ids || []).map((id, i) => i === winnerIdx ? `<b>${short(id)}</b>` : short(id)).join("<br>") || "—";
+    const tokenIds = (ev.token_ids || []).map((id, i) => i === winnerIdx ? `<b>${short(id)}</b>` : short(id)).join(" / ") || "—";
     for (const id of ev.tag_ids || []) ensureTagLabel(id);
     const tags = (ev.tag_ids || []).map((id) => tagLabels[id] || id).join(", ") || "—";
     ensureMarketSlug(ev.condition_id);
