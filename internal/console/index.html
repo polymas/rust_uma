@@ -366,7 +366,10 @@ function renderUpstream(p) {
 function renderNodes(p) {
   const latest = (p.upstream && p.upstream.latest_sequence) || 0;
   $("nodesmeta").textContent = `服务中 ${p.nodes.filter((n) => n.status === "serving").length} / 已知 ${p.nodes.length} · 心跳超 ${p.stale_after_ms/1000}s 判失联`;
-  const rows = p.nodes.map((n) => {
+  // 服务中在最上面，其后按"需要处理"的紧急程度排：已满/未就绪/摘流中/失联，最后是人工禁用的
+  const STATUS_ORDER = { serving:0, full:1, not_ready:2, draining:3, stale:4, disabled:5 };
+  const sortedNodes = [...p.nodes].sort((a, b) => (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9) || a.heartbeat.node_id.localeCompare(b.heartbeat.node_id, "zh"));
+  const rows = sortedNodes.map((n) => {
     const h = n.heartbeat; const lag = latest ? latest - h.last_event_sequence : null;
     const lagCls = lag == null ? "dim" : lag <= 0 ? "ok" : "bad";
     const nid = h.node_id;
