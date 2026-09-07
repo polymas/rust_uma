@@ -1,0 +1,28 @@
+# tinyuma 扇出集群接入契约（uma-console）
+
+业务下游不要直连 tinyuma（法兰克福），改连香港的 edge 节点。edge 原样转发
+tinyuma 的二进制帧（帧格式、子协议、after_sequence 语义见下方 tinyuma 契约），
+本地帧环支持回放。
+
+## 接入步骤
+
+1. `GET {console}/api/v1/nodes`（公开，无鉴权）得到：
+   `{"nodes":[{"node_id","url","weight","clients"}],"subprotocol","path","ttl_s","generated_at_ms"}`
+   列表只含正在服务的节点，按剩余容量降序。取 `nodes[0]`，失败则顺延下一个；
+   列表为空则退避后重拉。每 `ttl_s` 秒重新拉一次并在断线时立刻重拉。
+2. 用 `url` 建立 WebSocket，必须带子协议 `uma.pb.v1`，必须带 token：
+   `?token=<secret>` 或 `Authorization: Bearer <secret>`。token 由控制台签发，
+   被禁用时在线连接会收到关闭码 1008。
+3. 可选查询参数 `_replay=<0..4096|all>`：连接建立后先收到帧环里最近 N 帧再接实时。
+   帧内 `batch_sequence`/`UmaEvent.sequence` 单调递增，用它做去重与续传判断。
+
+## 关闭码
+
+- 1000 正常；1008 慢客户端或 token 失效（不要立刻原样重连，先重拉列表并检查 token）；
+- 1012 节点摘流（立刻重拉列表连别的节点）；
+- 握手 503 表示节点正在摘流或已满，换下一个节点。
+
+## 健康
+
+- `GET {console}/healthz`：`serving_nodes`/`known_nodes`/`upstream_ok`。
+- 各 edge：`GET {edge}/edge/ready` 200 表示可接客；`/edge/healthz` 为节点指标。

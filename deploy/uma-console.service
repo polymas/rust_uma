@@ -1,0 +1,23 @@
+[Unit]
+Description=tinyuma fan-out cluster console (uma-console)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/uma-console/uma-console.env
+ExecStart=/opt/uma-console/uma-console
+Restart=always
+RestartSec=2s
+TimeoutStopSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=uma-console
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

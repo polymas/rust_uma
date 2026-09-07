@@ -63,6 +63,8 @@ pub struct Config {
 pub enum ConfigError {
     #[error("WSS_RPC is required")]
     MissingWss,
+    #[error("{0} is required")]
+    Missing(&'static str),
     #[error("invalid {key}: {value}")]
     Invalid { key: &'static str, value: String },
 }
@@ -200,14 +202,14 @@ fn required_any(primary: &'static str, fallback: &'static str) -> Result<String,
         .ok_or(ConfigError::MissingWss)
 }
 
-fn nonempty(key: &str) -> Option<String> {
+pub(crate) fn nonempty(key: &str) -> Option<String> {
     env::var(key)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|v| !v.is_empty())
 }
 
-fn parse<T>(key: &'static str, default: &str) -> Result<T, ConfigError>
+pub(crate) fn parse<T>(key: &'static str, default: &str) -> Result<T, ConfigError>
 where
     T: FromStr,
 {
@@ -217,7 +219,7 @@ where
         .map_err(|_| ConfigError::Invalid { key, value })
 }
 
-fn optional_parse<T>(key: &'static str) -> Result<Option<T>, ConfigError>
+pub(crate) fn optional_parse<T>(key: &'static str) -> Result<Option<T>, ConfigError>
 where
     T: FromStr,
 {
@@ -230,7 +232,7 @@ where
         .transpose()
 }
 
-fn parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
+pub(crate) fn parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
     let Some(value) = nonempty(key) else {
         return Ok(default);
     };
