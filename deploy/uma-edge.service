@@ -1,0 +1,24 @@
+[Unit]
+Description=tinyuma fan-out edge node (uma-edge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/uma-edge/uma-edge.env
+ExecStart=/opt/uma-edge/uma-edge
+Restart=always
+RestartSec=2s
+# SIGTERM 触发 drain（按批 1012），给它足够时间
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

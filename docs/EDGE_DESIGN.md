@@ -1,6 +1,8 @@
 # uma-edge / uma-console 设计
 
-> 状态：设计稿，2026-09-07 与需求方对话后定稿，代码未开始。
+> 状态：2026-09-07 定稿并实现。console 上线于 uma-console.chainee.space；edge 见 `src/edge/`。
+> 与实现的差异：EDGE_UPSTREAM_URL 里的 `after_sequence` 在首次拨号时保留（`?after_sequence=0` 可预热帧环）；
+> 上游延迟只统计 10s 内的实时帧；drain/心跳周期等指令字段 console 目前回 0（edge 用本地默认）。
 > 参考：[rust-edge-migration-spec.md](rust-edge-migration-spec.md)（Go 版迁移规格，只作参考，
 > 本文与其冲突处以本文为准）。热路径要求见 [WORKFLOW.md](WORKFLOW.md) §1.1。
 

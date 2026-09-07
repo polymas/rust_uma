@@ -217,6 +217,22 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
   服务会补发。
 - 对至少一次投递进行去重，并使用指数退避策略重连。
 
+## 扇出集群（uma-edge / uma-console）
+
+业务下游不要直连本服务（法兰克福），改连香港的 edge 节点，本服务的 WebSocket
+只留给 edge。edge 原样转发本文描述的二进制帧（帧头、子协议、序号语义完全一致），
+本地帧环支持 `_replay=<0..4096|all>` 回放。接入方式：
+
+1. `GET https://uma-console.chainee.space/api/v1/nodes`（公开）→
+   `{"nodes":[{"node_id","url","weight","clients"}],"subprotocol","path","ttl_s"}`，
+   只含正在服务的节点，按剩余容量降序；取 `nodes[0]`，失败顺延，每 `ttl_s` 秒重拉。
+2. 连 `url`，子协议 `uma.pb.v1`，token 二选一：`?token=<secret>` 或
+   `Authorization: Bearer <secret>`。token 由控制台签发。
+3. 关闭码：1008 慢客户端或 token 失效（先检查 token 再重连）；1012 节点摘流
+   （立刻重拉列表换节点）；握手 503 表示摘流中或已满，换下一个。
+
+完整契约见 `https://uma-console.chainee.space/llms.txt`（集群段 + 本文原文）。
+
 ## 延迟相关的下游建议
 
 这条链路的唯一目标是把 propose/dispute 尽快送到下游。以下是根据生产实测
