@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.6.1（2026-09-07，<提交后填短哈希>）
+## v0.6.1（2026-09-09，9d81cca）
 - **生产故障修复：摘流过的 edge 节点永远回不到服务**（`edge/server.rs` +
   `edge/heartbeat.rs`）。`stats.draining` 是单向的，`start_drain` 置上之后没有
   任何地方复位；面板点 undrain 只清 console 侧的 `desired_drain`，心跳下发的
