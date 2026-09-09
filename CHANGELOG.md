@@ -17,6 +17,16 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.6.1（2026-09-07，<提交后填短哈希>）
+- **生产故障修复：edge 释放客户端后整进程 abort**（`edge/server.rs::session`）。
+  console 自动均衡 / 管理端 release / drain 让 writer 先于 reader 结束时，
+  `select!` 已经把 writer 的 `JoinHandle` poll 到完成，收尾又对同一个句柄做
+  `timeout(2s)` 等待，tokio 直接 panic "JoinHandle polled after completion"；
+  release 构建 `panic = "abort"`，一次 20 个连接的均衡把整个节点几百个客户端
+  一起打掉，systemd 拉起后再被均衡再崩，2026-09-07 下午五台 slave 累计崩了
+  14 次。现在记录 writer 是否已完成，只在 reader 先退出时才等 writer。新增
+  集成测试 `tests/edge_release.rs` 复现该路径（去掉修复即失败）。
+
 ## v0.6.0（2026-09-06，95af0bb）
 - 延迟分析后的两项热路径周边优化。**catalog 落盘不再占 tokio worker**：
   `Catalog::snapshot()` 改为只克隆 `Arc`（持读锁从几十毫秒降到几毫秒），排

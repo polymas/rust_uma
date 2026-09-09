@@ -193,15 +193,19 @@ async fn session(
             }
         }
     };
-    let why = tokio::select! {
-        why = reader => why,
-        _ = &mut writer => "writer done",
+    // `writer_done` records whether the JoinHandle already resolved: a tokio
+    // JoinHandle panics ("JoinHandle polled after completion") if polled again,
+    // so it must only be awaited below when the reader branch won the race.
+    let (why, writer_done) = tokio::select! {
+        why = reader => (why, false),
+        _ = &mut writer => ("writer done", true),
     };
     state.hub.unsubscribe(id);
     // Give the writer a moment to flush queued frames and the close frame.
-    if tokio::time::timeout(Duration::from_secs(2), &mut writer)
-        .await
-        .is_err()
+    if !writer_done
+        && tokio::time::timeout(Duration::from_secs(2), &mut writer)
+            .await
+            .is_err()
     {
         writer.abort();
     }
