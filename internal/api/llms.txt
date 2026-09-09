@@ -227,7 +227,7 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 1. `GET https://uma-console.chainee.space/api/v1/nodes`（公开；带正常 `User-Agent`，
    `Python-urllib` 默认 UA 会被 Cloudflare 拦成 403）→
    `{"nodes":[{"node_id","url","weight","clients"}],"subprotocol","path","ttl_s"}`，
-   只含正在服务的节点，按剩余容量降序；取 `nodes[0]`，失败顺延，每 `ttl_s` 秒重拉。
+   只含正在服务的节点，按当前连接数升序（`nodes[0]` 最空）；取 `nodes[0]`，失败顺延，每 `ttl_s` 秒重拉。
 2. 连 `url`，子协议 `uma.pb.v1`，token 二选一：`?token=<secret>` 或
    `Authorization: Bearer <secret>`。token 由控制台签发。
 3. 关闭码：1008 慢客户端或 token 失效（先检查 token 再重连）；1012 节点摘流

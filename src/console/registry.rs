@@ -102,15 +102,18 @@ struct NodesFile {
     settings: Settings,
 }
 
+/// 缺字段一律回落到 `Default`：旧 `nodes.json` 里是 `balance_threshold_pct`
+/// （按均值判超载的老规则），换成 `balance_spread_pct` 后不能让控制台起不来。
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
-    /// 自动均衡：超载节点每次心跳释放一小批连接，让它们重连到最空的节点。
+    /// 自动均衡：最忙的节点每次心跳释放一小批连接，让它们重连到最空的节点。
     pub auto_balance: bool,
     /// 每次心跳最多释放多少个（手动与自动共用）。
     pub release_batch: u32,
-    /// 超出集群平均值多少比例才算超载。
-    pub balance_threshold_pct: u32,
-    /// 超出的绝对数量低于这个值不动，避免为几个连接来回搬。
+    /// 收敛目标：最忙节点的连接数不超过最空节点的 (100 + 这个值)%。
+    pub balance_spread_pct: u32,
+    /// 超出目标线的绝对数量低于这个值不动，避免为几个连接来回搬。
     pub balance_min_excess: u64,
 }
 
@@ -119,8 +122,8 @@ impl Default for Settings {
         Self {
             auto_balance: true,
             release_batch: 20,
-            balance_threshold_pct: 10,
-            balance_min_excess: 20,
+            balance_spread_pct: 5,
+            balance_min_excess: 5,
         }
     }
 }
@@ -251,8 +254,10 @@ impl Registry {
         outcome
     }
 
-    /// 手动释放优先；没有手动任务时看自动均衡：该节点连接数超过集群（服务中节点）
-    /// 平均值 threshold% 且超出量 ≥ min_excess，并且别的服务中节点还有余量，才释放一批。
+    /// 手动释放优先；没有手动任务时看自动均衡：只有当前最忙的那个服务中节点会
+    /// 释放，且要超出"最空节点 × (1 + spread%)"这条线 ≥ min_excess。一次只动一个
+    /// 节点是有意的——释放出去的连接会一起落到最空的那台，让每个节点各放一批很
+    /// 容易把最空的一台直接顶成最忙的，来回搬。
     fn decide_release(&self, inner: &mut Inner, node_id: &str, now: u64) -> (u32, &'static str) {
         let batch = inner.settings.release_batch.max(1);
         let Some(node) = inner.nodes.get(node_id) else {
@@ -269,6 +274,9 @@ impl Registry {
         if !inner.settings.auto_balance || node.desired_drain {
             return (0, "");
         }
+        if self.busiest_serving(inner, now).as_deref() != Some(node_id) {
+            return (0, "");
+        }
         let excess = self.balance_excess(inner, node_id, now);
         if excess < inner.settings.balance_min_excess as i64 {
             return (0, "");
@@ -280,16 +288,14 @@ impl Registry {
         (n, "auto-balance")
     }
 
-    /// 该节点相对"服务中节点平均值 × (1+threshold)"的超出量；不在服务、或别的节点
-    /// 没有余量时为 0（搬过去也接不住）。
+    /// 该节点相对"最空的服务中节点 × (1 + spread%)"的超出量；不在服务、只有一个
+    /// 节点、或别的节点没有余量时为 0（搬过去也接不住）。
+    ///
+    /// 跟最空的节点比而不是跟平均值比：9 台里有 1 台空着，均值只被拉低 1/9，
+    /// 按"均值 +10%"算谁都不超载，那台空节点永远填不回来（2026-09-09 生产上
+    /// 就是这样，一台重启后卡在 20 个连接不动）。
     fn balance_excess(&self, inner: &Inner, node_id: &str, now: u64) -> i64 {
-        let serving: Vec<&Node> = inner
-            .nodes
-            .values()
-            .filter(|n| {
-                self.status_of(n, admin_of(inner, &n.heartbeat.node_id), now) == Status::Serving
-            })
-            .collect();
+        let serving = self.serving(inner, now);
         let Some(me) = serving.iter().find(|n| n.heartbeat.node_id == node_id) else {
             return 0;
         };
@@ -304,11 +310,40 @@ impl Registry {
         if others_spare == 0 {
             return 0;
         }
-        let total: u64 = serving.iter().map(|n| n.heartbeat.clients).sum();
-        let avg = total as f64 / serving.len() as f64;
-        let ceiling = avg * (1.0 + inner.settings.balance_threshold_pct as f64 / 100.0);
-        let excess = me.heartbeat.clients as f64 - ceiling;
-        (excess.floor() as i64).min(others_spare as i64)
+        let emptiest = serving
+            .iter()
+            .map(|n| n.heartbeat.clients)
+            .min()
+            .unwrap_or(0);
+        let ceiling = emptiest as f64 * (1.0 + inner.settings.balance_spread_pct as f64 / 100.0);
+        let excess = (me.heartbeat.clients as f64 - ceiling).floor() as i64;
+        // 一次最多搬掉差距的一半：全放到最空那台会让它反过来变成最忙的。
+        let half_gap = (me.heartbeat.clients.saturating_sub(emptiest) / 2) as i64;
+        excess.min(half_gap).min(others_spare as i64)
+    }
+
+    fn serving<'a>(&self, inner: &'a Inner, now: u64) -> Vec<&'a Node> {
+        inner
+            .nodes
+            .values()
+            .filter(|n| {
+                self.status_of(n, admin_of(inner, &n.heartbeat.node_id), now) == Status::Serving
+            })
+            .collect()
+    }
+
+    /// 连接数最多的服务中节点（并列时取 node_id 小的，保证同一次心跳里只有一个
+    /// 节点被选中）。
+    fn busiest_serving(&self, inner: &Inner, now: u64) -> Option<String> {
+        self.serving(inner, now)
+            .into_iter()
+            .max_by(|a, b| {
+                a.heartbeat
+                    .clients
+                    .cmp(&b.heartbeat.clients)
+                    .then_with(|| b.heartbeat.node_id.cmp(&a.heartbeat.node_id))
+            })
+            .map(|n| n.heartbeat.node_id.clone())
     }
 
     pub fn settings(&self) -> Settings {
@@ -370,9 +405,13 @@ impl Registry {
                 clients: n.heartbeat.clients,
             })
             .collect();
+        // 连接数最少的排最前：契约让下游取 nodes[0]，新连接就落到最空的节点。
+        // `weight`（剩余容量）留着给按权重挑的下游，两者在各节点 max_clients
+        // 相同时是同一个顺序。
         nodes.sort_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
+            a.clients
+                .cmp(&b.clients)
+                .then_with(|| b.weight.cmp(&a.weight))
                 .then_with(|| a.node_id.cmp(&b.node_id))
         });
         let (subprotocol, path) = inner
@@ -657,18 +696,33 @@ mod tests {
             ..hb(id, clients)
         };
         let (_dir, reg) = registry();
-        // busy 900 / idle 0 → 平均 450，阈值 495，busy 超出 405 → 每次心跳释放 20
+        // busy 900 / idle 0 → 目标线 0×1.05=0，busy 超出 900（一次最多搬一半）
+        // → 每次心跳释放 release_batch 个
         reg.heartbeat(hb("idle", 0), "1.1.1.2".into());
         let o = reg.heartbeat(hb("busy", 900), "1.1.1.1".into());
         assert_eq!((o.release, o.release_reason), (20, "auto-balance"));
-        // 均衡到阈值以内就停
-        reg.heartbeat(hb("idle", 430), "1.1.1.2".into());
+        // 收敛到最空节点的 5% 以内就停
+        reg.heartbeat(hb("idle", 450), "1.1.1.2".into());
         let o = reg.heartbeat(hb("busy", 470), "1.1.1.1".into());
-        assert_eq!(o.release, 0, "within threshold: nothing to move");
+        assert_eq!(o.release, 0, "within 5% spread: nothing to move");
         // 小差距不搬：超出 < min_excess
         reg.heartbeat(hb("idle", 100), "1.1.1.2".into());
-        let o = reg.heartbeat(hb("busy", 125), "1.1.1.1".into());
+        let o = reg.heartbeat(hb("busy", 108), "1.1.1.1".into());
         assert_eq!(o.release, 0);
+        // 只有最忙的那台放；第二忙的即使超出目标线也不动
+        reg.heartbeat(hb("idle", 0), "1.1.1.2".into());
+        reg.heartbeat(hb("mid", 400), "1.1.1.3".into());
+        let o = reg.heartbeat(hb("busy", 900), "1.1.1.1".into());
+        assert_eq!(o.release, 20);
+        let o = reg.heartbeat(hb("mid", 400), "1.1.1.3".into());
+        assert_eq!(o.release, 0, "only the busiest node sheds per heartbeat");
+        reg.heartbeat(
+            Heartbeat {
+                ready: false,
+                ..hb("mid", 400)
+            },
+            "1.1.1.3".into(),
+        );
         // 别的节点没余量就不搬
         reg.heartbeat(
             Heartbeat {
@@ -692,6 +746,60 @@ mod tests {
         let (_d2, solo) = registry();
         solo.heartbeat(hb("only", 900), "1.1.1.1".into());
         assert_eq!(solo.heartbeat(hb("only", 900), "1.1.1.1".into()).release, 0);
+    }
+
+    /// 生产场景回归：9 台节点，1 台刚重启是空的，自动均衡必须把它填回来，
+    /// 直到最忙/最空的差距收敛到 5% 以内。老规则（跟均值比 +10%、超出 ≥20）
+    /// 在这个分布下一次都不会触发，这个测试就是照着那次故障写的。
+    #[test]
+    fn auto_balance_converges_a_freshly_restarted_node_to_within_the_spread() {
+        let hb = |id: &str, clients: u64| Heartbeat {
+            max_clients: 1000,
+            ..hb(id, clients)
+        };
+        let (_dir, reg) = registry();
+        let mut clients: BTreeMap<String, u64> = (0..8)
+            .map(|i| (format!("node{i}"), 380))
+            .chain([("fresh".to_owned(), 20)])
+            .collect();
+
+        let spread = |c: &BTreeMap<String, u64>| {
+            let max = *c.values().max().unwrap();
+            let min = *c.values().min().unwrap();
+            (max, min)
+        };
+        let (max, min) = spread(&clients);
+        assert!(max as f64 > min as f64 * 1.05, "starts out of balance");
+
+        let mut rounds = 0;
+        loop {
+            for (id, n) in clients.clone() {
+                let out = reg.heartbeat(hb(&id, n), "1.1.1.1".into());
+                if out.release > 0 {
+                    assert_eq!(out.release_reason, "auto-balance");
+                    // 下游收到 1012 后重拉列表，落到当时最空的那台。
+                    let emptiest = clients
+                        .iter()
+                        .min_by_key(|(id, n)| (**n, (*id).clone()))
+                        .map(|(id, _)| id.clone())
+                        .unwrap();
+                    *clients.get_mut(&id).unwrap() -= out.release as u64;
+                    *clients.get_mut(&emptiest).unwrap() += out.release as u64;
+                }
+            }
+            let (max, min) = spread(&clients);
+            if max as f64 <= min as f64 * 1.05 {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds < 200, "never converged: {clients:?}");
+        }
+        assert_eq!(
+            clients.values().sum::<u64>(),
+            8 * 380 + 20,
+            "rebalancing must not create or drop connections"
+        );
+        assert!(clients["fresh"] >= 300, "fresh node filled up");
     }
 
     #[test]

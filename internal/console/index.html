@@ -77,7 +77,7 @@
 
 <div class="middle">
 <div class="sec-block">
-<h2 class="sec"><span>edge 节点（香港）<span id="balance" class="hint"></span><span class="help">?<span class="tip"><b>自动均衡</b>：某节点连接数超过"服务中节点平均值 + 10%"且超出 ≥20 时，console 每次心跳（5s）让它以 1012 释放 20 个，客户端重拉列表落到最空的节点，直到均衡；别的节点没余量时不搬。<b>释放</b>：手动让该节点按批释放指定数量，同样走 1012。<b>状态</b>优先级：失联（超时无心跳）&gt; 已禁用（人工）&gt; 摘流中 &gt; 未就绪（上游没连上）&gt; 已满 &gt; 服务中；只有"服务中"出现在公开节点列表。<b>序号滞后</b>：该节点最后事件序号落后 tinyuma 多少，正常 0。<b>上游延迟</b>：帧从 tinyuma 发出到本节点收到，只统计实时帧。<b>扇出耗时</b>：一次广播遍历全部客户端的最长耗时，常态应远小于 1ms。<b>慢客户端</b>：客户端队列满被 1008 踢掉的累计数。<b>摘流</b>：按批 1012 断开客户端并从列表摘除，节点重启后自动恢复；<b>禁用</b>：从列表摘除但不断已有连接，重启也保留；<b>移除</b>：从控制台删除记录，下次心跳会重新出现。</span></span></span><span class="hint" id="nodesmeta"></span></h2>
+<h2 class="sec"><span>edge 节点（香港）<span id="balance" class="hint"></span><span class="help">?<span class="tip"><b>自动均衡</b>：目标是最忙节点的连接数不超过最空节点的 105%。超出这条线 ≥5 时，console 每次心跳（5s）让<b>当前最忙的那一个</b>节点以 1012 释放 20 个，客户端重拉列表落到最空的节点，如此反复直到收敛；一次最多搬掉差距的一半，别的节点没余量时不搬。<b>释放</b>：手动让该节点按批释放指定数量，同样走 1012。<b>状态</b>优先级：失联（超时无心跳）&gt; 已禁用（人工）&gt; 摘流中 &gt; 未就绪（上游没连上）&gt; 已满 &gt; 服务中；只有"服务中"出现在公开节点列表。<b>序号滞后</b>：该节点最后事件序号落后 tinyuma 多少，正常 0。<b>上游延迟</b>：帧从 tinyuma 发出到本节点收到，只统计实时帧。<b>扇出耗时</b>：一次广播遍历全部客户端的最长耗时，常态应远小于 1ms。<b>慢客户端</b>：客户端队列满被 1008 踢掉的累计数。<b>摘流</b>：按批 1012 断开客户端并从列表摘除，节点重启后自动恢复；<b>禁用</b>：从列表摘除但不断已有连接，重启也保留；<b>移除</b>：从控制台删除记录，下次心跳会重新出现。</span></span></span><span class="hint" id="nodesmeta"></span></h2>
 <div class="wrap"><table><thead><tr>
   <th>节点</th><th>状态</th><th>连接数</th><th>滞后</th><th>上游延迟 最近/最大</th><th>帧数/字节</th>
   <th>慢客户端</th><th>扇出最大</th><th>上游</th><th>心跳</th><th>均衡</th><th>备注</th><th>操作</th>
@@ -383,7 +383,7 @@ function renderNodes(p) {
     const rejectCls = redIfGrew(`reject:${nid}`, h.clients_rejected_total);
     const beat = p.now_ms - n.last_seen_ms;
     const flags = [n.disabled ? "已禁用" : "", n.desired_drain ? "已下发摘流" : "", h.draining ? "节点摘流中" : ""].filter(Boolean).join(" · ");
-    const balCell = n.pending_release > 0 ? `<span class="warn-text">待释放 ${fmtNum(n.pending_release)}</span>` : n.balance_excess >= (p.settings.balance_min_excess || 20) ? `<span class="bad">超出 ${fmtNum(n.balance_excess)}</span>` : n.status === "serving" ? '<span class="ok">均衡</span>' : '<span class="dim">-</span>';
+    const balCell = n.pending_release > 0 ? `<span class="warn-text">待释放 ${fmtNum(n.pending_release)}</span>` : n.balance_excess >= (p.settings.balance_min_excess ?? 5) ? `<span class="bad">超出 ${fmtNum(n.balance_excess)}</span>` : n.status === "serving" ? '<span class="ok">均衡</span>' : '<span class="dim">-</span>';
     const balSub = n.released_total > 0 ? `<div class="dim">累计释放 ${fmtNum(n.released_total)} · ${fmtAgoMs(n.last_release_ms, p.now_ms)}</div>` : "";
     const actions = `<button data-n="${esc(h.node_id)}" data-a="release">释放</button><button data-n="${esc(h.node_id)}" data-a="${n.desired_drain ? "undrain" : "drain"}">${n.desired_drain ? "取消摘流" : "摘流"}</button><button data-n="${esc(h.node_id)}" data-a="${n.disabled ? "enable" : "disable"}">${n.disabled ? "启用" : "禁用"}</button><button class="danger" data-n="${esc(h.node_id)}" data-a="forget">移除</button>`;
     return `<tr>
@@ -403,7 +403,7 @@ function renderNodes(p) {
   });
   $("nodes").innerHTML = rows.join("") || '<tr><td colspan="13" class="empty">还没有节点心跳</td></tr>';
   const st = p.settings || {};
-  $("balance").innerHTML = `自动均衡 ${st.auto_balance ? '<span class="ok">开</span>' : '<span class="bad">关</span>'}（每 ${st.release_batch}/心跳，阈值 +${st.balance_threshold_pct}%）<button id="togglebal" data-en="${st.auto_balance ? 0 : 1}">${st.auto_balance ? "关闭" : "开启"}</button>`;
+  $("balance").innerHTML = `自动均衡 ${st.auto_balance ? '<span class="ok">开</span>' : '<span class="bad">关</span>'}（每 ${st.release_batch}/心跳，目标最忙 ≤ 最空 +${st.balance_spread_pct}%）<button id="togglebal" data-en="${st.auto_balance ? 0 : 1}">${st.auto_balance ? "关闭" : "开启"}</button>`;
 }
 
 // ---------- token 表 ----------

@@ -15,7 +15,8 @@ tinyuma 的二进制帧（帧格式、子协议、after_sequence 语义见下方
 1. `GET {console}/api/v1/nodes`（公开，无鉴权；控制台在 Cloudflare 后面，请求必须带一个正常的
    `User-Agent`，Python 默认的 `Python-urllib/x` 会被 Cloudflare 拦成 403）得到：
    `{"nodes":[{"node_id","url","weight","clients"}],"subprotocol","path","ttl_s","generated_at_ms"}`
-   列表只含正在服务的节点，按剩余容量降序。取 `nodes[0]`，失败则顺延下一个；
+   列表只含正在服务的节点，**按当前连接数升序**（`nodes[0]` 就是最空的那台，
+   `weight` 是剩余容量，按权重挑也可以）。取 `nodes[0]`，失败则顺延下一个；
    列表为空则退避后重拉。每 `ttl_s` 秒重新拉一次并在断线时立刻重拉。
 2. 用 `url` 建立 WebSocket，必须带子协议 `uma.pb.v1`，必须带 token：
    `?token=<secret>` 或 `Authorization: Bearer <secret>`。token 由控制台签发，
