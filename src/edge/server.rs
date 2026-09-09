@@ -354,12 +354,18 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
 
 // ---------- drain ----------
 
-/// One-way. Releases `drain_batch` clients every `drain_interval` with 1012
-/// until none remain or `drain_timeout`; then exits the process if
-/// `exit_after` (admin/SIGTERM) — console-initiated drains stay up so the
-/// panel keeps seeing the node until systemd/ops decide.
+/// Releases `drain_batch` clients every `drain_interval` with 1012 until none
+/// remain or `drain_timeout`; then exits the process if `exit_after`
+/// (admin/SIGTERM) — console-initiated drains stay up so the panel keeps
+/// seeing the node, and stay drained until `cancel_drain` (console undrain).
+/// An in-flight console drain upgraded by admin/SIGTERM still exits.
 pub fn start_drain(state: SharedState, exit_after: bool) {
-    if state.stats.draining.swap(true, Ordering::SeqCst) {
+    if exit_after {
+        state.stats.drain_exits.store(true, Ordering::SeqCst);
+    }
+    state.stats.draining.store(true, Ordering::SeqCst);
+    // 只允许一个循环在跑；已经在跑的那个会读到上面的 `drain_exits`。
+    if state.stats.drain_active.swap(true, Ordering::SeqCst) {
         return;
     }
     tokio::spawn(async move {
@@ -367,6 +373,11 @@ pub fn start_drain(state: SharedState, exit_after: bool) {
         info!(clients, exit_after, "drain started");
         let deadline = tokio::time::Instant::now() + state.config.drain_timeout;
         loop {
+            if !state.stats.draining.load(Ordering::SeqCst) {
+                info!("drain cancelled; back in service");
+                state.stats.drain_active.store(false, Ordering::SeqCst);
+                return;
+            }
             let remaining = state.hub.clients();
             if remaining == 0 {
                 info!("drain complete");
@@ -380,13 +391,26 @@ pub fn start_drain(state: SharedState, exit_after: bool) {
             info!(released, remaining = remaining - released, "drain batch");
             tokio::time::sleep(state.config.drain_interval).await;
         }
-        if exit_after {
+        state.stats.drain_active.store(false, Ordering::SeqCst);
+        // `drain_exits` may have been set after the loop started (console drain
+        // then SIGTERM), so read it here rather than trusting `exit_after`.
+        if state.stats.drain_exits.load(Ordering::SeqCst) {
             // give close frames a moment to flush
             tokio::time::sleep(Duration::from_millis(1500)).await;
             info!("drain finished; exiting");
             std::process::exit(0);
         }
     });
+}
+
+/// 撤销一次 console 发起的 drain，让节点重新 ready。返回是否真的解除了。
+/// 退进程的 drain（admin/SIGTERM）不可撤销：进程马上就没了，拉回服务只会
+/// 让 console 把新客户端送进一个正在关的节点。
+pub fn cancel_drain(state: &SharedState) -> bool {
+    if state.stats.drain_exits.load(Ordering::SeqCst) {
+        return false;
+    }
+    state.stats.draining.swap(false, Ordering::SeqCst)
 }
 
 #[cfg(test)]

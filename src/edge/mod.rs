@@ -114,6 +114,12 @@ pub struct EdgeStats {
     pub fanout_last_us: AtomicU64,
     pub fanout_max_us: AtomicU64,
     pub draining: AtomicBool,
+    /// 这次 drain 结束后要退进程（admin / SIGTERM）。这种 drain 不可取消，
+    /// 否则 console 的心跳会把正在优雅退出的节点又拉回服务。
+    pub drain_exits: AtomicBool,
+    /// drain 循环是否还在跑。和 `draining` 分开：drain 放完人走了，节点仍然
+    /// 保持 draining 直到 undrain，此时再来一次 SIGTERM 需要能起新循环去退。
+    pub drain_active: AtomicBool,
 }
 
 impl EdgeStats {

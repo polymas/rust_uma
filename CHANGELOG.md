@@ -18,6 +18,17 @@
 <!-- 新条目加在这行下面 -->
 
 ## v0.6.1（2026-09-07，<提交后填短哈希>）
+- **生产故障修复：摘流过的 edge 节点永远回不到服务**（`edge/server.rs` +
+  `edge/heartbeat.rs`）。`stats.draining` 是单向的，`start_drain` 置上之后没有
+  任何地方复位；面板点 undrain 只清 console 侧的 `desired_drain`，心跳下发的
+  `drain=false` 在 edge 侧被完全忽略，节点继续上报 `ready:false,draining:true`，
+  于是既不进 `public_list`（新客户端拿不到它），也不进自动均衡的 serving 集合
+  （别的节点的"超出量"不会因为多了一台空节点而变大），流量再也切不回来，只能
+  重启进程。2026-09-09 发现 `43.135.4.241`（`压测客户端-冲`）就这样空转了约
+  40 小时。现在 drain 可撤销：`cancel_drain()` 让心跳的 `drain=false` 真正解除
+  摘流，drain 循环每轮检查该位并提前退出；`drain_exits` 标记 admin/SIGTERM 那
+  条要退进程的 drain（不可撤销，且在 drain 已结束后再收到 SIGTERM 时仍能起新
+  循环退出）。新增回归测试 `tests/edge_undrain.rs`。
 - **生产故障修复：edge 释放客户端后整进程 abort**（`edge/server.rs::session`）。
   console 自动均衡 / 管理端 release / drain 让 writer 先于 reader 结束时，
   `select!` 已经把 writer 的 `JoinHandle` poll 到完成，收尾又对同一个句柄做

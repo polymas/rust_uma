@@ -8,8 +8,10 @@ use tracing::{info, warn};
 use crate::console::registry::{Directive, Heartbeat};
 
 use super::{
-    COMMIT, SUBPROTOCOL, SharedState, VERSION, WS_PATH, hub::CLOSE_RESTART, now_ms,
-    server::start_drain,
+    COMMIT, SUBPROTOCOL, SharedState, VERSION, WS_PATH,
+    hub::CLOSE_RESTART,
+    now_ms,
+    server::{cancel_drain, start_drain},
 };
 
 pub fn build_heartbeat(state: &SharedState) -> Heartbeat {
@@ -139,8 +141,14 @@ pub fn apply(state: &SharedState, directive: Directive, interval: &mut Duration)
             released, "console asked to release clients (1012)"
         );
     }
-    if directive.drain && !state.stats.draining.load(Ordering::Relaxed) {
-        info!("console requested drain");
-        start_drain(state.clone(), false);
+    if directive.drain {
+        if !state.stats.draining.load(Ordering::Relaxed) {
+            info!("console requested drain");
+            start_drain(state.clone(), false);
+        }
+    } else if cancel_drain(state) {
+        // 面板点 undrain 只清 console 的 desired_drain；这里必须把本地这一位
+        // 也放掉，否则节点会一直 ready=false，永远回不到 public_list。
+        info!("console cleared drain; back in service");
     }
 }
