@@ -83,7 +83,14 @@ impl Processor {
             Ok(event) => event,
             Err(error) => {
                 Stats::increment(&self.stats.decode_errors);
-                debug!(%error, tx=%raw.transaction_hash, "discarding undecodable RPC log");
+                // `warn!` (not `debug!`) deliberately: production runs at the
+                // default `info` level, so a `debug!` here left
+                // `decode_errors_total` with no way to tell which tx or which
+                // `DecodeError` variant caused it — this is rare enough
+                // (well under 1% of received logs) that it belongs in the
+                // default-level journal, not gated behind a log level nobody
+                // enables in prod.
+                warn!(%error, tx=%raw.transaction_hash, "discarding undecodable RPC log");
                 return;
             }
         };
