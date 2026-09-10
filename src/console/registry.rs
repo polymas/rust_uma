@@ -2,6 +2,7 @@
 //! `disabled`/`note` 落盘，`desired_drain` 不落盘（一次性动作）。
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashMap},
     io,
     path::PathBuf,
@@ -9,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use super::now_ms;
@@ -254,7 +256,7 @@ impl Registry {
         outcome
     }
 
-    /// 手动释放优先；没有手动任务时看自动均衡：只有当前最忙的那个服务中节点会
+    /// 手动释放优先；没有手动任务时看自动均衡：只有当前最忙的那个可摘节点会
     /// 释放，且要超出"最空节点 × (1 + spread%)"这条线 ≥ min_excess。一次只动一个
     /// 节点是有意的——释放出去的连接会一起落到最空的那台，让每个节点各放一批很
     /// 容易把最空的一台直接顶成最忙的，来回搬。
@@ -274,7 +276,7 @@ impl Registry {
         if !inner.settings.auto_balance || node.desired_drain {
             return (0, "");
         }
-        if self.busiest_serving(inner, now).as_deref() != Some(node_id) {
+        if self.busiest_sheddable(inner, now).as_deref() != Some(node_id) {
             return (0, "");
         }
         let excess = self.balance_excess(inner, node_id, now);
@@ -288,20 +290,21 @@ impl Registry {
         (n, "auto-balance")
     }
 
-    /// 该节点相对"最空的服务中节点 × (1 + spread%)"的超出量；不在服务、只有一个
-    /// 节点、或别的节点没有余量时为 0（搬过去也接不住）。
+    /// 该节点相对"最空的服务中节点 × (1 + spread%)"的超出量；不可摘、没有别的
+    /// 节点接得住时为 0（搬过去也接不住）。
     ///
     /// 跟最空的节点比而不是跟平均值比：9 台里有 1 台空着，均值只被拉低 1/9，
     /// 按"均值 +10%"算谁都不超载，那台空节点永远填不回来（2026-09-09 生产上
     /// 就是这样，一台重启后卡在 20 个连接不动）。
+    ///
+    /// `me` 从 `sheddable` 里找而不是 `serving`：满员节点也要能被摘（见
+    /// `sheddable`）。搬去的目标只能是 `serving`——满员/摘流中的接不住。
     fn balance_excess(&self, inner: &Inner, node_id: &str, now: u64) -> i64 {
-        let serving = self.serving(inner, now);
-        let Some(me) = serving.iter().find(|n| n.heartbeat.node_id == node_id) else {
+        let sheddable = self.sheddable(inner, now);
+        let Some(me) = sheddable.iter().find(|n| n.heartbeat.node_id == node_id) else {
             return 0;
         };
-        if serving.len() < 2 {
-            return 0;
-        }
+        let serving = self.serving(inner, now);
         let others_spare: u64 = serving
             .iter()
             .filter(|n| n.heartbeat.node_id != node_id)
@@ -310,6 +313,8 @@ impl Registry {
         if others_spare == 0 {
             return 0;
         }
+        // 目标线看服务中的最空节点。`me` 自己满员时不在 `serving` 里，这个 min
+        // 自然就只看得到别人；`me` 在服务中时它也参与 min，跟以前一样。
         let emptiest = serving
             .iter()
             .map(|n| n.heartbeat.clients)
@@ -322,6 +327,7 @@ impl Registry {
         excess.min(half_gap).min(others_spare as i64)
     }
 
+    /// 正在服务（= 公开列表里、能接新连接）的节点，也就是搬运的目标集合。
     fn serving<'a>(&self, inner: &'a Inner, now: u64) -> Vec<&'a Node> {
         inner
             .nodes
@@ -332,10 +338,30 @@ impl Registry {
             .collect()
     }
 
-    /// 连接数最多的服务中节点（并列时取 node_id 小的，保证同一次心跳里只有一个
+    /// 可以被摘连接的节点：正在服务的，**加上已经满员的**。
+    ///
+    /// 满员必须算进来：`Full` 一旦被排除，节点触到 `max_clients` 的那一刻就从
+    /// 均衡的视野里消失了——既选不成 `busiest`，`balance_excess` 也直接返回 0，
+    /// 同时它又不在公开列表里、进不来新连接，于是只能永远卡在 N/N，等人工
+    /// release。2026-09-10 生产上 ubuntu3 就是这样卡在 1000/1000 三个多小时。
+    /// 摘流中（`Draining`）不算：那是另一套节流在放，别叠加。
+    fn sheddable<'a>(&self, inner: &'a Inner, now: u64) -> Vec<&'a Node> {
+        inner
+            .nodes
+            .values()
+            .filter(|n| {
+                matches!(
+                    self.status_of(n, admin_of(inner, &n.heartbeat.node_id), now),
+                    Status::Serving | Status::Full
+                )
+            })
+            .collect()
+    }
+
+    /// 连接数最多的可摘节点（并列时取 node_id 小的，保证同一次心跳里只有一个
     /// 节点被选中）。
-    fn busiest_serving(&self, inner: &Inner, now: u64) -> Option<String> {
-        self.serving(inner, now)
+    fn busiest_sheddable(&self, inner: &Inner, now: u64) -> Option<String> {
+        self.sheddable(inner, now)
             .into_iter()
             .max_by(|a, b| {
                 a.heartbeat
@@ -408,11 +434,26 @@ impl Registry {
         // 连接数最少的排最前：契约让下游取 nodes[0]，新连接就落到最空的节点。
         // `weight`（剩余容量）留着给按权重挑的下游，两者在各节点 max_clients
         // 相同时是同一个顺序。
-        nodes.sort_by(|a, b| {
-            a.clients
+        //
+        // 但"最空的唯一一台永远排第一"会造成羊群：一波重连的客户端读到同一份
+        // 列表，全都落到同一台，一次就能把它从平均水位顶到满员（2026-09-10 的
+        // ubuntu3）。所以把跟最空节点差在 spread% 以内的都算"同样空"，这一档
+        // 内部每次请求随机排序——下游照样取 nodes[0]，但取到的是这一档里的随机
+        // 一台。列表带 max-age 缓存，同一份缓存内还是同一个顺序，这只是把冲顶
+        // 摊薄，真正兜底的是满员之后自动均衡还能把它摘回来。
+        let emptiest = nodes.iter().map(|n| n.clients).min().unwrap_or(0);
+        let ceiling = emptiest + emptiest * inner.settings.balance_spread_pct as u64 / 100;
+        nodes.shuffle(&mut rand::rng());
+        nodes.sort_by(|a, b| match (a.clients <= ceiling, b.clients <= ceiling) {
+            // 同一档：保持上面 shuffle 的随机序（sort_by 是稳定排序）。
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => a
+                .clients
                 .cmp(&b.clients)
                 .then_with(|| b.weight.cmp(&a.weight))
-                .then_with(|| a.node_id.cmp(&b.node_id))
+                .then_with(|| a.node_id.cmp(&b.node_id)),
         });
         let (subprotocol, path) = inner
             .nodes
@@ -746,6 +787,69 @@ mod tests {
         let (_d2, solo) = registry();
         solo.heartbeat(hb("only", 900), "1.1.1.1".into());
         assert_eq!(solo.heartbeat(hb("only", 900), "1.1.1.1".into()).release, 0);
+    }
+
+    /// 生产回归（2026-09-10 ubuntu3）：节点满员后必须还能被自动均衡摘回来。
+    /// 老规则把 `Full` 排除在均衡视野外，节点一触到 max_clients 就既进不来新
+    /// 连接、也永远放不掉旧连接，只能人工 release。
+    #[test]
+    fn auto_balance_sheds_from_a_full_node() {
+        let hb = |id: &str, clients: u64| Heartbeat {
+            max_clients: 1000,
+            ..hb(id, clients)
+        };
+        let (_dir, reg) = registry();
+        reg.heartbeat(hb("idle", 260), "1.1.1.2".into());
+        reg.heartbeat(hb("full", 1000), "1.1.1.1".into());
+        assert_eq!(
+            reg.admin_list()
+                .iter()
+                .find(|v| v.heartbeat.node_id == "full")
+                .map(|v| v.status),
+            Some(Status::Full),
+        );
+        let o = reg.heartbeat(hb("full", 1000), "1.1.1.1".into());
+        assert_eq!((o.release, o.release_reason), (20, "auto-balance"));
+        // 满员节点不进公开列表，但仍要在面板上显示为超载。
+        let full = reg
+            .admin_list()
+            .into_iter()
+            .find(|v| v.heartbeat.node_id == "full")
+            .unwrap();
+        assert!(full.balance_excess > 0);
+        assert!(
+            !reg.public_list(Duration::from_secs(1))
+                .nodes
+                .iter()
+                .any(|n| n.node_id == "full")
+        );
+        // 别人也满了就没处搬。
+        reg.heartbeat(hb("idle", 1000), "1.1.1.2".into());
+        let o = reg.heartbeat(hb("full", 1000), "1.1.1.1".into());
+        assert_eq!(o.release, 0);
+    }
+
+    /// 跟最空节点差在 spread% 以内的节点排在同一档，档内每次请求随机排序，
+    /// 避免一波重连全部落到唯一"最空"的那台上。
+    #[test]
+    fn list_randomizes_within_the_spread_band() {
+        let hb = |id: &str, clients: u64| Heartbeat {
+            max_clients: 1000,
+            ..hb(id, clients)
+        };
+        let (_dir, reg) = registry();
+        for (i, n) in [200u64, 205, 210, 500].iter().enumerate() {
+            reg.heartbeat(hb(&format!("n{i}"), *n), "1.1.1.1".into());
+        }
+        let mut heads = BTreeMap::new();
+        for _ in 0..200 {
+            let list = reg.public_list(Duration::from_secs(1));
+            assert_eq!(list.nodes.len(), 4);
+            assert_eq!(list.nodes[3].node_id, "n3", "档外的按连接数升序垫底");
+            *heads.entry(list.nodes[0].node_id.clone()).or_insert(0) += 1;
+        }
+        // 200/205/210 都在 200×1.05=210 这条线内，三台都该轮到过。
+        assert_eq!(heads.len(), 3, "only saw {heads:?} at the head");
     }
 
     /// 生产场景回归：9 台节点，1 台刚重启是空的，自动均衡必须把它填回来，
