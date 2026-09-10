@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.8.0（2026-09-10，<待填>）
+## v0.8.0（2026-09-10，557493c）
 - **新增一级分类 `CATEGORY_MENTIONS`(=8) 和 6xxx 组的三个 `BET_TYPE`**
   （`proto/uma.proto` + `config/category_rules.json` + `src/category.rs`）。
   Polymarket 的 "Mentions" 家族（"某人在某场合会不会说某个词/说几次"，tag
