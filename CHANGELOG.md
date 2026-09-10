@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.7.1（2026-09-10，<待填>）
+## v0.7.1（2026-09-10，cb77f47）
 - **生产故障修复：edge 节点一旦满员就永远回不到均衡**（`console/registry.rs`）。
   `balance_excess` / `busiest_serving` 都只在 `Status::Serving` 的节点里挑，节点
   连接数触到 `max_clients` 的那一刻状态变成 `Full`，就同时从两边消失：既不在
