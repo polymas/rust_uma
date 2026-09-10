@@ -17,6 +17,16 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.8.1（2026-09-10，<待填>）
+- **解码失败的 RPC log 从 `debug!` 提到 `warn!`**（`pipeline.rs`）。生产跑在默认
+  `info` 级别，原来 `decode_errors_total` 涨了也看不出是哪条 tx、哪个
+  `DecodeError` 变体，只能事后开 `RUST_LOG=debug` 复现；实测占比很低（生产
+  `/healthz` 上 28/24970 ≈ 0.1%），不会刷屏。注意这跟 WORKFLOW 4.4 里"
+  `decode_errors_total` 涨得快是正常的"不是一回事：那条讲的是非 Polymarket 的
+  UMA 请求在富化阶段被过滤掉，这里是 ABI 解码本身失败。
+- 本次没有代码之外的改动，`v0.8.0` 的 Mentions 分类连同这条一起作为
+  `uma-console`/`uma-edge`（与主服务同一个 crate、同一个版本号）的部署基线。
+
 ## v0.8.0（2026-09-10，557493c）
 - **新增一级分类 `CATEGORY_MENTIONS`(=8) 和 6xxx 组的三个 `BET_TYPE`**
   （`proto/uma.proto` + `config/category_rules.json` + `src/category.rs`）。
