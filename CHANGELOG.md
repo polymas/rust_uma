@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.8.1（2026-09-10，<待填>）
+## v0.8.1（2026-09-10，d164d1a）
 - **解码失败的 RPC log 从 `debug!` 提到 `warn!`**（`pipeline.rs`）。生产跑在默认
   `info` 级别，原来 `decode_errors_total` 涨了也看不出是哪条 tx、哪个
   `DecodeError` 变体，只能事后开 `RUST_LOG=debug` 复现；实测占比很低（生产
