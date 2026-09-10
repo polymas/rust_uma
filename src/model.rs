@@ -97,7 +97,8 @@ impl PriceOutcome {
 }
 
 /// Top-level market category, derived once at enrichment time from Gamma tag
-/// IDs — see `crate::category::classify`. See the doc comment on
+/// IDs (plus one question-text fallback for `Mentions`) — see
+/// `crate::category::classify`. See the doc comment on
 /// `UmaEvent.category` in `proto/uma.proto` for the derivation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Category {
@@ -109,6 +110,7 @@ pub enum Category {
     Culture,
     Weather,
     Other,
+    Mentions,
 }
 
 impl Category {
@@ -122,6 +124,7 @@ impl Category {
             Self::Culture => pb::Category::Culture as i32,
             Self::Weather => pb::Category::Weather as i32,
             Self::Other => pb::Category::Other as i32,
+            Self::Mentions => pb::Category::Mentions as i32,
         }
     }
 
@@ -134,6 +137,7 @@ impl Category {
             pb::Category::Culture => Self::Culture,
             pb::Category::Weather => Self::Weather,
             pb::Category::Other => Self::Other,
+            pb::Category::Mentions => Self::Mentions,
             pb::Category::Unspecified => Self::Unspecified,
         }
     }
@@ -173,6 +177,10 @@ pub enum BetType {
     AwardWinner,
     MediaMetricRange,
     CultureProp,
+    // Mentions block.
+    MentionTerm,
+    MentionCount,
+    MentionProp,
 }
 
 impl BetType {
@@ -201,6 +209,9 @@ impl BetType {
             Self::AwardWinner => pb::BetType::AwardWinner as i32,
             Self::MediaMetricRange => pb::BetType::MediaMetricRange as i32,
             Self::CultureProp => pb::BetType::CultureProp as i32,
+            Self::MentionTerm => pb::BetType::MentionTerm as i32,
+            Self::MentionCount => pb::BetType::MentionCount as i32,
+            Self::MentionProp => pb::BetType::MentionProp as i32,
         }
     }
 
@@ -228,6 +239,9 @@ impl BetType {
             pb::BetType::AwardWinner => Self::AwardWinner,
             pb::BetType::MediaMetricRange => Self::MediaMetricRange,
             pb::BetType::CultureProp => Self::CultureProp,
+            pb::BetType::MentionTerm => Self::MentionTerm,
+            pb::BetType::MentionCount => Self::MentionCount,
+            pb::BetType::MentionProp => Self::MentionProp,
             pb::BetType::Unspecified => Self::Unspecified,
         }
     }

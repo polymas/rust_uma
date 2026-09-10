@@ -1,7 +1,18 @@
 {
   "_comment": "匹配/加载逻辑见 src/category.rs；每条规则是怎么从真实抓到的 Gamma/链上数据推出来的，见相关会话记录。改规则改这个文件，同时去 src/category.rs 补一条回归测试，不要绕开规则条目直接改编译后的匹配逻辑。bet_type_groups 按一级分类分组——每个 Category 只会用自己那一组里的 tag/sportsMarketType/question 规则，不会跟别的分类混着匹配（历史教训：体育的 OUTRIGHT 文本规则 \"Will X win the Y?\" 曾经是全局共享的，能匹配到 \"Will Sarah Huckabee Sanders win the 2028 Republican presidential nomination?\" 这种政治选举市场，把 bet_type 错判成体育组的值）。",
 
+  "_comment_category_text_rules": "一级分类唯一的文本规则，在 tag_rules 之前跑，命中即定案（会盖过 tag）。只为 MENTIONS 存在：这一类由玩法而不是话题定义，而实测 2025 年以后仍有约 3% 的市场压根不挂 100343——要么是单市场型（\"Will Trump say \\\"mog\\\" in 2024?\" 这种不成事件簇的），要么是偶发漏标（EA 财报电话会只挂 Finance、UFC 解说员只挂 UFC/Sports）。这些漏标市场都带 Trump/Culture/Politics 之类的 tag，所以只在 tag 落空时兜底救不了它们，必须让文本规则优先。exclude_regex 是实测出来的唯一一类误伤：\"Fear & Greed Index says \\\"Extreme Fear\\\" on Friday?\" 是指数读数，不是有人说话。",
+
+  "category_text_rules": [
+    {
+      "regex": "(\\b(says?|said|mentions?|posts?|tweets?)\\b[^?]*[\"\u201c\u2018])|(\\b(says?|said|mentions?)\\b[^?]*\\b(\\d+\\s*(\\+|or more)|times)\\b)",
+      "exclude_regex": "\\bindex says\\b",
+      "category": "MENTIONS"
+    }
+  ],
+
   "tag_rules": [
+    { "tag_id": 100343, "category": "MENTIONS" },
     { "tag_id": 64, "category": "ESPORTS" },
     { "tag_id": 1, "category": "SPORTS" },
     { "tag_id": 84, "category": "WEATHER" },
@@ -99,6 +110,16 @@
       "question_text_rules": [
         { "regex": "^Will\\s.+\\sbe\\sthe\\s.+\\?$", "bet_type": "AWARD_WINNER" },
         { "regex": "\\bbetween\\s*[\\d,.]+\\S*\\s+and\\s+[\\d,.]+|\\b(less than|more than)\\s*[\\d,.]+\\s*(million|m|k)?\\s*(views|gross)\\b", "bet_type": "MEDIA_METRIC_RANGE" }
+      ]
+    },
+    {
+      "categories": ["MENTIONS"],
+      "fallback_bet_type": "MENTION_PROP",
+      "tag_bet_type_rules": [],
+      "sports_market_type_rules": [],
+      "question_text_rules": [
+        { "regex": "\\btimes\\b|\\b\\d+\\s*(\\+|or more|or fewer|or less)", "bet_type": "MENTION_COUNT" },
+        { "regex": "\\b(says?|said|posts?|tweets?|mentions?)\\b|\\bbe in the (headlines|manifesto)\\b", "bet_type": "MENTION_TERM" }
       ]
     }
   ]

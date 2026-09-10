@@ -187,9 +187,10 @@ const PRICE_OUTCOME = { 0: "unspecified", 1: "token0", 2: "token1", 3: "tie" };
 // Category/BetType：proto/uma.proto 里 category=13、bet_type=14，纯本地从
 // Gamma tag/sportsMarketType/question 派生（见 src/category.rs），不查外部
 // API，跟上面几个枚举一样直接按 proto 里的顺序写死映射表。
-const CATEGORY = { 0: "unspecified", 1: "sports", 2: "esports", 3: "politics", 4: "crypto", 5: "culture", 6: "weather", 7: "other" };
+const CATEGORY = { 0: "unspecified", 1: "sports", 2: "esports", 3: "politics", 4: "crypto", 5: "culture", 6: "weather", 7: "other", 8: "mentions" };
 // CCCBBB 编码：千位分组 x1000 + 组内三位序号，1xxx = Sports/Esports、
-// 2xxx = Weather、3xxx = Crypto、4xxx = Politics、5xxx = Culture（各自带自
+// 2xxx = Weather、3xxx = Crypto、4xxx = Politics、5xxx = Culture、
+// 6xxx = Mentions（各自带自
 // 己的兜底值 xxx_prop/weather_other，不共用跨分组的兜底）——分组号是人工指
 // 定的、跟 CATEGORY 自己的枚举值无关（比如 Sports 和 Esports 是两个不同的
 // CATEGORY 值，但共用同一个 1xxx 分组，因为下注类型词汇对两者完全一样）。
@@ -201,6 +202,7 @@ const BET_TYPE = {
   3001: "price_target", 3002: "price_threshold", 3003: "up_down", 3004: "crypto_prop",
   4001: "election_winner", 4002: "fed_rate_decision", 4003: "tweet_count", 4004: "politics_prop",
   5001: "award_winner", 5002: "media_metric_range", 5003: "culture_prop",
+  6001: "mention_term", 6002: "mention_count", 6003: "mention_prop",
 };
 
 function decodeUmaEvent(buf) {
@@ -317,6 +319,7 @@ const OUTCOME_LABEL = { token0: "买 Token0", token1: "买 Token1", tie: "50/50"
 const CATEGORY_LABEL = {
   unspecified: "—", sports: "体育", esports: "电竞", politics: "政治",
   crypto: "加密", culture: "文化", weather: "天气", other: "其他",
+  mentions: "提及",
 };
 const BET_TYPE_LABEL = {
   unspecified: "—", moneyline: "胜负", spread: "让分", over_under: "大小分",
@@ -326,6 +329,7 @@ const BET_TYPE_LABEL = {
   price_target: "到价", price_threshold: "价格阈值", up_down: "涨跌", crypto_prop: "其他盘口",
   election_winner: "选举获胜", fed_rate_decision: "美联储利率决议", tweet_count: "推文数量", politics_prop: "其他盘口",
   award_winner: "登顶", media_metric_range: "数据区间", culture_prop: "其他盘口",
+  mention_term: "是否提及", mention_count: "提及次数", mention_prop: "其他盘口",
 };
 
 // Polymarket tag id -> label. 纯客户端浏览器直接拉 Polymarket 自己的公开

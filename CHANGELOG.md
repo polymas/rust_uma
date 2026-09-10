@@ -17,6 +17,45 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.8.0（2026-09-10，<待填>）
+- **新增一级分类 `CATEGORY_MENTIONS`(=8) 和 6xxx 组的三个 `BET_TYPE`**
+  （`proto/uma.proto` + `config/category_rules.json` + `src/category.rs`）。
+  Polymarket 的 "Mentions" 家族（"某人在某场合会不会说某个词/说几次"，tag
+  100343，全部走 UMA adapter 结算、都会进这条流）原先被打散在四个一级分类
+  里：2025 年至今 363 个 event 判成 POLITICS、58 个 CULTURE、11 个 SPORTS、
+  8 个 CRYPTO，还有 86 个（$36.7M，含 Powell 发布会、财报电话会、Trump 就职
+  演讲 mentions）因为只挂 `Finance`/`Earnings Calls`/`Fed` 这类 tag 而掉进
+  `CATEGORY_OTHER`、`bet_type` 恒为 UNSPECIFIED。这个家族由玩法而不是话题定
+  义，所以 tag 100343 排在 `tag_rules` 最前、盖过 Sports/Politics/Culture/
+  Crypto。二级是 `MENTION_TERM`(6001，是否说到)/`MENTION_COUNT`(6002，说 N
+  次以上或区间)/`MENTION_PROP`(6003，兜底：演讲时长 O/U、"remarks not air")。
+  **下游影响：按 `CATEGORY_POLITICS` 过滤的消费者从此收不到这批市场，要改成
+  `category in (POLITICS, MENTIONS)` 或单订 `CATEGORY_MENTIONS`；按
+  `tag_ids` 含 100343 过滤会漏掉下面那条文本兜底捞回的部分，应该用
+  `category` 字段。**
+- **一级分类第一次引入 question 文本规则（`category_text_rules`，跑在所有
+  tag 规则之前、会盖过 tag）**。实测 2025 年及以后仍有约 3% 的 mentions 市场
+  压根不挂 100343：单市场型的（`Will Trump mention "South Park" by Sunday?`
+  这种不成事件簇的）和偶发漏标的（EA 财报电话会只挂 `Finance`、UFC 解说员只
+  挂 `UFC/Sports`）。这些都带话题 tag，"tag 落空才兜底"救不了，只能让文本规
+  则优先。用 2025+ 的 1685 个 event / 25941 个 market 全量验证：带 tag 的
+  14839 条全部落进 6xxx，文本兜底额外捞回 95 条；另取 1780 条 2025+ 的体育/
+  政治/加密/文化/天气/电竞市场做对照集，零误命中；全语料唯一的误伤
+  `Fear & Greed Index says "Extreme Fear"`（指数读数不是有人说话）由
+  `exclude_regex` 挡掉。
+- **修掉一个会静默吃掉分类的真实数据坑**（`src/category.rs`）：Gamma 给
+  "NFL Sunday Mentions" 的解说员市场统统盖了假的 `sportsMarketType:
+  "moneyline"`（2025+ 样本里 85 条，如
+  `curl https://gamma-api.polymarket.com/markets/619325?include_tag=true`）。
+  `bet_type_for` 原先只要 `sportsMarketType` 非空就短路进该组的
+  sportsMarketType 规则，Mentions 组这份规则是空的，会直接掉到组兜底、永远
+  够不着 question 规则。现在只有该组真有 sportsMarketType 规则时才走这条
+  路径。
+- 面板与契约同步：`internal/api/llms.txt`、`internal/console/index.html`、
+  `internal/api/dashboard.html` 的枚举/标签表都加了 mentions（显示「提及」）。
+  12 条回归测试全部用 2025 年及以后的真实 Gamma 市场，注释里带
+  `curl .../markets/<id>?include_tag=true` 出处。
+
 ## v0.7.1（2026-09-10，cb77f47）
 - **生产故障修复：edge 节点一旦满员就永远回不到均衡**（`console/registry.rs`）。
   `balance_excess` / `busiest_serving` 都只在 `Status::Serving` 的节点里挑，节点

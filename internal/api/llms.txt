@@ -87,8 +87,17 @@ Gamma 的 tag/`sportsMarketType`/`question` 派生（`src/category.rs` +
 
 `category`（一级分类）：`CATEGORY_SPORTS`/`CATEGORY_ESPORTS`/
 `CATEGORY_WEATHER`/`CATEGORY_CRYPTO`/`CATEGORY_POLITICS`/`CATEGORY_CULTURE`/
-`CATEGORY_OTHER`（已知 tag，但不属于前面任何一类）/`CATEGORY_UNSPECIFIED`
-（没有富化上，或市场确实没打任何已知 tag）。
+`CATEGORY_MENTIONS`/`CATEGORY_OTHER`（已知 tag，但不属于前面任何一类）/
+`CATEGORY_UNSPECIFIED`（没有富化上，或市场确实没打任何已知 tag）。
+
+`CATEGORY_MENTIONS` 是唯一一个不只看 tag 的一级分类，也是唯一一个会盖过其他
+tag 的：它对应 Polymarket 自己的 "Mentions" 家族（tag 100343，"某人在某场合
+会不会说某个词/说几次"），这个家族由玩法而不是话题定义，同一批市场同时挂着
+Politics/Culture/Sports/Crypto 的 tag。tag 100343 命中即判 `MENTIONS`；此外还
+有一条 question 文本规则在所有 tag 规则之前跑，用来捞回实测约 3% 压根没挂
+100343 的成员（单市场型的 `Will Trump mention "South Park" by Sunday?`、只挂
+Finance 的财报电话会 mentions 等）。所以订阅方按 `CATEGORY_POLITICS` 过滤时
+拿不到"Trump 会不会说某个词"这类市场，要另外订 `CATEGORY_MENTIONS`。
 
 `bet_type`（二级下注类型）数值按 `CCCBBB` 编码——千位是分组号，同一个
 `category` 的 `bet_type` 一定落在同一个千位区间里，且每个分组都有自己的
@@ -110,6 +119,9 @@ Gamma 的 tag/`sportsMarketType`/`question` 派生（`src/category.rs` +
 - `5xxx` Culture：`AWARD_WINNER`（"will X be the Y"式夺魁/登顶，如票房冠
   军、榜单第一）/`MEDIA_METRIC_RANGE`（票房/播放量等指标分档）/
   `CULTURE_PROP`（兜底）。
+- `6xxx` Mentions：`MENTION_TERM`（某个词/词组会不会被说到，二元不计数）/
+  `MENTION_COUNT`（说 N 次以上或落在计数区间）/`MENTION_PROP`（兜底：演讲
+  时长大小分、"remarks not air" 这种活动没发生的腿）。
 - `BET_TYPE_UNSPECIFIED`（=0）：`category` 是 `CATEGORY_UNSPECIFIED`/
   `CATEGORY_OTHER`（没有对应的下注类型词表），或者虽然是可下注类目但一点
   信号都拿不到（`sportsMarketType`/`question` 都是空）。

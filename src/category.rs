@@ -34,7 +34,7 @@ pub fn classify(
     question: Option<&str>,
 ) -> (Category, BetType) {
     let rules = &*RULES;
-    let category = rules.category_for(tag_ids);
+    let category = rules.category_for(tag_ids, question);
     let bet_type = rules
         .bet_type_groups
         .iter()
@@ -46,8 +46,20 @@ pub fn classify(
 }
 
 struct CompiledRules {
+    category_text_rules: Vec<CategoryTextRule>,
     tag_rules: Vec<(u32, Category)>,
     bet_type_groups: Vec<BetTypeGroup>,
+}
+
+/// A `Category` decided from the market `question` alone, checked *before*
+/// any tag rule and winning over all of them. Exists for exactly one
+/// category — see `_comment_category_text_rules` in
+/// `config/category_rules.json` for why the Mentions family can't be
+/// recognised by tags alone, and why a tags-first ordering wouldn't help.
+struct CategoryTextRule {
+    regex: Regex,
+    exclude_regex: Option<Regex>,
+    category: Category,
 }
 
 /// One `BetType` numeric block (see the doc comment on `BetType` in
@@ -75,6 +87,15 @@ impl CompiledRules {
     fn parse(json: &str) -> Self {
         let raw: RawRules =
             serde_json::from_str(json).expect("config/category_rules.json must be valid JSON");
+        let category_text_rules = raw
+            .category_text_rules
+            .into_iter()
+            .map(|rule| CategoryTextRule {
+                regex: compile_question_regex(&rule.regex),
+                exclude_regex: rule.exclude_regex.as_deref().map(compile_question_regex),
+                category: parse_category(&rule.category),
+            })
+            .collect();
         let tag_rules = raw
             .tag_rules
             .into_iter()
@@ -86,12 +107,25 @@ impl CompiledRules {
             .map(BetTypeGroup::parse)
             .collect();
         Self {
+            category_text_rules,
             tag_rules,
             bet_type_groups,
         }
     }
 
-    fn category_for(&self, tag_ids: &[u32]) -> Category {
+    fn category_for(&self, tag_ids: &[u32], question: Option<&str>) -> Category {
+        if let Some(question) = question {
+            for rule in &self.category_text_rules {
+                if rule.regex.is_match(question)
+                    && !rule
+                        .exclude_regex
+                        .as_ref()
+                        .is_some_and(|excluded| excluded.is_match(question))
+                {
+                    return rule.category;
+                }
+            }
+        }
         for &(tag_id, category) in &self.tag_rules {
             if tag_ids.contains(&tag_id) {
                 return category;
@@ -126,17 +160,10 @@ impl BetTypeGroup {
             .question_text_rules
             .into_iter()
             .map(|rule| {
-                // Case-insensitive: the exact capitalization of a Gamma
-                // `question` string isn't a contract, and rules should keep
-                // matching regardless (e.g. `hurricane` shows up both
-                // lowercase mid-sentence and capitalized at a title's start).
-                let compiled = Regex::new(&format!("(?i){}", rule.regex)).unwrap_or_else(|error| {
-                    panic!(
-                        "config/category_rules.json: invalid regex {:?}: {error}",
-                        rule.regex
-                    )
-                });
-                (compiled, parse_bet_type(&rule.bet_type))
+                (
+                    compile_question_regex(&rule.regex),
+                    parse_bet_type(&rule.bet_type),
+                )
             })
             .collect();
         Self {
@@ -159,7 +186,19 @@ impl BetTypeGroup {
                 return bet_type;
             }
         }
-        if let Some(sports_market_type) = sports_market_type {
+        // `!self.sports_market_type_rules.is_empty()` is load-bearing, not a
+        // micro-optimization: Gamma stamps a *bogus* `sportsMarketType` on
+        // markets that aren't game bets at all — every "NFL Sunday Mentions"
+        // announcer market carries `"moneyline"` (e.g.
+        // `curl https://gamma-api.polymarket.com/markets/619325?include_tag=true`
+        // → "Will the announcers say \"Tush push\" during 49ers vs Rams
+        // game?"). Without this guard those short-circuit into the Mentions
+        // group's (empty) sportsMarketType rules and land on the group
+        // fallback, never reaching the question rules that actually classify
+        // them.
+        if let Some(sports_market_type) =
+            sports_market_type.filter(|_| !self.sports_market_type_rules.is_empty())
+        {
             let lower = sports_market_type.to_lowercase();
             return self
                 .sports_market_type_rules
@@ -180,8 +219,16 @@ impl BetTypeGroup {
 
 #[derive(Deserialize)]
 struct RawRules {
+    category_text_rules: Vec<RawCategoryTextRule>,
     tag_rules: Vec<RawTagCategoryRule>,
     bet_type_groups: Vec<RawBetTypeGroup>,
+}
+
+#[derive(Deserialize)]
+struct RawCategoryTextRule {
+    regex: String,
+    exclude_regex: Option<String>,
+    category: String,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +264,16 @@ struct RawRegexRule {
     bet_type: String,
 }
 
+/// Case-insensitive: the exact capitalization of a Gamma `question` string
+/// isn't a contract, and rules should keep matching regardless (e.g.
+/// `hurricane` shows up both lowercase mid-sentence and capitalized at a
+/// title's start).
+fn compile_question_regex(regex: &str) -> Regex {
+    Regex::new(&format!("(?i){regex}")).unwrap_or_else(|error| {
+        panic!("config/category_rules.json: invalid regex {regex:?}: {error}")
+    })
+}
+
 fn parse_category(name: &str) -> Category {
     match name {
         "SPORTS" => Category::Sports,
@@ -225,6 +282,7 @@ fn parse_category(name: &str) -> Category {
         "CRYPTO" => Category::Crypto,
         "CULTURE" => Category::Culture,
         "WEATHER" => Category::Weather,
+        "MENTIONS" => Category::Mentions,
         "OTHER" => Category::Other,
         "UNSPECIFIED" => Category::Unspecified,
         other => panic!("config/category_rules.json: unknown category {other:?}"),
@@ -255,6 +313,9 @@ fn parse_bet_type(name: &str) -> BetType {
         "AWARD_WINNER" => BetType::AwardWinner,
         "MEDIA_METRIC_RANGE" => BetType::MediaMetricRange,
         "CULTURE_PROP" => BetType::CultureProp,
+        "MENTION_TERM" => BetType::MentionTerm,
+        "MENTION_COUNT" => BetType::MentionCount,
+        "MENTION_PROP" => BetType::MentionProp,
         "UNSPECIFIED" => BetType::Unspecified,
         other => panic!("config/category_rules.json: unknown bet_type {other:?}"),
     }
@@ -686,6 +747,209 @@ mod tests {
         assert_eq!(
             classify(&[596], None, Some("Will Jesus Christ return before 2027?")),
             (Category::Culture, BetType::CultureProp)
+        );
+    }
+
+    // The Mentions fixtures below are all real Gamma markets created in 2025
+    // or later, fetched via
+    // `curl https://gamma-api.polymarket.com/markets/<id>?include_tag=true`
+    // in the session that added this category (see docs/WORKFLOW.md 1.2).
+
+    #[test]
+    fn tagged_mention_with_a_count_is_mention_count() {
+        // https://gamma-api.polymarket.com/markets/4199672?include_tag=true
+        // tags [596, 105481, 126, 100343, 2] — tag 100343 must win over the
+        // Politics/Culture tags on the same market.
+        assert_eq!(
+            classify(
+                &[2, 126, 596, 100343, 105481],
+                None,
+                Some(
+                    r#"Will JD Vance say "America" or "American" 20+ times during RNC Convention?"#
+                )
+            ),
+            (Category::Mentions, BetType::MentionCount)
+        );
+    }
+
+    #[test]
+    fn spelled_out_count_is_still_mention_count() {
+        // https://gamma-api.polymarket.com/markets/1096572?include_tag=true
+        // "at least ten times" — no digit anywhere near the count, which is
+        // why the MENTION_COUNT rule matches a bare `times` too.
+        assert_eq!(
+            classify(
+                &[2, 126, 246, 100_265, 100_343, 101_669],
+                None,
+                Some(
+                    r#"Will Donald Trump say "Venezuela" at least ten times during his Mar-a-Lago press conference on Venezuela on Saturday?"#
+                )
+            ),
+            (Category::Mentions, BetType::MentionCount)
+        );
+    }
+
+    #[test]
+    fn weekly_mention_date_range_is_not_a_count() {
+        // https://gamma-api.polymarket.com/markets/681127?include_tag=true
+        // Regression: an earlier MENTION_COUNT rule accepted `\d+\s*[-–]\s*\d+`
+        // as a count range, which swallowed the "(November 17 – 23)" window
+        // that every weekly mentions market carries — 235 markets in the
+        // 2025+ sample were misfiled as MENTION_COUNT because of it.
+        assert_eq!(
+            classify(
+                &[2, 126, 100_343],
+                None,
+                Some(
+                    r#"Will Trump say "MAGA" or "Make America Great Again" this week? (November 17 – 23)"#
+                )
+            ),
+            (Category::Mentions, BetType::MentionTerm)
+        );
+    }
+
+    #[test]
+    fn tagged_mention_without_a_count_is_mention_term() {
+        // https://gamma-api.polymarket.com/markets/4200126?include_tag=true
+        // tags [1401, 101999, 100343, 102451] — an earnings-call mention;
+        // none of the other tags maps to a category, so before tag 100343
+        // existed this whole family fell through to Category::Other.
+        assert_eq!(
+            classify(
+                &[1401, 100_343, 101_999, 102_451],
+                None,
+                Some(r#"Will Macy's say "Tax" during earnings call?"#)
+            ),
+            (Category::Mentions, BetType::MentionTerm)
+        );
+    }
+
+    #[test]
+    fn passive_headline_mention_is_mention_term() {
+        // https://gamma-api.polymarket.com/markets/4231050?include_tag=true
+        // The NYT front-page family words it as "be in the headlines", with
+        // no verb of speech at all.
+        assert_eq!(
+            classify(
+                &[2, 596, 100_343, 103_236],
+                None,
+                Some(r#"Will "Trump" be in the headlines this week?"#)
+            ),
+            (Category::Mentions, BetType::MentionTerm)
+        );
+    }
+
+    #[test]
+    fn mentions_no_show_leg_is_mention_prop() {
+        // https://gamma-api.polymarket.com/markets/4199691?include_tag=true
+        // Every mentions event carries this "the thing never happened" leg.
+        assert_eq!(
+            classify(
+                &[2, 126, 596, 100_343, 105_481],
+                None,
+                Some("Will JD Vance’s remarks not air?")
+            ),
+            (Category::Mentions, BetType::MentionProp)
+        );
+    }
+
+    #[test]
+    fn bogus_sports_market_type_still_reaches_the_mentions_question_rules() {
+        // https://gamma-api.polymarket.com/markets/619325?include_tag=true
+        // Gamma stamps `sportsMarketType: "moneyline"` on every "NFL Sunday
+        // Mentions" announcer market even though nothing about it is a game
+        // bet. The Mentions group has no sportsMarketType rules, so
+        // `bet_type_for` has to fall through to the question rules instead of
+        // short-circuiting onto the group fallback.
+        assert_eq!(
+            classify(
+                &[1, 10, 450, 100_343],
+                Some("moneyline"),
+                Some(
+                    r#"Will the announcers say "Tush push" during 49ers vs Rams game? (October 2)"#
+                )
+            ),
+            (Category::Mentions, BetType::MentionTerm)
+        );
+    }
+
+    #[test]
+    fn untagged_single_market_mention_is_caught_by_the_text_rule() {
+        // https://gamma-api.polymarket.com/markets/567509?include_tag=true
+        // tags [2, 126, 596, 101191, 102438, 102439, 102440] — no 100343.
+        // One-off mentions that don't form an event cluster systematically
+        // miss the tag, and they always carry a topic tag, so the text rule
+        // has to win over `tag_rules` (this one would be Politics otherwise).
+        assert_eq!(
+            classify(
+                &[2, 126, 596, 101_191, 102_438, 102_439, 102_440],
+                None,
+                Some(r#"Will Trump mention "South Park" by Sunday?"#)
+            ),
+            (Category::Mentions, BetType::MentionTerm)
+        );
+    }
+
+    #[test]
+    fn untagged_earnings_call_mention_is_caught_by_the_text_rule() {
+        // https://gamma-api.polymarket.com/markets/1168467?include_tag=true
+        // tags [120] — the EA earnings-call mentions event was never tagged
+        // 100343 at all, unlike its Macy's/NVIDIA siblings above.
+        assert_eq!(
+            classify(
+                &[120],
+                None,
+                Some(r#"Will EA say "Mobile" during earnings call?"#)
+            ),
+            (Category::Mentions, BetType::MentionTerm)
+        );
+    }
+
+    #[test]
+    fn index_reading_is_excluded_from_the_mentions_text_rule() {
+        // https://gamma-api.polymarket.com/markets/527593?include_tag=true
+        // "Fear & Greed Index says ..." is a reading of an indicator, not
+        // anyone saying anything — the only false positive the text rule
+        // produced across the whole 2025+ sample, hence `exclude_regex`.
+        assert_eq!(
+            classify(
+                &[2, 100_328, 101_757],
+                None,
+                Some(r#"Fear & Greed Index says "Extreme Fear" on Friday?"#)
+            ),
+            (Category::Politics, BetType::PoliticsProp)
+        );
+    }
+
+    #[test]
+    fn tweet_count_is_not_swallowed_by_the_mentions_text_rule() {
+        // https://gamma-api.polymarket.com/markets/539615?include_tag=true
+        // "tweet N times" counts posts, not utterances of a term — the text
+        // rule only fires on say/said/mention (+ a quoted term for posts), so
+        // this family must stay out of Category::Mentions.
+        let (category, _) = classify(
+            &[282, 596, 972],
+            None,
+            Some("Will Elon tweet 100–124 times April 25–May 2?"),
+        );
+        assert_ne!(category, Category::Mentions);
+    }
+
+    #[test]
+    fn quoted_tweet_term_is_a_mention_but_a_tweet_count_is_not() {
+        // https://gamma-api.polymarket.com/markets/2296215?include_tag=true
+        // tags [21, 1329, 972, 105289] — "tweet <quoted term>" is the same
+        // bet as "post <quoted term>", so the text rule takes it away from
+        // Crypto. The count branch deliberately does NOT list tweet/post:
+        // "tweet 100–124 times" counts posts, not utterances of a term (see
+        // `tweet_count_is_not_swallowed_by_the_mentions_text_rule`).
+        assert_eq!(
+            classify(
+                &[21, 972, 1329, 105_289],
+                None,
+                Some(r#"Will Elon Musk tweet "Hyperliquid" by June 30, 2026?"#)
+            ),
+            (Category::Mentions, BetType::MentionTerm)
         );
     }
 }

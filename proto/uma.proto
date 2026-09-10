@@ -97,8 +97,9 @@ enum PriceOutcome {
   PRICE_OUTCOME_TIE = 3;
 }
 
-// Top-level market category. Derived from Gamma tag IDs — see
-// `category::classify` and `config/category_rules.json`.
+// Top-level market category. Derived from Gamma tag IDs, plus one
+// question-text fallback for CATEGORY_MENTIONS (see `category::classify` and
+// `config/category_rules.json`).
 enum Category {
   CATEGORY_UNSPECIFIED = 0;
   CATEGORY_SPORTS = 1;
@@ -108,6 +109,14 @@ enum Category {
   CATEGORY_CULTURE = 5;
   CATEGORY_WEATHER = 6;
   CATEGORY_OTHER = 7; // known tag(s), but none matched a category above
+  // "Will X say <term> (N+ times) during Y" — Polymarket's own top-level
+  // "Mentions" family (tag 100343). Deliberately wins over every tag rule
+  // above: the family is defined by its bet mechanics, not its topic, and
+  // the same event carries Politics/Culture/Sports/Crypto tags depending on
+  // who is talking. This is also the one category with a question-text
+  // fallback, because roughly 3% of the family never gets tag 100343 —
+  // see `config/category_rules.json`.
+  CATEGORY_MENTIONS = 8;
 }
 
 // Bet-type sub-classification. Meaningful for every Category except
@@ -137,7 +146,8 @@ enum Category {
 //   3xxx  Crypto
 //   4xxx  Politics
 //   5xxx  Culture
-//   6xxx  next bettable Category, if one is ever added, then 7xxx, ...
+//   6xxx  Mentions
+//   7xxx  next bettable Category, if one is ever added, then 8xxx, ...
 // Each group carries its own catch-all ("known category, no specific bucket
 // fit" — BET_TYPE_SPORTS_PROP / BET_TYPE_WEATHER_OTHER) rather than sharing
 // one cross-group value, so "every BetType for group X falls in X's 1000s"
@@ -184,4 +194,11 @@ enum BetType {
   BET_TYPE_MEDIA_METRIC_RANGE = 5002; // will a release's metric (box office gross, view count, ...) land in a given range
   BET_TYPE_CULTURE_PROP = 5003; // known culture bet, no more specific bucket fit
   // 5004-5999 reserved for future Culture bet types.
+
+  // Group 6xxx: Mentions
+  BET_TYPE_MENTION_TERM = 6001; // will the term be said at all (binary, no count)
+  BET_TYPE_MENTION_COUNT = 6002; // will the term be said N+ times / within a count range
+  BET_TYPE_MENTION_PROP = 6003; // known mentions bet, no more specific bucket fit (speech length O/U, "remarks not air", ...)
+  // 6004-6999 reserved for future Mentions bet types (e.g. "which term is
+  // said most", a ranking shape that has only appeared once so far).
 }
