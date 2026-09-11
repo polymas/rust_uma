@@ -52,11 +52,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Vec::new()
         });
     let mut initial_sequence = 0;
+    // Only enriched events were ever broadcast (see `Processor::process`), so
+    // this — not `initial_sequence` — is the newest cursor a downstream can
+    // legitimately hold from the previous process.
+    let mut last_broadcast_sequence = 0;
     for event in recovered {
         initial_sequence = initial_sequence.max(event.sequence);
+        if event.enrichment.is_some() {
+            last_broadcast_sequence = last_broadcast_sequence.max(event.sequence);
+        }
         events.insert(event);
     }
-    let frames = Arc::new(FrameHub::new(config.frame_ring_capacity));
+    let frames = Arc::new(FrameHub::resuming_after(
+        config.frame_ring_capacity,
+        last_broadcast_sequence,
+    ));
     let stats = Arc::new(Stats::default());
     stats
         .catalog_markets

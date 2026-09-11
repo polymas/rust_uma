@@ -6,6 +6,7 @@ pub mod edge;
 pub mod enrichment;
 pub mod hub;
 pub mod model;
+pub mod net;
 pub mod pipeline;
 pub mod stats;
 pub mod storage;

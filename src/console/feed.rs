@@ -93,10 +93,21 @@ impl Feed {
     }
 }
 
+/// tinyuma closes with 1013 when the requested cursor can't be replayed.
+const CURSOR_REJECTED: u16 = 1013;
+
+enum FeedEnd {
+    CursorRejected,
+    Other(String),
+}
+
 pub async fn run_feed(state: SharedState) {
     let url = state.config.upstream_ws.clone();
     let mut backoff = Duration::from_secs(1);
     let mut first = true;
+    // 回拉的历史被拒过一次，下一次就只要实时：否则每次重连都用"最新序号 − 60"
+    // 这个同样够不着的游标，2026-09-10 tinyuma 重启后面板因此连续被拒 12 分钟。
+    let mut skip_warmup = false;
     loop {
         if !first {
             state.feed.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -115,14 +126,18 @@ pub async fn run_feed(state: SharedState) {
             tokio::time::sleep(Duration::from_secs(1)).await;
             latest = state.upstream.snapshot().latest_sequence;
         }
-        let dial = if latest > WARMUP_SEQUENCES {
-            format!("{url}?after_sequence={}", latest - WARMUP_SEQUENCES)
-        } else {
-            url.clone()
-        };
+        let dial = dial_url(&url, latest, skip_warmup);
+        skip_warmup = false;
         match session(&state, &dial).await {
             Ok(()) => info!(url, "panel feed closed by upstream"),
-            Err(error) => warn!(url, %error, "panel feed session ended"),
+            Err(FeedEnd::CursorRejected) => {
+                warn!(
+                    url,
+                    "panel feed warm-up cursor rejected (1013); next dial live only"
+                );
+                skip_warmup = true;
+            }
+            Err(FeedEnd::Other(error)) => warn!(url, %error, "panel feed session ended"),
         }
         state.feed.connected.store(false, Ordering::Relaxed);
         if started.elapsed() >= Duration::from_secs(30) {
@@ -131,13 +146,22 @@ pub async fn run_feed(state: SharedState) {
     }
 }
 
-async fn session(state: &SharedState, url: &str) -> Result<(), String> {
-    let uri: Uri = url.parse().map_err(|e| format!("bad url: {e}"))?;
+fn dial_url(url: &str, latest: u64, skip_warmup: bool) -> String {
+    if !skip_warmup && latest > WARMUP_SEQUENCES {
+        format!("{url}?after_sequence={}", latest - WARMUP_SEQUENCES)
+    } else {
+        url.to_owned()
+    }
+}
+
+async fn session(state: &SharedState, url: &str) -> Result<(), FeedEnd> {
+    let other = FeedEnd::Other;
+    let uri: Uri = url.parse().map_err(|e| other(format!("bad url: {e}")))?;
     let request = ClientRequestBuilder::new(uri).with_sub_protocol(SUBPROTOCOL);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(request))
         .await
-        .map_err(|_| "connect timeout".to_owned())?
-        .map_err(|e| format!("connect: {e}"))?;
+        .map_err(|_| other("connect timeout".to_owned()))?
+        .map_err(|e| other(format!("connect: {e}")))?;
     info!(url, "panel feed connected to tinyuma");
     state.feed.connected.store(true, Ordering::Relaxed);
     let mut ping = tokio::time::interval(Duration::from_secs(20));
@@ -145,19 +169,39 @@ async fn session(state: &SharedState, url: &str) -> Result<(), String> {
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                ws.send(Message::Ping(Vec::new().into())).await.map_err(|e| format!("ping: {e}"))?;
+                ws.send(Message::Ping(Vec::new().into())).await.map_err(|e| other(format!("ping: {e}")))?;
             }
             next = tokio::time::timeout(Duration::from_secs(60), ws.next()) => {
-                match next.map_err(|_| "no message for 60s".to_owned())? {
+                match next.map_err(|_| other("no message for 60s".to_owned()))? {
                     None => return Ok(()),
-                    Some(Err(e)) => return Err(format!("read: {e}")),
+                    Some(Err(e)) => return Err(other(format!("read: {e}"))),
                     Some(Ok(Message::Binary(bytes))) => state.feed.publish(bytes),
                     Some(Ok(Message::Close(frame))) => {
-                        return Err(format!("close {:?}", frame.map(|f| u16::from(f.code))));
+                        let code = frame.map(|f| u16::from(f.code));
+                        if code == Some(CURSOR_REJECTED) {
+                            return Err(FeedEnd::CursorRejected);
+                        }
+                        return Err(other(format!("close {code:?}")));
                     }
                     Some(Ok(_)) => {}
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warm_up_cursor_is_dropped_after_a_rejection() {
+        let url = "ws://x/uma/v1/ws";
+        assert_eq!(
+            dial_url(url, 1000, false),
+            format!("{url}?after_sequence=940")
+        );
+        assert_eq!(dial_url(url, 1000, true), url);
+        assert_eq!(dial_url(url, 10, false), url);
     }
 }

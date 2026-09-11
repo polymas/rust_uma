@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tracing::warn;
 
 use crate::{
     config::Config,
@@ -50,7 +51,7 @@ pub async fn serve(
     state: AppState,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
-    let listener = tokio::net::TcpListener::bind(state.config.api_addr).await?;
+    let listener = crate::net::bind_nodelay(state.config.api_addr).await?;
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             while !*shutdown.borrow() {
@@ -82,6 +83,7 @@ struct HealthResponse {
     last_broadcast_at_us: u64,
     subscribers: u64,
     slow_clients_dropped_total: u64,
+    ws_cursor_rejected_total: u64,
     storage_queue_dropped_total: u64,
     latest_block: u64,
     event_ring_oldest_sequence: u64,
@@ -119,6 +121,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         last_broadcast_at_us: state.stats.last_broadcast_at_us.load(Ordering::Relaxed),
         subscribers: state.stats.subscribers.load(Ordering::Relaxed),
         slow_clients_dropped_total: state.stats.slow_clients_dropped.load(Ordering::Relaxed),
+        ws_cursor_rejected_total: state.stats.ws_cursor_rejected.load(Ordering::Relaxed),
         storage_queue_dropped_total: state.stats.storage_queue_dropped.load(Ordering::Relaxed),
         latest_block: state.stats.latest_block.load(Ordering::Relaxed),
         event_ring_oldest_sequence: oldest,
@@ -192,6 +195,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "rust_uma_slow_clients_dropped_total",
             state.stats.slow_clients_dropped.load(Ordering::Relaxed),
         ),
+        (
+            "rust_uma_ws_cursor_rejected_total",
+            state.stats.ws_cursor_rejected.load(Ordering::Relaxed),
+        ),
         ("rust_uma_event_ring_oldest_sequence", oldest),
         ("rust_uma_event_ring_latest_sequence", latest),
     ];
@@ -252,6 +259,7 @@ struct DashboardData {
     ws_frames_sent_total: u64,
     ws_bytes_sent_total: u64,
     slow_clients_dropped_total: u64,
+    ws_cursor_rejected_total: u64,
     storage_queue_dropped_total: u64,
     latest_block: u64,
     event_ring_oldest_sequence: u64,
@@ -323,6 +331,7 @@ async fn dashboard_data(
         ws_frames_sent_total: state.stats.ws_frames_sent.load(Ordering::Relaxed),
         ws_bytes_sent_total: state.stats.ws_bytes_sent.load(Ordering::Relaxed),
         slow_clients_dropped_total: state.stats.slow_clients_dropped.load(Ordering::Relaxed),
+        ws_cursor_rejected_total: state.stats.ws_cursor_rejected.load(Ordering::Relaxed),
         storage_queue_dropped_total: state.stats.storage_queue_dropped.load(Ordering::Relaxed),
         latest_block: state.stats.latest_block.load(Ordering::Relaxed),
         event_ring_oldest_sequence: oldest,
@@ -392,19 +401,42 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, requested_aft
     loop {
         match send_available(&mut socket, &state, &mut after).await {
             Ok(()) => {}
-            Err(FrameReadError::Lagged) => {
+            Err(SendFailure::CursorTooOld) => {
+                // The only case that may close with 1013: edges (and the
+                // console feed) read 1013 as "your cursor is gone" and redial
+                // without it.
+                state
+                    .stats
+                    .ws_cursor_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    after,
+                    "downstream cursor older than frame ring; closing with 1013"
+                );
+                let _ = timed_send(
+                    &mut socket,
+                    Message::Close(Some(CloseFrame {
+                        code: 1013,
+                        reason: "cursor older than frame ring".into(),
+                    })),
+                    state.config.ws_write_timeout,
+                )
+                .await;
+                break;
+            }
+            Err(SendFailure::Write(WriteError::Timeout)) => {
+                // No close frame: a write that just timed out would block
+                // again, and 1013 here used to make edges drop a perfectly
+                // good cursor and skip frames on every 5s link stall. Dropping
+                // the socket makes the peer reconnect with its cursor intact.
                 state
                     .stats
                     .slow_clients_dropped
                     .fetch_add(1, Ordering::Relaxed);
-                let _ = socket
-                    .send(Message::Close(Some(CloseFrame {
-                        code: 1013,
-                        reason: "cursor older than frame ring".into(),
-                    })))
-                    .await;
+                warn!(after, "downstream write timed out; dropping connection");
                 break;
             }
+            Err(SendFailure::Write(WriteError::Closed)) => break,
         }
         tokio::select! {
             changed = notifications.changed() => if changed.is_err() { break; },
@@ -424,23 +456,34 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, requested_aft
     }
 }
 
+enum SendFailure {
+    CursorTooOld,
+    Write(WriteError),
+}
+
+enum WriteError {
+    Timeout,
+    Closed,
+}
+
 async fn send_available(
     socket: &mut WebSocket,
     state: &AppState,
     after: &mut u64,
-) -> Result<(), FrameReadError> {
-    for frame in state.frames.after(*after)? {
+) -> Result<(), SendFailure> {
+    let frames = state
+        .frames
+        .after(*after)
+        .map_err(|FrameReadError::Lagged| SendFailure::CursorTooOld)?;
+    for frame in frames {
         let frame_len = frame.bytes.len() as u64;
-        if timed_send(
+        timed_send(
             socket,
             Message::Binary(frame.bytes.clone()),
             state.config.ws_write_timeout,
         )
         .await
-        .is_err()
-        {
-            return Err(FrameReadError::Lagged);
-        }
+        .map_err(SendFailure::Write)?;
         state.stats.ws_frames_sent.fetch_add(1, Ordering::Relaxed);
         state
             .stats
@@ -451,11 +494,15 @@ async fn send_available(
     Ok(())
 }
 
-async fn timed_send(socket: &mut WebSocket, message: Message, timeout: Duration) -> Result<(), ()> {
+async fn timed_send(
+    socket: &mut WebSocket,
+    message: Message,
+    timeout: Duration,
+) -> Result<(), WriteError> {
     tokio::time::timeout(timeout, socket.send(message))
         .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
+        .map_err(|_| WriteError::Timeout)?
+        .map_err(|_| WriteError::Closed)
 }
 
 struct SubscriberGuard(Arc<Stats>);
@@ -478,5 +525,117 @@ impl IntoResponse for ApiError {
             Json(serde_json::json!({"error": self.message})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use futures_util::StreamExt;
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{self, client::IntoClientRequest},
+    };
+
+    use super::*;
+    use crate::{config::test_config, wire::WireFrame};
+
+    async fn start(frames: FrameHub, write_timeout: Duration) -> (SocketAddr, Arc<Stats>) {
+        let mut config = test_config();
+        config.ws_write_timeout = write_timeout;
+        let stats = Arc::new(Stats::default());
+        let state = AppState {
+            config: Arc::new(config),
+            events: Arc::new(EventHub::new(16)),
+            frames: Arc::new(frames),
+            catalog: Arc::new(Catalog::new(Vec::new())),
+            stats: stats.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(state)).await });
+        (addr, stats)
+    }
+
+    async fn connect(
+        addr: SocketAddr,
+        after: u64,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let mut request = format!("ws://{addr}/uma/v1/ws?after_sequence={after}")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", SUBPROTOCOL.parse().unwrap());
+        connect_async(request).await.unwrap().0
+    }
+
+    fn frame(first: u64, last: u64, len: usize) -> Arc<WireFrame> {
+        Arc::new(WireFrame {
+            batch_sequence: first,
+            first_sequence: first,
+            last_sequence: last,
+            bytes: bytes::Bytes::from(vec![0_u8; len]),
+        })
+    }
+
+    async fn wait_for(counter: &std::sync::atomic::AtomicU64) {
+        for _ in 0..500 {
+            if counter.load(Ordering::Relaxed) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("counter never moved");
+    }
+
+    /// A client that stops reading must be dropped *without* 1013: edges treat
+    /// 1013 as "cursor gone" and would redial without `after_sequence`,
+    /// skipping every frame of the stall.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_timeout_drops_the_socket_without_1013() {
+        let frames = FrameHub::new(64);
+        for i in 1..=64 {
+            frames.publish(frame(i, i, 1 << 20));
+        }
+        let (addr, stats) = start(frames, Duration::from_millis(50)).await;
+        let mut ws = connect(addr, 0).await;
+        // Don't read: kernel buffers fill, the server's write times out.
+        wait_for(&stats.slow_clients_dropped).await;
+
+        let mut close_codes = Vec::new();
+        while let Some(message) = ws.next().await {
+            match message {
+                Ok(tungstenite::Message::Close(frame)) => {
+                    close_codes.push(frame.map(|f| u16::from(f.code)));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(close_codes.is_empty(), "got close frames {close_codes:?}");
+        assert_eq!(stats.ws_cursor_rejected.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_older_than_the_ring_closes_with_1013() {
+        let frames = FrameHub::resuming_after(16, 100);
+        frames.publish(frame(102, 102, 16));
+        let (addr, stats) = start(frames, Duration::from_secs(5)).await;
+        let mut ws = connect(addr, 50).await;
+        let code = loop {
+            match ws.next().await {
+                Some(Ok(tungstenite::Message::Close(frame))) => {
+                    break frame.map(|f| u16::from(f.code));
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected a close frame, got {other:?}"),
+            }
+        };
+        assert_eq!(code, Some(1013));
+        assert_eq!(stats.ws_cursor_rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.slow_clients_dropped.load(Ordering::Relaxed), 0);
     }
 }

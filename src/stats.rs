@@ -72,7 +72,15 @@ pub struct Stats {
     pub last_upstream_received_at_us: AtomicU64,
     pub last_broadcast_at_us: AtomicU64,
     pub subscribers: AtomicU64,
+    /// Downstream `/uma/v1/ws` connections dropped because a write timed out
+    /// (`WS_WRITE_TIMEOUT_MS`). Dropped without a close frame — see
+    /// `api::websocket_session`.
     pub slow_clients_dropped: AtomicU64,
+    /// Downstream connections closed with 1013 because their `after_sequence`
+    /// is older than the frame ring can replay. Counted separately from
+    /// `slow_clients_dropped`: 1013 tells the client to drop its cursor, a
+    /// write timeout must not.
+    pub ws_cursor_rejected: AtomicU64,
     pub storage_queue_dropped: AtomicU64,
     pub latest_block: AtomicU64,
     /// Raw bytes read off the upstream WSS RPC socket(s) (subscribe request's

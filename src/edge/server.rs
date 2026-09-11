@@ -49,7 +49,7 @@ pub async fn serve(
     state: SharedState,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
-    let listener = tokio::net::TcpListener::bind(state.config.listen_addr).await?;
+    let listener = crate::net::bind_nodelay(state.config.listen_addr).await?;
     axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),

@@ -172,7 +172,8 @@ Protobuf schema 位于仓库 `proto/uma.proto`，下游可直接下载
 消息帧采用至少一次投递。重连时，如果 `after_sequence` 落在之前编码的某个批次
 内，客户端可能收到该批次中序号更早的事件；客户端必须按 `sequence` 或
 `(transaction_hash, log_index)` 去重。如果请求的游标早于内存帧环中最旧的记录，
-连接将直接被关闭（错误码 1013）——没有 HTTP 补拉端点作为退路，客户端必须靠
+连接将直接被关闭（错误码 1013，计入 `ws_cursor_rejected_total`；1013 只用于这
+一种情况）——没有 HTTP 补拉端点作为退路，客户端必须靠
 `EVENT_RING_CAPACITY`/`FRAME_RING_CAPACITY` 覆盖住自己可能的最长离线时间，或
 干脆断线后直接重新以 `after_sequence=0`（或不传，取最新）建立新连接。
 
@@ -262,13 +263,14 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
   而一个远端消费者到服务器的 RTT 实测约 190ms，这一跳就是端到端延迟的大头。
   消费者应尽量部署在法兰克福同机房，最好直接跑在同一台机器上走 `127.0.0.1`。
 - **客户端 socket 打开 `TCP_NODELAY`。** 各语言 WebSocket 库默认不一定禁用
-  Nagle，下游发出的 Pong/控制帧不应被合并延迟。注意：服务端发送方向的 Nagle
-  由服务端控制，当前版本服务端尚未显式禁用，同区块突发产生的第二帧可能要等
-  第一帧的 ACK 回来才发出，代价恰好等于一个 RTT——这也是就近部署最直接的收益。
+  Nagle，下游发出的 Pong/控制帧不应被合并延迟。服务端（本服务和 edge）接入的
+  每个连接都已打开 `TCP_NODELAY`，同区块突发产生的相邻几帧会立即发出，不再等
+  前一帧的 ACK。
 - **读 socket 的循环不要做任何阻塞工作。** 服务端对每一帧的写有
-  `WS_WRITE_TIMEOUT_MS`（默认 5s）超时，超时即视为慢客户端，直接关闭连接
-  （错误码 1013）并计入 `slow_clients_dropped_total`。解码、下单、落库都应该
-  放到独立线程/任务里，读循环只负责把帧入队。
+  `WS_WRITE_TIMEOUT_MS`（默认 5s）超时，超时即视为慢客户端，直接断开 TCP
+  （**不发关闭帧**）并计入 `slow_clients_dropped_total`；客户端应带着最后处理的
+  `sequence` 正常续传重连。解码、下单、落库都应该放到独立线程/任务里，读循环
+  只负责把帧入队。
 - **按帧处理，预热解压器。** 同一区块的多条事件几乎同时到达（间隔亚毫秒，
   九成事件落在多事件区块里），会被打包进一帧或紧邻的两帧。载荷不小于 4096
   字节时使用 Zstd level 1，突发时会出现压缩帧；复用 Zstd 解压上下文，不要
@@ -300,4 +302,5 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 - `last_broadcast_at_us`
 - `subscribers`
 - `slow_clients_dropped_total`
+- `ws_cursor_rejected_total`
 - `event_ring_oldest_sequence` / `event_ring_latest_sequence`
