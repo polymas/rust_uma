@@ -2,6 +2,7 @@
 //! 发布公开节点列表。全部状态在内存里，只有 token 表和节点管理位落盘
 //! （见 `store.rs`）。这里没有热路径——它不碰任何帧。
 
+pub mod alerts;
 pub mod feed;
 pub mod registry;
 pub mod server;
@@ -31,6 +32,11 @@ pub struct ConsoleConfig {
     pub upstream_dashboard_token: Option<String>,
     pub upstream_poll: Duration,
     pub llms_cache: Duration,
+    /// 飞书群自定义机器人 webhook；不配则告警只写日志。
+    pub alert_webhook: Option<String>,
+    /// 告警消息末尾附的面板地址（不要带 token）。
+    pub alert_panel_url: Option<String>,
+    pub alert_interval: Duration,
 }
 
 impl ConsoleConfig {
@@ -62,6 +68,11 @@ impl ConsoleConfig {
             upstream_dashboard_token: nonempty("CONSOLE_UPSTREAM_DASHBOARD_TOKEN"),
             upstream_poll: Duration::from_secs(parse("CONSOLE_UPSTREAM_POLL_SECONDS", "3")?),
             llms_cache: Duration::from_secs(parse("CONSOLE_LLMS_CACHE_SECONDS", "300")?),
+            alert_webhook: nonempty("CONSOLE_ALERT_WEBHOOK"),
+            alert_panel_url: nonempty("CONSOLE_ALERT_PANEL_URL"),
+            alert_interval: Duration::from_secs(
+                parse::<u64>("CONSOLE_ALERT_INTERVAL_SECONDS", "15")?.max(1),
+            ),
         })
     }
 }
@@ -80,6 +91,7 @@ pub struct ConsoleState {
     pub tokens: tokens::TokenStore,
     pub upstream: upstream::UpstreamCache,
     pub feed: feed::Feed,
+    pub alerts: alerts::Alerts,
     pub http: reqwest::Client,
     pub started_at_ms: u64,
 }

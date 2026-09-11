@@ -56,6 +56,10 @@
   .help .tip b { color: var(--accent); }
   h2.sec .help { position: relative; top: auto; right: auto; display: inline-block; margin-left: 6px; vertical-align: middle; }
   h2.sec .help .tip { top: 20px; right: auto; left: 0; }
+  .alertbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; flex:0 0 auto; font-size:11px; color:var(--dim); }
+  .alertbar .help { position:relative; top:auto; right:auto; display:inline-block; }
+  .alertbar .help .tip { top:20px; right:auto; left:0; width:520px; }
+  .alertbar .item { border:1px solid currentColor; border-radius:3px; padding:0 6px; cursor:default; }
 </style>
 </head>
 <body>
@@ -69,6 +73,7 @@
   </div>
 </div>
 <div id="secret"></div>
+<div class="alertbar" id="alertbar"></div>
 
 <div class="sec-block upstream">
 <h2 class="sec"><span>tinyuma（法兰克福）</span><span class="hint" id="upmeta"></span></h2>
@@ -344,11 +349,12 @@ function renderUpstream(p) {
   grid.appendChild(card("直连 tinyuma 的 WSS", directCls, [
     ["当前连接数", `${data.subscribers}（应为 ${expectedDirect}）`, directCls],
     ["慢客户端断开总数", data.slow_clients_dropped_total, redIfGrew("tiny_slow", data.slow_clients_dropped_total)],
+    ["游标过旧拒绝(1013)", data.ws_cursor_rejected_total ?? "-", redIfGrew("tiny_cursor", data.ws_cursor_rejected_total)],
     ["下发速率", fmtRate(rate("ws_bytes_sent_total"))],
     ["下发帧速率", rate("ws_frames_sent_total").toFixed(2) + " 帧/s"],
     ["累计下发字节", fmtBytes(data.ws_bytes_sent_total)],
     ["累计下发帧数", data.ws_frames_sent_total],
-  ], "直接连在 tinyuma 上的 WebSocket 订阅者。集群上线后应只剩 6 台 edge 加 console 的面板转发共 7 个，超过说明还有业务下游在直连法兰克福，应改连香港 edge。<b>慢客户端断开</b>：跟不上广播被 1013 踢掉的次数。<b>下发速率/帧速率</b>：按抓取差分计算。<br><b>颜色</b>：当前连接数恰好等于 edge 数 + 1（console 的转发）为绿，多了说明有业务下游绕过 edge 直连，少了说明有 edge 掉线，都为红。"));
+  ], "直接连在 tinyuma 上的 WebSocket 订阅者。集群上线后应只剩 6 台 edge 加 console 的面板转发共 7 个，超过说明还有业务下游在直连法兰克福，应改连香港 edge。<b>慢客户端断开</b>：写一帧超过 WS_WRITE_TIMEOUT_MS（默认 5s）直接断 TCP 的次数，不发关闭帧，对端带原游标重连即可。<b>游标过旧拒绝</b>：after_sequence 早于帧环能回放的范围，以 1013 关闭，对端应不带游标重连（中间的帧已经补不回来）。<b>下发速率/帧速率</b>：按抓取差分计算。<br><b>颜色</b>：当前连接数恰好等于 edge 数 + 1（console 的转发）为绿，多了说明有业务下游绕过 edge 直连，少了说明有 edge 掉线，都为红。"));
   const edgeClients = p.nodes.reduce((s, n) => s + (n.heartbeat.clients || 0), 0);
   const serving = p.nodes.filter((n) => n.status === "serving").length;
   const maxLag = Math.max(0, ...p.nodes.map((n) => u.latest_sequence - n.heartbeat.last_event_sequence));
@@ -408,6 +414,24 @@ function renderNodes(p) {
   $("balance").innerHTML = `自动均衡 ${st.auto_balance ? '<span class="ok">开</span>' : '<span class="bad">关</span>'}（每 ${st.release_batch}/心跳，目标最忙 ≤ 最空 +${st.balance_spread_pct}%）<button id="togglebal" data-en="${st.auto_balance ? 0 : 1}">${st.auto_balance ? "关闭" : "开启"}</button>`;
 }
 
+// ---------- 告警条 ----------
+function alertRulesHelp(a) {
+  const r = a.rules;
+  return `console 每 ${a.interval_s}s 检查一次，条件<b>持续到阈值</b>才触发；同一轮的新触发、到期提醒、已恢复合并成一条飞书消息。仍未恢复的每 ${r.repeat_after_min} 分钟再提醒一次；条件消失满 ${r.resolve_after_s}s 才算恢复。悬停告警项看详情，"观察中"是已命中但还没持续到阈值的。<br>` +
+    `<b>tinyuma</b>：抓不到 ≥${r.upstream_unreachable_s}s（严重）；RPC 订阅全断 ≥${r.rpc_disconnected_s}s（严重）；多路 RPC 有掉线 ≥${r.rpc_sources_degraded_s}s；30min 重连 ≥${r.rpc_reconnects_per_30m} 次；${r.upstream_silent_min}min 没收到链上事件（严重，订阅假死）；近期富化命中率 &lt;${r.enrichment_recent_min_pct}%；1h 未命中 ≥${r.enrichment_misses_per_1h}、解码失败 ≥${r.decode_errors_per_1h}；10min 写超时断开 ≥${r.slow_clients_per_10m}、游标过旧 1013 ≥${r.cursor_rejected_per_10m}、WAL 丢弃 ≥${r.storage_dropped_per_10m}（严重）；缓存市场 &lt;${fmtNum(r.catalog_min_markets)} 持续 5min。<br>` +
+    `<b>edge</b>：失联 ≥${r.edge_stale_s}s（严重）；与 tinyuma 断开 ≥${r.edge_upstream_down_s}s（严重）；序号落后 ≥${r.edge_sequence_lag} 条持续 ${r.edge_sequence_lag_s}s；传输延迟 ≥${r.edge_link_lag_ms}ms 持续 ${r.edge_link_lag_s}s；1h 新接入 ≥${r.edge_accepted_per_1h} 个连接（客户端反复断线重连）；10min 慢客户端 ≥${r.edge_slow_clients_per_10m}、坏帧 ≥${r.edge_bad_frames_per_10m}；连接数 ≥${r.edge_full_pct}% 持续 ${r.edge_full_s}s；服务中节点 &lt;${r.min_serving_nodes} 持续 60s（严重）。已禁用的节点不告警。<br>` +
+    `<b>面板实时转发</b>断开 ≥${r.panel_feed_down_s}s。<br>阈值在服务器 <b>/var/lib/uma-console/alerts.json</b> 里改（只写要改的字段，其余用默认值），改完重启 console。`;
+}
+function renderAlerts(p) {
+  const a = p.alerts; if (!a) { $("alertbar").innerHTML = ""; return; }
+  const firing = a.alerts.filter((x) => x.firing), watching = a.alerts.length - firing.length;
+  const channel = !a.webhook_configured ? '<span class="bad">未配 CONSOLE_ALERT_WEBHOOK，只写日志</span>'
+    : a.last_error && a.last_error_ms > a.last_sent_ms ? `<span class="bad">推送失败：${esc(a.last_error)}</span>`
+    : `<span class="ok">飞书已接</span> · 已推送 ${fmtNum(a.sent_total)} 条${a.last_sent_ms ? "，最近 " + fmtAgoMs(a.last_sent_ms, p.now_ms) : ""}`;
+  const items = firing.map((x) => `<span class="item ${x.severity === "critical" ? "bad" : "warn"}" title="${esc(x.detail)}\n开始于 ${esc(ts(x.since_ms))} UTC">${x.severity === "critical" ? "严重" : "警告"} · ${esc(x.title)}${x.subject ? "：" + esc(x.subject) : ""}</span>`).join("");
+  $("alertbar").innerHTML = `<b style="color:var(--text)">告警</b>${helpTag(alertRulesHelp(a))} ${channel} · ${firing.length ? items : '<span class="ok">没有触发中的告警</span>'}${watching ? ` <span class="dim">观察中 ${watching}</span>` : ""} <button id="testalert">发送测试告警</button>`;
+}
+
 // ---------- token 表 ----------
 function renderTokens(p) {
   const rows = p.tokens.map((t) => {
@@ -422,6 +446,7 @@ function renderTokens(p) {
 
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("button"); if (!b) return;
+  if (b.id === "testalert") { const j = await admin("POST", "/api/v1/admin/alerts/test"); if (j) alert(j.ok ? "已发送，去飞书群里看" : "发送失败：" + j.error); load(); return; }
   if (b.id === "togglebal") { await admin("POST", "/api/v1/admin/balance", { enabled: b.dataset.en === "1" }); load(); return; }
   if (b.dataset.n && b.dataset.a === "release") {
     const v = prompt(`让 ${b.dataset.n} 释放多少个连接？（每次心跳按批下发，填 0 取消未下发的）`, "100");
@@ -455,7 +480,7 @@ async function load() {
     const p = await r.json(); const c = p.console;
     $("meta").className = "";
     $("meta").textContent = `console ${c.version} (${c.commit}) · 已运行 ${Math.floor(c.uptime_s/60)} 分钟 · 服务中节点 ${c.serving_nodes}/${c.known_nodes} · ${ts(p.now_ms)} UTC · 每 2s 刷新`;
-    renderUpstream(p); renderNodes(p); renderTokens(p);
+    renderUpstream(p); renderNodes(p); renderTokens(p); renderAlerts(p);
   } catch (err) { $("meta").className = "err"; $("meta").textContent = `加载失败：${err.message}（需要 ?token=）`; }
   finally { busy = false; }
 }

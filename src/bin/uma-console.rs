@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rust_uma::console::{
     COMMIT, ConsoleConfig, ConsoleState, VERSION,
+    alerts::{Alerts, load_rules, run_alerts},
     feed::{Feed, run_feed},
     now_ms,
     registry::Registry,
@@ -31,6 +32,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = ConsoleConfig::from_env()?;
     let registry = Registry::open(config.data_dir.join("nodes.json"), config.stale_after)?;
     let tokens = TokenStore::open(config.data_dir.join("tokens.json"))?;
+    let alert_rules = load_rules(&config.data_dir.join("alerts.json"));
     info!(
         version = VERSION,
         commit = COMMIT,
@@ -39,14 +41,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_dir = %config.data_dir.display(),
         tokens = tokens.list().len(),
         tokens_version = tokens.version(),
+        alert_webhook = config.alert_webhook.is_some(),
         "uma-console starting"
     );
+    let alerts = Alerts::new(alert_rules, config.alert_webhook.is_some());
     let state = Arc::new(ConsoleState {
         config,
         registry,
         tokens,
         upstream: UpstreamCache::default(),
         feed: Feed::default(),
+        alerts,
         http: reqwest::Client::builder().build()?,
         started_at_ms: now_ms(),
     });
@@ -54,6 +59,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(run_upstream_poller(state.clone()));
     tokio::spawn(run_feed(state.clone()));
+    tokio::spawn(run_alerts(state.clone()));
     let server = tokio::spawn(server::serve(state, shutdown_rx));
 
     tokio::select! {

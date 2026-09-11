@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use super::{
     COMMIT, SharedState, VERSION,
+    alerts::{AlertsStatus, send_feishu},
     feed::FeedStatus,
     now_ms,
     registry::{Directive, Heartbeat, NodeView},
@@ -64,6 +65,7 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/api/v1/admin/tokens/{id}/name", put(admin_token_rename))
         .route("/api/v1/admin/tokens/{id}", delete(admin_token_delete))
+        .route("/api/v1/admin/alerts/test", post(admin_alert_test))
         .with_state(state)
 }
 
@@ -221,6 +223,7 @@ struct Panel {
     stale_after_ms: u64,
     feed: FeedStatus,
     settings: super::registry::Settings,
+    alerts: AlertsStatus,
 }
 
 async fn panel(
@@ -265,6 +268,7 @@ async fn panel(
         stale_after_ms: state.config.stale_after.as_millis() as u64,
         feed: state.feed.status(),
         settings: state.registry.settings(),
+        alerts: state.alerts.status(state.config.alert_interval),
     }))
 }
 
@@ -505,6 +509,26 @@ async fn admin_token_delete(
     Ok(Json(
         serde_json::json!({"ok": true, "version": state.tokens.version()}),
     ))
+}
+
+// ---------- 管理：告警 ----------
+
+/// 往配置的飞书 webhook 发一条测试消息，确认告警通道是通的。
+async fn admin_alert_test(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_bearer(&headers, &state.config.admin_token)?;
+    let Some(url) = &state.config.alert_webhook else {
+        return Err(ApiError::bad("CONSOLE_ALERT_WEBHOOK is not configured"));
+    };
+    info!(from = %client_ip(&headers, peer), "alert test requested");
+    let text = format!("【uma 告警】测试消息：console {VERSION} ({COMMIT}) 的告警通道正常");
+    Ok(Json(match send_feishu(&state.http, url, &text).await {
+        Ok(()) => serde_json::json!({"ok": true}),
+        Err(error) => serde_json::json!({"ok": false, "error": error}),
+    }))
 }
 
 // ---------- 通用 ----------
