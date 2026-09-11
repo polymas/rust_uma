@@ -17,6 +17,28 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.9.0（2026-09-11）
+- **广播方向关掉 Nagle**（`net.rs`，tinyuma 8011 + edge 8012）。axum 0.8 的
+  `serve` 默认不设 `TCP_NODELAY`。法兰克福→香港 edge 实测 RTT≈200ms，同一笔交易
+  拆出的相邻几帧，后一帧要等前一帧的 ACK 回来才发。edge 必须一起升级，才能覆盖
+  edge→worker 这一跳。
+- **生产故障修复：链路卡一次 5s，edge 就会静默跳帧**（`api.rs`）。tinyuma 写超时
+  也发 1013，而 edge 把 1013 当成"游标失效"，下次重连不带 `after_sequence`。现在
+  写超时直接断 TCP、不发关闭帧（计 `slow_clients_dropped_total`），1013 只用于
+  游标确实早于帧环（新计数 `ws_cursor_rejected_total`）。**直连 tinyuma 的下游**：
+  写超时不再收到 1013，按普通断线带游标续传即可。
+- **生产故障修复：tinyuma 重启后，合法的续传游标被误判成 1013**（`hub.rs`）。原来
+  拿帧环里最老帧的 `first_sequence` 判断，但富化未命中的事件占序号却不出帧，重启
+  前的事件也不在新帧环里。2026-09-10 重启后 console 面板转发连续被拒 50 次、
+  断了 12 分钟（`slow_clients_dropped_total=53` 基本都是它）；edge 撞上同样的情况
+  会不带游标重连、丢帧。现在记录"可回放下界"：被淘汰帧的 `last_sequence`，启动时
+  取 WAL 里最后一条已广播事件。console 面板转发收到 1013 后也改为直接要实时。
+- **uma-console 新增告警聚合 + 飞书推送**（`console/alerts.rs`）。复用 console 已经
+  在拉的 tinyuma 指标和 edge 心跳，约 20 条规则：条件持续到阈值才触发，消失 60s
+  才恢复。同一轮的新触发、到期提醒、已恢复合并成一条消息，推到
+  `CONSOLE_ALERT_WEBHOOK`；阈值可以用 `$CONSOLE_DATA_DIR/alerts.json` 覆盖。面板
+  顶部加了告警条和"发送测试告警"按钮。
+
 ## v0.8.1（2026-09-10，d164d1a）
 - **解码失败的 RPC log 从 `debug!` 提到 `warn!`**（`pipeline.rs`）。生产跑在默认
   `info` 级别，原来 `decode_errors_total` 涨了也看不出是哪条 tx、哪个
