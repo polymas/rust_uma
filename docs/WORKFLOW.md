@@ -57,9 +57,11 @@ cargo run
 
 - `proto/` 是 git submodule，指向 `git@github.com:polymas/proto.git`（polymas
   各项目共用的协议仓库），本项目的 schema 在 `proto/polyuma/wire/v1/uma.proto`。
-  改协议分两步：先在 `proto/` 里 commit 并 push 到 polymas/proto，再回本仓库
-  `git add proto` 提交新的子仓库指针。只改了 `proto/` 没推远程就提交指针，
-  别的机器 `git submodule update` 会拉不到那个 commit。
+  改协议前先读 `proto/AGENTS.md`（字段编号、版本号、CHANGELOG、tag 的统一规范）。
+  改协议分两步：先在 `proto/` 里改 `.proto` + `polyuma/wire/v1/CHANGELOG.md`，
+  commit、push 并打 `polyuma/wire/vX.Y.Z` tag，再回本仓库 `git add proto` 提交新
+  的子仓库指针。只改了 `proto/` 没推远程就提交指针，别的机器
+  `git submodule update` 会拉不到那个 commit。
 
 - `.env` 永远不进 git（`.gitignore` 已排除），也不要在任何输出、commit
   message、日志截图里贴出其中的 RPC 地址/token。
