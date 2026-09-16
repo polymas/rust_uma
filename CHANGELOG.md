@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.9.1（2026-09-16）
+## v0.9.1（2026-09-16，7e52931）
 - **proto 协议迁到共用仓库 `polymas/proto`，以 git submodule 挂在 `proto/`**，
   schema 路径变为 `proto/polyuma/wire/v1/uma.proto`（当前固定在
   `polyuma/wire/v1.0.1`）。package、字段、生成代码、wire 格式、控制台
