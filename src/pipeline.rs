@@ -157,7 +157,7 @@ impl Processor {
         let block_number = decoded.chain().block_number;
         // A DisputePrice's price is the value under dispute, not a fresh
         // answer — only a Propose's own price is a real signal (see
-        // proto/uma.proto's UmaEvent.price_outcome doc comment).
+        // proto/polyuma/wire/v1/uma.proto's UmaEvent.price_outcome doc comment).
         let price_outcome = match decoded.kind() {
             EventKind::Propose => {
                 PriceOutcome::from_propose_price(&decoded.request().proposed_price)

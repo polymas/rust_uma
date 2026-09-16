@@ -36,7 +36,7 @@ Protobuf 路径，避免两套格式并存。其实时热路径仅执行以下�
 区块哈希、交易序号、参与方全量地址、问题原文、resolution 文字、initializer
 这些字段，日志里从来不需要读，因此解码阶段干脆不解析、不分配——不是"解析
 了但不广播"，是压根不解析。需要这些信息时用 `transaction_hash` 反查链上原始
-日志或 Gamma API。具体保留/删减范围见 `proto/uma.proto` 里 `UmaEvent` 的注释。
+日志或 Gamma API。具体保留/删减范围见 `proto/polyuma/wire/v1/uma.proto` 里 `UmaEvent` 的注释。
 
 `condition_id` 在解析阶段会按标准二元 Adapter 公式
 `keccak256(requester || question_id || uint256(2))` 推导一份，但这个公式仅对标准
@@ -164,7 +164,7 @@ Sec-WebSocket-Protocol: uma.pb.v1
 12      ...   Protobuf UmaBatch 载荷，可选使用 Zstd level 1 压缩
 ```
 
-Protobuf schema 位于仓库 `proto/uma.proto`，下游可直接下载
+Protobuf schema 位于仓库 `proto/polyuma/wire/v1/uma.proto`，下游可直接下载
 `https://uma-console.chainee.space/uma.proto`（同一份文件）。小于 4096 字节的载荷不压缩；更大的载荷
 使用 Zstd level 1。每个批次最多包含 64 个事件，或压缩前不超过 32 KiB。这些值
 均可配置。

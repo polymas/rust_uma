@@ -42,7 +42,7 @@ impl EventKind {
 
 /// Which of a binary condition's two outcome tokens this event's on-chain
 /// price resolves to — see the doc comment on `UmaEvent.price_outcome` in
-/// `proto/uma.proto` for the derivation and why it's only meaningful for
+/// `proto/polyuma/wire/v1/uma.proto` for the derivation and why it's only meaningful for
 /// Propose events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PriceOutcome {
@@ -99,7 +99,7 @@ impl PriceOutcome {
 /// Top-level market category, derived once at enrichment time from Gamma tag
 /// IDs (plus one question-text fallback for `Mentions`) — see
 /// `crate::category::classify`. See the doc comment on
-/// `UmaEvent.category` in `proto/uma.proto` for the derivation.
+/// `UmaEvent.category` in `proto/polyuma/wire/v1/uma.proto` for the derivation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Category {
     Unspecified,
@@ -144,13 +144,13 @@ impl Category {
 }
 
 /// Bet-type sub-classification — see the doc comment on `UmaEvent.bet_type`
-/// in `proto/uma.proto` for which `Category` each block belongs to and why
+/// in `proto/polyuma/wire/v1/uma.proto` for which `Category` each block belongs to and why
 /// matching is always scoped to one group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BetType {
     Unspecified,
     // Sports/Esports block — see the numeric-grouping doc comment on
-    // `BetType` in proto/uma.proto.
+    // `BetType` in proto/polyuma/wire/v1/uma.proto.
     Moneyline,
     Spread,
     OverUnder,
@@ -256,7 +256,7 @@ pub struct MarketEnrichment {
     pub category: Category,
     pub bet_type: BetType,
     /// Polymarket's "Neg Risk" flag, taken as-is from Gamma's `negRisk` — see
-    /// the doc comment on `UmaEvent.neg_risk` in proto/uma.proto for why this
+    /// the doc comment on `UmaEvent.neg_risk` in proto/polyuma/wire/v1/uma.proto for why this
     /// is enrichment-only, never derived on-chain.
     pub neg_risk: bool,
 }
@@ -334,7 +334,7 @@ impl EventRecord {
     }
 
     /// Reconstructs a record from a persisted/wire `pb::UmaEvent`. Fields
-    /// retired from the wire schema (see `proto/uma.proto`) aren't
+    /// retired from the wire schema (see `proto/polyuma/wire/v1/uma.proto`) aren't
     /// recoverable here — this only backs `EventHub` replay (dedup key,
     /// re-broadcast), which never reads them; it doesn't reconstruct the rich
     /// on-chain view that only exists transiently during live decode.
@@ -478,7 +478,7 @@ mod tests {
     fn wire_fields_round_trip_through_protobuf() {
         // Only asserts on what's actually part of the wire schema — most
         // on-chain fields (block metadata, participant addresses, ancillary
-        // text, ...) are intentionally not on the wire (see proto/uma.proto)
+        // text, ...) are intentionally not on the wire (see proto/polyuma/wire/v1/uma.proto)
         // and `from_proto` fills them with placeholders, so a full
         // `decoded.event == record.event` equality no longer holds.
         let record = EventRecord {

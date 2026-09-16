@@ -7,7 +7,7 @@ tinyuma 的二进制帧（帧格式、子协议、after_sequence 语义见下方
 ## Protobuf schema
 
 帧里的 `UmaBatch` / `UmaEvent` 定义直接从控制台取：`GET {console}/uma.proto`
-（与 tinyuma 编帧用的是同一份 `proto/uma.proto`，package `polyuma.wire.v1`）。
+（与 tinyuma 编帧用的是同一份 `proto/polyuma/wire/v1/uma.proto`，package `polyuma.wire.v1`）。
 用 protoc 生成目标语言代码即可，例如 `protoc --python_out=. uma.proto`。
 
 ## 接入步骤

@@ -1,10 +1,14 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=proto/uma.proto");
+    println!("cargo:rerun-if-changed=proto/polyuma/wire/v1/uma.proto");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/logs/HEAD");
-    prost_build::compile_protos(&["proto/uma.proto"], &["proto"])
+    assert!(
+        std::path::Path::new("proto/polyuma/wire/v1/uma.proto").exists(),
+        "proto/ 是 git submodule（polymas/proto），先执行 `git submodule update --init`"
+    );
+    prost_build::compile_protos(&["proto/polyuma/wire/v1/uma.proto"], &["proto"])
         .expect("compile UMA protobuf schema");
 
     let commit = Command::new("git")

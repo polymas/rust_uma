@@ -113,7 +113,7 @@ impl Storage {
                 tag_ids.push(read_u32(&mut reader)?);
             }
             let category = Category::from_proto(read_u8(&mut reader)? as i32);
-            // `BetType` values are `CCCBBB`-encoded (see proto/uma.proto) and
+            // `BetType` values are `CCCBBB`-encoded (see proto/polyuma/wire/v1/uma.proto) and
             // can reach into the low hundred-thousands, so unlike `category`
             // this doesn't fit in one byte.
             let bet_type = BetType::from_proto(read_i32(&mut reader)?);

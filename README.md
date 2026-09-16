@@ -47,7 +47,7 @@
 ## WSS 协议方向
 
 - WebSocket BinaryMessage
-- Protobuf 批量格式：`proto/uma.proto`
+- Protobuf 批量格式：`proto/polyuma/wire/v1/uma.proto`
 - 小于 4 KiB 的 Protobuf payload 不压缩
 - 大于等于 4 KiB 时使用 Zstd level 1
 - 单批上限暂定 64 个事件或 32 KiB 未压缩数据
@@ -99,4 +99,4 @@ GET /uma/v1/ws?after_sequence=0
 是一个 token 鉴权的只读运维面板，只展示聚合统计，不提供单条事件查询。
 
 WSS 客户端必须声明子协议 `uma.pb.v1`。消息头、压缩阈值、重放语义和
-下游约束见 `internal/api/llms.txt`，Protobuf schema 见 `proto/uma.proto`。
+下游约束见 `internal/api/llms.txt`，Protobuf schema 见 `proto/polyuma/wire/v1/uma.proto`。

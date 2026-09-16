@@ -50,9 +50,16 @@ propose/dispute 结果，才能吃到尾盘 share**。所有工程决策服从�
 ### 1.2 本地跑起来
 
 ```bash
+git submodule update --init   # 首次；proto/ 是子仓库，缺了 build.rs 会直接报错
 cp .env.example .env   # 首次；填入真实 WSS_RPC/HTTP_RPC，不要把 .env 提交上去
 cargo run
 ```
+
+- `proto/` 是 git submodule，指向 `git@github.com:polymas/proto.git`（polymas
+  各项目共用的协议仓库），本项目的 schema 在 `proto/polyuma/wire/v1/uma.proto`。
+  改协议分两步：先在 `proto/` 里 commit 并 push 到 polymas/proto，再回本仓库
+  `git add proto` 提交新的子仓库指针。只改了 `proto/` 没推远程就提交指针，
+  别的机器 `git submodule update` 会拉不到那个 commit。
 
 - `.env` 永远不进 git（`.gitignore` 已排除），也不要在任何输出、commit
   message、日志截图里贴出其中的 RPC 地址/token。
@@ -197,7 +204,7 @@ cargo test
 本地 commit 完不算完——下面这几类"重要变更"，验证门禁过了之后必须
 `git push` 到 `origin/main`，并在这次改动的提交上打一个 tag 一并推送：
 
-- 会影响 `proto/uma.proto` 的 wire schema 改动（加字段、删字段、改字段号、
+- 会影响 `proto/polyuma/wire/v1/uma.proto` 的 wire schema 改动（加字段、删字段、改字段号、
   加新的 `enum`……即第 5 节"升级"覆盖的范围）
 - 富化/条件 ID 解析逻辑、去重逻辑这类热路径正确性改动
 - `storage.rs` 的本地存储格式改动
@@ -229,7 +236,7 @@ git push origin --tags
   下游读错数据而不是报错、存储格式改了但不能自愈迁移（旧数据只能报错拒绝或
   丢弃，没有优雅降级路径）、需要下游消费者协同升级才能完成的改动。
 - **`0.y.z` 阶段的例外**：只要这个项目还没有真实生产下游消费者（现状——见
-  `proto/uma.proto` 里"目前没有生产消费者，字段号可以自由排布"那条注释），
+  `proto/polyuma/wire/v1/uma.proto` 里"目前没有生产消费者，字段号可以自由排布"那条注释），
   破坏性改动允许只跳 MINOR、不用跳到 `1.0.0`——这是标准语义化版本的约定
   （`0.y.z` 阶段本身就允许破坏性变更不必等大版本号），不用为了"这算不算破
   坏性"纠结着要不要提前把大版本号跳到 1。等项目第一次有真实下游依赖接入，
@@ -341,7 +348,7 @@ brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
 存储格式这类**会影响正在运行的下游消费者或本地持久化数据**的改动，比日常部
 署多几条约束：
 
-- **Protobuf 字段只做加法**：`proto/uma.proto` 新增字段用新的字段号，不复用
+- **Protobuf 字段只做加法**：`proto/polyuma/wire/v1/uma.proto` 新增字段用新的字段号，不复用
   旧字段号，不删除旧字段（除非确认所有下游消费者已经切换）。已连接的下游按
   `after_sequence` 断点续传（`FrameHub::after`），协议不兼容会让它们直接读错
   数据而不是报错，风险比进程崩溃更隐蔽，升级 Protobuf 前必须人工确认下游兼容。

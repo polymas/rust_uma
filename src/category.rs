@@ -63,7 +63,7 @@ struct CategoryTextRule {
 }
 
 /// One `BetType` numeric block (see the doc comment on `BetType` in
-/// proto/uma.proto) and the rules that resolve into it. Matching is always
+/// proto/polyuma/wire/v1/uma.proto) and the rules that resolve into it. Matching is always
 /// scoped to a single group — `classify` picks the group whose `categories`
 /// contains the event's resolved `Category` first, then only that group's
 /// own tag/sportsMarketType/question rules ever run. This is deliberate, not
@@ -567,7 +567,7 @@ mod tests {
         // block's own fallback (WEATHER_OTHER), never the Sports block's
         // (SPORTS_PROP) — see the per-Category fallback split in
         // config/category_rules.json and the numeric-grouping doc comment
-        // on `BetType` in proto/uma.proto.
+        // on `BetType` in proto/polyuma/wire/v1/uma.proto.
         assert_eq!(
             classify(
                 &[84],

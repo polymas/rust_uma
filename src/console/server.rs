@@ -30,7 +30,7 @@ use super::{
 };
 
 const CLUSTER_LLMS: &str = include_str!("../../internal/console/llms_cluster.txt");
-const UMA_PROTO: &str = include_str!("../../proto/uma.proto");
+const UMA_PROTO: &str = include_str!("../../proto/polyuma/wire/v1/uma.proto");
 const INDEX_HTML: &str = include_str!("../../internal/console/index.html");
 const HEARTBEAT_BODY_LIMIT: usize = 64 * 1024;
 

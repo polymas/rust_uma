@@ -19,7 +19,7 @@ pub struct ChainLog {
 /// binary-adapter condition_id fallback, `market_id` for enrichment lookup.
 /// The question text and res_data/initializer used to be parsed here too,
 /// but nothing has read them since the wire schema dropped `question`/
-/// `resolution_p1..p4` — see `proto/uma.proto`.
+/// `resolution_p1..p4` — see `proto/polyuma/wire/v1/uma.proto`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolymarketAncillary {
     pub question_id: [u8; 32],
