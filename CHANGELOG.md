@@ -17,6 +17,15 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.9.1（2026-09-16）
+- **proto 协议迁到共用仓库 `polymas/proto`，以 git submodule 挂在 `proto/`**，
+  schema 路径变为 `proto/polyuma/wire/v1/uma.proto`（当前固定在
+  `polyuma/wire/v1.0.1`）。package、字段、生成代码、wire 格式、控制台
+  `/uma.proto` 下发内容都不变，下游无需任何改动。
+- **开发侧**：新 clone 需 `git clone --recursive` 或 `git submodule update --init`，
+  否则 `build.rs` 会直接报错提示；改协议先按 `proto/AGENTS.md` 在子仓库提交、推送、
+  打 tag，再回本仓库提交子仓库指针（见 `docs/WORKFLOW.md` 1.2）。
+
 ## v0.9.0（2026-09-11，28ea783）
 - **广播方向关掉 Nagle**（`net.rs`，tinyuma 8011 + edge 8012）。axum 0.8 的
   `serve` 默认不设 `TCP_NODELAY`。法兰克福→香港 edge 实测 RTT≈200ms，同一笔交易
