@@ -334,7 +334,16 @@ async fn admin_node_action(
     Path((id, action)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_bearer(&headers, &state.config.admin_token)?;
+    let guarded = matches!(
+        action.as_str(),
+        "drain" | "undrain" | "disable" | "enable" | "forget"
+    );
+    if guarded && state.registry.is_relay(&id) {
+        return Err(ApiError::conflict("relay node: unrelay first"));
+    }
     let known = match action.as_str() {
+        "relay" => state.registry.set_relay(&id, true)?,
+        "unrelay" => state.registry.set_relay(&id, false)?,
         "drain" => state.registry.set_drain(&id, true),
         "undrain" => state.registry.set_drain(&id, false),
         "disable" => state.registry.set_disabled(&id, true)?,
@@ -373,6 +382,9 @@ async fn admin_node_release(
     require_bearer(&headers, &state.config.admin_token)?;
     if body.count > 100_000 {
         return Err(ApiError::bad("count too large"));
+    }
+    if state.registry.is_relay(&id) {
+        return Err(ApiError::conflict("relay node: unrelay first"));
     }
     if !state.registry.request_release(&id, body.count) {
         return Err(ApiError::not_found("unknown node"));
@@ -573,6 +585,12 @@ impl ApiError {
     fn not_found(message: &'static str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message,
+        }
+    }
+    fn conflict(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message,
         }
     }

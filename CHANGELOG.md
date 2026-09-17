@@ -17,6 +17,19 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.10.0（2026-09-17）
+- **console 新增"中继"节点角色**（`registry.rs` / `server.rs` / `alerts.rs` / 面板）。
+  配合内网化改造：香港只留 `uma-hk-master` 一台连法兰克福 tinyuma，其余 edge 经 VPC
+  内网订阅它。中继只能用管理接口 `POST /api/v1/admin/nodes/{id}/relay|unrelay`
+  设置，状态落在 `nodes.json`。设置后：永不进公开节点列表，不下发摘流和释放指令，
+  不参与自动均衡；对它执行 enable/disable/drain/undrain/forget/release 返回 409；
+  `unrelay` 后自动变为禁用，不会直接接 worker。面板上中继置顶、不显示操作按钮。
+  告警不再像"已禁用"节点那样跳过它，中继失联或与 tinyuma 断开照常告警。
+- 面板"直连 tinyuma 的 WSS"的期望连接数改为只算上游不指向其他 edge 的节点，
+  级联在中继后面的 edge 不再计入。
+- 只改 console；edge、tinyuma、wire 协议不变，旧 `nodes.json` 缺 `relay` 字段按
+  false 读取。
+
 ## v0.9.1（2026-09-16，7e52931）
 - **proto 协议迁到共用仓库 `polymas/proto`，以 git submodule 挂在 `proto/`**，
   schema 路径变为 `proto/polyuma/wire/v1/uma.proto`（当前固定在

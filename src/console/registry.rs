@@ -83,6 +83,8 @@ pub struct Directive {
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Stale,
+    /// 中继（master）：只给其他 edge 供帧，永远不进公开列表、不参与摘流/释放/均衡。
+    Relay,
     Disabled,
     Draining,
     NotReady,
@@ -95,6 +97,9 @@ pub enum Status {
 pub struct NodeAdmin {
     pub disabled: bool,
     pub note: String,
+    /// 只能经管理接口 relay/unrelay 改，面板不提供开关，避免误操作把中继放给 worker。
+    #[serde(default)]
+    pub relay: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -150,6 +155,7 @@ pub struct NodeView {
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub disabled: bool,
+    pub relay: bool,
     pub desired_drain: bool,
     pub note: String,
     pub status: Status,
@@ -250,6 +256,15 @@ impl Registry {
         node.last_seen_ms = now;
         outcome.desired_drain = node.desired_drain;
         let node_id = node.heartbeat.node_id.clone();
+        // 中继的下游是其他 edge：摘流/释放会把整个集群的上游断掉，一律不下发。
+        if admin_of(&inner, &node_id).relay {
+            if let Some(node) = inner.nodes.get_mut(&node_id) {
+                node.desired_drain = false;
+                node.pending_release = 0;
+            }
+            outcome.desired_drain = false;
+            return outcome;
+        }
         let (release, reason) = self.decide_release(&mut inner, &node_id, now);
         outcome.release = release;
         outcome.release_reason = reason;
@@ -398,6 +413,8 @@ impl Registry {
         let hb = &node.heartbeat;
         if now.saturating_sub(node.last_seen_ms) > self.stale_after.as_millis() as u64 {
             Status::Stale
+        } else if admin.relay {
+            Status::Relay
         } else if admin.disabled {
             Status::Disabled
         } else if node.desired_drain || hb.draining {
@@ -489,6 +506,7 @@ impl Registry {
                     first_seen_ms: n.first_seen_ms,
                     last_seen_ms: n.last_seen_ms,
                     disabled: admin.disabled,
+                    relay: admin.relay,
                     desired_drain: n.desired_drain,
                     note: admin.note.clone(),
                     status: self.status_of(n, admin, now),
@@ -530,6 +548,20 @@ impl Registry {
 
     pub fn set_disabled(&self, id: &str, disabled: bool) -> io::Result<bool> {
         self.mutate_admin(id, |a| a.disabled = disabled)
+    }
+
+    /// 解除中继时顺手禁用：解除只是为了改回普通 edge，不该立刻进公开列表。
+    pub fn set_relay(&self, id: &str, relay: bool) -> io::Result<bool> {
+        self.mutate_admin(id, |a| {
+            a.relay = relay;
+            if !relay {
+                a.disabled = true;
+            }
+        })
+    }
+
+    pub fn is_relay(&self, id: &str) -> bool {
+        self.lock().admin.get(id).is_some_and(|a| a.relay)
     }
 
     pub fn set_note(&self, id: &str, note: &str) -> io::Result<bool> {
@@ -576,6 +608,7 @@ fn admin_of<'a>(inner: &'a Inner, id: &str) -> &'a NodeAdmin {
     static EMPTY: NodeAdmin = NodeAdmin {
         disabled: false,
         note: String::new(),
+        relay: false,
     };
     inner.admin.get(id).unwrap_or(&EMPTY)
 }
@@ -679,6 +712,48 @@ mod tests {
             "1.1.1.1".into(),
         );
         assert_eq!(reg.admin_list()[0].url, "wss://edge.example.com:443/custom");
+    }
+
+    #[test]
+    fn relay_is_never_listed_drained_or_released_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.json");
+        {
+            let reg = Registry::open(path.clone(), Duration::from_secs(15)).unwrap();
+            reg.heartbeat(hb("master", 0), "10.0.0.1".into());
+            reg.heartbeat(hb("edge", 50), "10.0.0.2".into());
+            assert!(reg.set_relay("master", true).unwrap());
+            assert!(!reg.set_relay("ghost", true).unwrap());
+            // 即使被人启用、下发摘流/释放，中继也不进列表、不收指令
+            reg.set_disabled("master", false).unwrap();
+            reg.set_drain("master", true);
+            reg.request_release("master", 10);
+            let outcome = reg.heartbeat(hb("master", 0), "10.0.0.1".into());
+            assert!(!outcome.desired_drain);
+            assert_eq!(outcome.release, 0);
+            let ids: Vec<String> = reg
+                .public_list(Duration::from_secs(1))
+                .nodes
+                .into_iter()
+                .map(|n| n.node_id)
+                .collect();
+            assert_eq!(ids, ["edge"]);
+            let view = reg
+                .admin_list()
+                .into_iter()
+                .find(|v| v.heartbeat.node_id == "master")
+                .unwrap();
+            assert_eq!(view.status, Status::Relay);
+            assert!(view.relay);
+            assert!(reg.is_relay("master") && !reg.is_relay("edge"));
+        }
+        let reg = Registry::open(path, Duration::from_secs(15)).unwrap();
+        reg.heartbeat(hb("master", 0), "10.0.0.1".into());
+        assert_eq!(reg.admin_list()[0].status, Status::Relay);
+        // 解除中继落到禁用，不会直接开始接 worker
+        reg.set_relay("master", false).unwrap();
+        assert_eq!(reg.admin_list()[0].status, Status::Disabled);
+        assert!(reg.public_list(Duration::from_secs(1)).nodes.is_empty());
     }
 
     #[test]

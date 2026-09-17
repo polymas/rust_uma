@@ -1063,6 +1063,7 @@ mod tests {
             first_seen_ms: at,
             last_seen_ms: at,
             disabled: false,
+            relay: false,
             desired_drain: false,
             note: String::new(),
             status,
@@ -1249,6 +1250,25 @@ mod tests {
         let n = engine.pending_message(t, None).unwrap();
         assert!(n.text.contains("仍未恢复（到期提醒）"), "{}", n.text);
         assert!(n.text.contains("a：心跳"), "{}", n.text);
+    }
+
+    /// 中继（master）在面板上是"不接 worker"的节点，但它断了整个集群都断，
+    /// 不能像已禁用节点那样跳过告警。
+    #[test]
+    fn relay_node_still_alerts() {
+        let mut engine = Engine::new(AlertRules::default());
+        let down = |t| {
+            let mut relay = node("uma-hk-master", Status::Relay, 0, t);
+            relay.relay = true;
+            relay.heartbeat.upstream_connected = false;
+            inputs(healthy(t), vec![relay, node("a", Status::Serving, 0, t)], t)
+        };
+        engine.observe(T0, &down(T0));
+        let t = T0 + 10 * MINUTE_MS;
+        engine.observe(t, &down(t));
+        let n = engine.pending_message(t, None).expect("fires");
+        assert!(n.text.contains("edge 与 tinyuma 断开"), "{}", n.text);
+        assert!(n.text.contains("uma-hk-master"), "{}", n.text);
     }
 
     #[test]

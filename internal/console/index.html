@@ -259,8 +259,8 @@ const fmtNum = (n) => (n == null ? "-" : Number(n).toLocaleString("en-US"));
 const ts = (ms) => (ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 19) : "-");
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 function short(hex) { return hex && hex.length > 14 ? hex.slice(0, 8) + "…" + hex.slice(-6) : hex; }
-const statusClass = (s) => ({ serving:"ok", full:"bad", not_ready:"bad", draining:"bad", disabled:"dim", stale:"bad" }[s] || "");
-const STATUS_LABEL = { serving:"服务中", full:"已满", not_ready:"未就绪", draining:"摘流中", disabled:"已禁用", stale:"失联" };
+const statusClass = (s) => ({ serving:"ok", full:"bad", not_ready:"bad", draining:"bad", disabled:"dim", stale:"bad", relay:"ver" }[s] || "");
+const STATUS_LABEL = { serving:"服务中", full:"已满", not_ready:"未就绪", draining:"摘流中", disabled:"已禁用", stale:"失联", relay:"中继" };
 // 累计型指标：只在"最近 2 分钟内有增长"时标红。lastSeen 记上一次的值，alerts 记最近一次增长的时刻。
 const lastSeen = {}, alerts = {}; const ALERT_HOLD_MS = 120000;
 function grew(key, value) {
@@ -310,7 +310,10 @@ function renderUpstream(p) {
   const srcCls = data.rpc_sources_connected === 0 ? "bad" : data.rpc_sources_connected < data.rpc_sources_configured ? "bad" : "ok";
   const lastUpstreamMs = data.last_upstream_received_at_us ? Date.now() - data.last_upstream_received_at_us / 1000 : Infinity;
   const lastBroadcastMs = data.last_broadcast_at_us ? Date.now() - data.last_broadcast_at_us / 1000 : Infinity;
-  const expectedDirect = p.nodes.length + 1; // 6 台 edge + console 的 feed
+  // 上游指向其他 edge（级联在中继后面）的节点不直连 tinyuma；+1 是 console 自己的 feed
+  const edgeHosts = new Set(p.nodes.flatMap((n) => [n.heartbeat.advertise_host, n.remote_ip]).filter(Boolean));
+  const upstreamHost = (u) => { try { return new URL(u).hostname; } catch { return ""; } };
+  const expectedDirect = p.nodes.filter((n) => !edgeHosts.has(upstreamHost(n.heartbeat.upstream_url))).length + 1;
   const hitPct = (data.enrichment_hits_total + data.enrichment_misses_total) > 0 ? data.enrichment_hits_total / (data.enrichment_hits_total + data.enrichment_misses_total) * 100 : 100;
   const recentPct = data.enrichment_recent_total > 0 ? data.enrichment_recent_hits / data.enrichment_recent_total * 100 : 100;
   grid.appendChild(card("RPC 上游收发", rpcOk ? "ok" : "bad", [
@@ -375,9 +378,10 @@ function renderUpstream(p) {
 function renderNodes(p) {
   const latest = (p.upstream && p.upstream.latest_sequence) || 0;
   $("nodesmeta").textContent = `服务中 ${p.nodes.filter((n) => n.status === "serving").length} / 已知 ${p.nodes.length} · 心跳超 ${p.stale_after_ms/1000}s 判失联`;
-  // 服务中在最上面，其后按"需要处理"的紧急程度排：已满/未就绪/摘流中/失联，最后是人工禁用的
-  const STATUS_ORDER = { serving:0, full:1, not_ready:2, draining:3, stale:4, disabled:5 };
-  const sortedNodes = [...p.nodes].sort((a, b) => (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9) || a.heartbeat.node_id.localeCompare(b.heartbeat.node_id, "zh"));
+  // 中继（master）永远置顶（失联了也置顶），其后服务中，再按"需要处理"的紧急程度排：已满/未就绪/摘流中/失联，最后是人工禁用的
+  const STATUS_ORDER = { relay:-1, serving:0, full:1, not_ready:2, draining:3, stale:4, disabled:5 };
+  const orderOf = (n) => n.relay ? -2 : (STATUS_ORDER[n.status] ?? 9);
+  const sortedNodes = [...p.nodes].sort((a, b) => orderOf(a) - orderOf(b) || a.heartbeat.node_id.localeCompare(b.heartbeat.node_id, "zh"));
   const rows = sortedNodes.map((n) => {
     const h = n.heartbeat; const lag = latest ? latest - h.last_event_sequence : null;
     const lagCls = lag == null ? "dim" : lag <= 0 ? "ok" : "bad";
@@ -393,7 +397,7 @@ function renderNodes(p) {
     const flags = [n.disabled ? "已禁用" : "", n.desired_drain ? "已下发摘流" : "", h.draining ? "节点摘流中" : ""].filter(Boolean).join(" · ");
     const balCell = n.pending_release > 0 ? `<span class="warn-text">待释放 ${fmtNum(n.pending_release)}</span>` : n.balance_excess >= (p.settings.balance_min_excess ?? 5) ? `<span class="bad">超出 ${fmtNum(n.balance_excess)}</span>` : n.status === "serving" ? '<span class="ok">均衡</span>' : '<span class="dim">-</span>';
     const balSub = n.released_total > 0 ? `<div class="dim">累计释放 ${fmtNum(n.released_total)} · ${fmtAgoMs(n.last_release_ms, p.now_ms)}</div>` : "";
-    const actions = `<button data-n="${esc(h.node_id)}" data-a="release">释放</button><button data-n="${esc(h.node_id)}" data-a="${n.desired_drain ? "undrain" : "drain"}">${n.desired_drain ? "取消摘流" : "摘流"}</button><button data-n="${esc(h.node_id)}" data-a="${n.disabled ? "enable" : "disable"}">${n.disabled ? "启用" : "禁用"}</button><button class="danger" data-n="${esc(h.node_id)}" data-a="forget">移除</button>`;
+    const actions = n.relay ? `<span class="dim" title="中继节点只给其他 edge 供帧，面板不提供启用/摘流/释放/移除，避免误操作放给 worker。解除只能调管理接口 POST /api/v1/admin/nodes/{id}/unrelay（解除后自动禁用）">中继，不可操作</span>` : `<button data-n="${esc(h.node_id)}" data-a="release">释放</button><button data-n="${esc(h.node_id)}" data-a="${n.desired_drain ? "undrain" : "drain"}">${n.desired_drain ? "取消摘流" : "摘流"}</button><button data-n="${esc(h.node_id)}" data-a="${n.disabled ? "enable" : "disable"}">${n.disabled ? "启用" : "禁用"}</button><button class="danger" data-n="${esc(h.node_id)}" data-a="forget">移除</button>`;
     return `<tr>
       <td title="${esc(n.url)}\n来源 IP ${esc(n.remote_ip)}">${esc(h.node_id)}<div class="dim">${esc((h.advertise_host || n.remote_ip))} <span class="badge ver" title="edge ${esc(h.version)} · commit ${esc(h.commit)}">v${esc(h.version)}</span></div></td>
       <td><span class="badge ${statusClass(n.status)}" title="${esc(n.status)}">${STATUS_LABEL[n.status] || esc(n.status)}</span>${flags ? `<div class="dim">${esc(flags)}</div>` : ""}</td>

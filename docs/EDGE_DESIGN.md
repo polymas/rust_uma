@@ -159,6 +159,7 @@ Bearer `EDGE_CONSOLE_TOKEN`，超时 4s，复用一个 `reqwest::Client`。失�
 | `GET /api/v1/panel` | `?token=` = `CONSOLE_PANEL_TOKEN` | 面板一次性拉全量：tinyuma 缓存 + 全部节点 + token 用量 |
 | `GET /api/v1/admin/nodes` | Bearer `CONSOLE_ADMIN_TOKEN` | 管理视图 |
 | `POST /api/v1/admin/nodes/{id}/{drain\|undrain\|disable\|enable\|forget}` | admin | 动作写日志含来源 IP |
+| `POST /api/v1/admin/nodes/{id}/{relay\|unrelay}` | admin | 中继角色（master）：不进公开列表、不收摘流/释放、其余节点动作 409；unrelay 后自动禁用；面板不提供开关 |
 | `PUT /api/v1/admin/nodes/{id}/note` | admin | `{"note":""}` |
 | `GET /api/v1/admin/tokens` | admin | 列表（secret 只显示前缀） |
 | `POST /api/v1/admin/tokens` | admin | `{"name":""}` → 返回完整 secret（仅此一次） |
