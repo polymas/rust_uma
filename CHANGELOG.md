@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.10.0（2026-09-17）
+## v0.10.0（2026-09-17，b4c1b1e）
 - **console 新增"中继"节点角色**（`registry.rs` / `server.rs` / `alerts.rs` / 面板）。
   配合内网化改造：香港只留 `uma-hk-master` 一台连法兰克福 tinyuma，其余 edge 经 VPC
   内网订阅它。中继只能用管理接口 `POST /api/v1/admin/nodes/{id}/relay|unrelay`
