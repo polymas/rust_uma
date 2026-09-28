@@ -22,6 +22,9 @@ use crate::{
 struct CatalogIndexes {
     by_condition: HashMap<[u8; 32], Arc<MarketEnrichment>>,
     market_to_condition: HashMap<u64, [u8; 32]>,
+    /// Highest Gamma market id ever upserted — the stop point for
+    /// `sync_newest_markets` (Gamma ids are assigned in creation order).
+    max_market_id: u64,
 }
 
 pub struct Catalog {
@@ -84,6 +87,7 @@ impl Catalog {
         {
             return false;
         }
+        indexes.max_market_id = indexes.max_market_id.max(market.market_id);
         if let Some(previous) = indexes
             .market_to_condition
             .insert(market.market_id, market.condition_id)
@@ -109,6 +113,13 @@ impl Catalog {
         self.len() == 0
     }
 
+    pub fn max_market_id(&self) -> u64 {
+        self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .max_market_id
+    }
+
     /// Pointer clones only (`Arc` refcount bumps), so the read lock is held
     /// for a few ms at production scale rather than the tens of ms a deep
     /// copy of ~350k rows (two `Vec`s each) used to cost. That matters
@@ -125,6 +136,22 @@ impl Catalog {
             .cloned()
             .collect()
     }
+}
+
+/// Backoff between retries of one keyset page; its length is the retry count.
+const KEYSET_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_millis(4000),
+];
+
+#[derive(Clone, Copy, Debug)]
+enum KeysetOrder {
+    /// Most recently updated first — the incremental cursor walk.
+    UpdatedAtDesc,
+    /// Newest market first — `sync_newest_markets`. Ids are unique, so this
+    /// ordering has none of the tied-sort-key page drops `updatedAt` has.
+    IdDesc,
 }
 
 #[derive(Clone)]
@@ -149,6 +176,37 @@ pub enum EnrichmentError {
     Identity(&'static str),
 }
 
+impl EnrichmentError {
+    /// Network hiccups, 5xx/429 and truncated bodies are worth retrying;
+    /// anything else (4xx, bad identity, storage) will fail the same way again.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(_) | Self::Json(_) => true,
+            Self::Status(status) => {
+                status.is_server_error() || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            }
+            Self::Oversized | Self::Storage(_) | Self::Identity(_) => false,
+        }
+    }
+}
+
+/// `Display` plus every `source()` below it. reqwest's own `Display` stops at
+/// "error sending request for url (...)", which hid whether the 2026-09-26
+/// refresh failures were timeouts, resets or TLS errors.
+struct ErrorChain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(error) = source {
+            write!(f, ": {error}")?;
+            source = error.source();
+        }
+        Ok(())
+    }
+}
+
 impl GammaClient {
     pub fn new(base_url: String) -> Result<Self, reqwest::Error> {
         Ok(Self {
@@ -163,7 +221,7 @@ impl GammaClient {
     async fn keyset(
         &self,
         cursor: Option<&str>,
-        newest_first: bool,
+        order: KeysetOrder,
         closed: bool,
     ) -> Result<GammaPage, EnrichmentError> {
         let mut request = self
@@ -174,13 +232,42 @@ impl GammaClient {
                 ("closed", if closed { "true" } else { "false" }),
                 ("include_tag", "true"),
             ]);
-        if newest_first {
-            request = request.query(&[("order", "updatedAt"), ("ascending", "false")]);
+        match order {
+            KeysetOrder::UpdatedAtDesc => {
+                request = request.query(&[("order", "updatedAt"), ("ascending", "false")]);
+            }
+            KeysetOrder::IdDesc => {
+                request = request.query(&[("order", "id"), ("ascending", "false")]);
+            }
         }
         if let Some(cursor) = cursor {
             request = request.query(&[("after_cursor", cursor)]);
         }
         self.get_json(request).await
+    }
+
+    /// `keyset` with a short retry for transient failures. A single refresh
+    /// pass can need hundreds of pages (Gamma periodically re-stamps ~40k
+    /// open markets with one shared `updatedAt`, all of which sort ahead of
+    /// the cursor), and one dropped connection used to throw the whole pass
+    /// away: from 2026-09-26 production saw ~85% of passes fail this way.
+    async fn keyset_with_retry(
+        &self,
+        cursor: Option<&str>,
+        order: KeysetOrder,
+        closed: bool,
+    ) -> Result<GammaPage, EnrichmentError> {
+        let mut attempt = 0;
+        loop {
+            match self.keyset(cursor, order, closed).await {
+                Ok(page) => return Ok(page),
+                Err(error) if attempt < KEYSET_RETRY_DELAYS.len() && error.is_transient() => {
+                    tokio::time::sleep(KEYSET_RETRY_DELAYS[attempt]).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(
@@ -406,7 +493,7 @@ pub async fn run_catalog_sync(
                         );
                     }
                     Ok(_) => {}
-                    Err(error) => warn!(%error, "Gamma recent catalog refresh failed"),
+                    Err(error) => warn!(error = %ErrorChain(&error), "Gamma recent catalog refresh failed"),
                 }
             }
         }
@@ -461,7 +548,7 @@ pub async fn run_catalog_reconcile(
                         info!(changed, markets = catalog.len(), "Gamma full catalog reconciliation closed a coverage gap");
                     }
                     Ok(_) => info!("Gamma full catalog reconciliation found no gap"),
-                    Err(error) => warn!(%error, "Gamma full catalog reconciliation failed"),
+                    Err(error) => warn!(error = %ErrorChain(&error), "Gamma full catalog reconciliation failed"),
                 }
             }
         }
@@ -479,6 +566,106 @@ async fn reconcile_full(
     let (changed_closed, _) =
         sync_incremental(gamma, catalog, None, true, Some(&boundary), usize::MAX).await?;
     Ok(changed_active + changed_closed)
+}
+
+/// Pages of newest-by-id markets `sync_newest_markets` may walk per tick.
+/// Production creates ~20 markets per 5 minutes, so one 100-market page
+/// normally covers a 10s tick; the cap only bounds a burst, and anything
+/// beyond it is still picked up by the regular `updatedAt` walk.
+const NEW_MARKET_MAX_PAGES: usize = 5;
+
+/// Independent background task: every `config.gamma_new_market_interval`,
+/// pull the newest markets by id and upsert any the catalog doesn't have yet.
+///
+/// Exists because the `updatedAt` walk in `run_catalog_sync` stopped keeping
+/// up with fresh markets. Since 2026-09-26 Gamma re-stamps ~40k open markets
+/// with a single shared `updatedAt`, so every incremental pass walks 400+
+/// pages (~2 minutes) before reaching its cursor, most passes failed outright
+/// until the per-page retry was added, and within such a tied run keyset
+/// pagination is known to skip entries (see `run_catalog_reconcile`).
+/// Short-lived sports/esports markets get proposed 2–4 minutes after
+/// creation, so they were missing from the catalog when their ProposePrice
+/// arrived and were never broadcast — 37 active markets over three days, 8
+/// of them traded. Ordering by id is immune to both problems and needs one
+/// page per tick.
+///
+/// Memory only: it never persists the catalog or touches either cursor.
+/// Writing the ~46 MB catalog file every few seconds would be pure churn;
+/// the next `run_catalog_sync` pass (or startup sync after a restart) sees
+/// the same markets through the normal path and persists them.
+pub async fn run_new_market_watch(
+    config: Arc<Config>,
+    gamma: GammaClient,
+    catalog: Arc<Catalog>,
+    stats: Arc<Stats>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(config.gamma_new_market_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => if *shutdown.borrow() { break; },
+            _ = interval.tick() => {
+                match sync_newest_markets(&gamma, &catalog, NEW_MARKET_MAX_PAGES).await {
+                    Ok(0) => {}
+                    Ok(added) => {
+                        stats.catalog_markets.store(catalog.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        stats.catalog_new_markets_added.fetch_add(added as u64, std::sync::atomic::Ordering::Relaxed);
+                        info!(added, markets = catalog.len(), "Gamma new markets added to catalog");
+                    }
+                    Err(error) => warn!(error = %ErrorChain(&error), "Gamma new market watch failed"),
+                }
+            }
+        }
+    }
+}
+
+/// Walks active markets newest-id-first and upserts each one until it
+/// reaches an id at or below the catalog's highest known id (everything past
+/// that point is already covered by earlier ticks or the regular sync).
+/// Returns how many markets were added or changed.
+///
+/// A market Gamma lists before it has a `conditionId` fails `compact_market`
+/// and is skipped; it doesn't raise the stop point, so the next tick sees it
+/// again once Gamma fills it in.
+async fn sync_newest_markets(
+    gamma: &GammaClient,
+    catalog: &Catalog,
+    max_pages: usize,
+) -> Result<usize, EnrichmentError> {
+    let known_max = catalog.max_market_id();
+    let mut page_cursor: Option<String> = None;
+    let mut changed = 0;
+    for _ in 0..max_pages.max(1) {
+        let page = gamma
+            .keyset_with_retry(page_cursor.as_deref(), KeysetOrder::IdDesc, false)
+            .await?;
+        if page.markets.is_empty() {
+            break;
+        }
+        let mut reached_known = false;
+        for raw in page.markets {
+            if raw.id.parse::<u64>().is_ok_and(|id| id <= known_max) {
+                reached_known = true;
+                break;
+            }
+            if let Ok(market) = compact_market(raw)
+                && catalog.upsert(market)
+            {
+                changed += 1;
+            }
+        }
+        if reached_known
+            || page.next_cursor.is_empty()
+            || page.next_cursor == "LTE="
+            || page_cursor.as_deref() == Some(&page.next_cursor)
+        {
+            break;
+        }
+        page_cursor = Some(page.next_cursor);
+    }
+    Ok(changed)
 }
 
 /// `YYYY-MM-DD` for `days_ago` days before now (UTC), used as a lexicographic
@@ -520,7 +707,9 @@ async fn sync_incremental(
     let mut changed = 0;
     let mut newest = previous.cloned();
     for _ in 0..max_pages.max(1) {
-        let page = gamma.keyset(page_cursor.as_deref(), true, closed).await?;
+        let page = gamma
+            .keyset_with_retry(page_cursor.as_deref(), KeysetOrder::UpdatedAtDesc, closed)
+            .await?;
         if page.markets.is_empty() {
             break;
         }
@@ -1070,6 +1259,125 @@ mod tests {
         // Idempotent: reconciling again with the market already present
         // finds nothing new to merge.
         assert_eq!(reconcile_full(&gamma, &catalog, 3).await.unwrap(), 0);
+        server.abort();
+    }
+
+    /// Real, unmodified body of
+    /// `curl 'https://gamma-api.polymarket.com/markets/keyset?limit=3&closed=false&include_tag=true&order=id&ascending=false'`
+    /// captured 2026-09-28 02:25Z in the session that added
+    /// `run_new_market_watch`: two short esports markets (5060739, 5060738)
+    /// created seconds before, and a crypto Up/Down market (5060737).
+    const REAL_NEWEST_BY_ID_PAGE: &str =
+        include_str!("testdata/gamma_keyset_newest_by_id_2026-09-28.json");
+
+    /// Regression test for the 2026-09-26 miss wave: fresh short-lived
+    /// markets were proposed before the slow `updatedAt` walk had cached
+    /// them. The newest-by-id pass must request `order=id&ascending=false`,
+    /// add exactly the markets newer than the catalog's highest id, and stop
+    /// there instead of walking the rest of Gamma.
+    #[tokio::test]
+    async fn newest_market_watch_adds_only_markets_newer_than_the_catalog() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+
+        #[derive(Clone, Default)]
+        struct Seen(Arc<RwLock<Vec<HashMap<String, String>>>>);
+
+        async fn list_markets(
+            State(seen): State<Seen>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            seen.0.write().unwrap().push(query);
+            Json(serde_json::from_str(REAL_NEWEST_BY_ID_PAGE).unwrap())
+        }
+
+        let seen = Seen::default();
+        let app = Router::new()
+            .route("/markets/keyset", get(list_markets))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let gamma = GammaClient::new(format!("http://{address}")).unwrap();
+
+        // The catalog already knows 5060737 (the oldest market on the page).
+        let known: GammaPage = serde_json::from_str(REAL_NEWEST_BY_ID_PAGE).unwrap();
+        let oldest = known.markets.into_iter().last().unwrap();
+        assert_eq!(oldest.id, "5060737");
+        let catalog = Catalog::new(vec![compact_market(oldest).unwrap()]);
+        assert_eq!(catalog.max_market_id(), 5_060_737);
+
+        let added = sync_newest_markets(&gamma, &catalog, NEW_MARKET_MAX_PAGES)
+            .await
+            .unwrap();
+        assert_eq!(added, 2);
+        for id in [5_060_739, 5_060_738] {
+            let market = catalog
+                .get_by_market_id(id)
+                .expect("new market must be cached");
+            assert_eq!(
+                market.token_ids.len(),
+                2,
+                "real market {id} has YES/NO tokens"
+            );
+        }
+        assert_eq!(catalog.max_market_id(), 5_060_739);
+
+        let queries = seen.0.read().unwrap().clone();
+        assert_eq!(queries.len(), 1, "must stop at the known id, not page on");
+        assert_eq!(queries[0].get("order").map(String::as_str), Some("id"));
+        assert_eq!(
+            queries[0].get("ascending").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(queries[0].get("closed").map(String::as_str), Some("false"));
+
+        // Nothing newer than the catalog now: no changes, still one request.
+        assert_eq!(
+            sync_newest_markets(&gamma, &catalog, NEW_MARKET_MAX_PAGES)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(seen.0.read().unwrap().len(), 2);
+        server.abort();
+    }
+
+    /// Regression test for the ~85% refresh failure rate since 2026-09-26:
+    /// one failed page used to discard the whole pass. A transient failure
+    /// is now retried and the pass completes.
+    #[tokio::test]
+    async fn incremental_sync_retries_a_transiently_failing_page() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn flaky(State(calls): State<Arc<AtomicUsize>>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return axum::http::StatusCode::BAD_GATEWAY.into_response();
+            }
+            Json(serde_json::from_str::<Value>(REAL_NEWEST_BY_ID_PAGE).unwrap()).into_response()
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/markets/keyset", get(flaky))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let gamma = GammaClient::new(format!("http://{address}")).unwrap();
+        let catalog = Catalog::new(Vec::new());
+
+        // max_pages = 1: the real page's next_cursor would otherwise loop.
+        let (changed, next) = sync_incremental(&gamma, &catalog, None, false, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(changed, 3);
+        assert!(next.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one 502, then one retry");
+
+        // A 4xx is not transient: fail fast instead of retrying.
+        assert!(!EnrichmentError::Status(reqwest::StatusCode::BAD_REQUEST).is_transient());
         server.abort();
     }
 }

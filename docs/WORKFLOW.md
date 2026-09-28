@@ -146,6 +146,16 @@ src/
   cursor 文件——它只负责查漏补缺，不参与、不干扰快路径的正常推进。
   `catalog_reconcile_gaps_closed_total`（`/healthz`、`/metrics`）应该趋向于
   0；如果长期非零，说明 Gamma 分页丢失是持续性的，不是偶发。
+- **新建市场不能只靠 `updatedAt` 增量拉**：2026-09-26 起 Gamma 周期性地把约 4 万个
+  未关闭市场的 `updatedAt` 刷成同一时刻，增量刷新每轮要翻 400+ 页（约 2 分钟）才碰到
+  游标，任一页失败就整轮作废（生产失败率约 85%），并列排序键里还会漏项。体育/电竞
+  短盘创建后 2–4 分钟就被 Propose，这时还不在目录里 → 富化 miss、不广播（三天 37 个
+  活跃市场，8 个有成交）。修复两处：`keyset_with_retry` 单页失败重试（退避 0.5/1.5/4s，
+  只重试网络错误、5xx、429、截断的 body）；独立任务 `run_new_market_watch` 每
+  `GAMMA_NEW_MARKET_INTERVAL_SECONDS`（默认 10）秒按 `order=id&ascending=false` 拉最
+  新市场，拉到目录已知的最大 id 就停，只写内存不落盘（落盘交给下一轮常规刷新）。
+  `catalog_new_markets_added_total` 是它提前收录的市场数；刷新失败日志现在带完整的
+  error source 链。
 - **任何 `tokio::time::interval` 的周期都不能来自未夹紧的用户配置**：验证这
   条自愈任务时，临时把 `CATALOG_RECONCILE_INTERVAL_HOURS` 设成 `0` 想让它立
   刻触发，结果 `tokio::time::interval(Duration::ZERO)` 直接 panic——而

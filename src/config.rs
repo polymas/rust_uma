@@ -34,6 +34,10 @@ pub struct Config {
     pub max_decompressed_bytes: usize,
     pub gamma_base_url: String,
     pub gamma_refresh_interval: Duration,
+    /// How often `enrichment::run_new_market_watch` pulls the newest
+    /// markets by id. Short-lived markets are proposed minutes after
+    /// creation, so this has to be much tighter than the full refresh.
+    pub gamma_new_market_interval: Duration,
     /// How many days back to also cache recently-*closed* Gamma markets, in
     /// addition to the always-cached active (closed=false) set. ProposePrice
     /// mostly fires right as a market closes, so an active-only cache misses
@@ -95,6 +99,7 @@ pub(crate) fn test_config() -> Config {
         max_decompressed_bytes: 1 << 20,
         gamma_base_url: String::new(),
         gamma_refresh_interval: Duration::from_secs(60),
+        gamma_new_market_interval: Duration::from_secs(10),
         closed_market_lookback_days: 0,
         catalog_reconcile_interval: Duration::from_secs(3600),
         require_market_id: false,
@@ -184,6 +189,9 @@ impl Config {
             // any panic anywhere fatal to the whole process, not just the task).
             gamma_refresh_interval: Duration::from_secs(
                 parse::<u64>("GAMMA_REFRESH_INTERVAL_SECONDS", "60")?.max(1),
+            ),
+            gamma_new_market_interval: Duration::from_secs(
+                parse::<u64>("GAMMA_NEW_MARKET_INTERVAL_SECONDS", "10")?.max(1),
             ),
             closed_market_lookback_days: parse("CLOSED_MARKET_LOOKBACK_DAYS", "3")?,
             catalog_reconcile_interval: Duration::from_secs(

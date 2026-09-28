@@ -69,6 +69,9 @@ pub struct Stats {
     /// `enrichment::run_catalog_reconcile`). Should trend toward 0 per pass;
     /// sustained non-zero values mean the incremental sync is leaking.
     pub catalog_reconcile_gaps_closed: AtomicU64,
+    /// Markets `enrichment::run_new_market_watch` added ahead of the regular
+    /// `updatedAt` refresh — how often the new-market fast path mattered.
+    pub catalog_new_markets_added: AtomicU64,
     pub last_upstream_received_at_us: AtomicU64,
     pub last_broadcast_at_us: AtomicU64,
     pub subscribers: AtomicU64,

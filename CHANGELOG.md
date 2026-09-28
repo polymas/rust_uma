@@ -17,6 +17,15 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.11.0（2026-09-28，待补）
+- **修复新建市场富化未命中、事件不广播**（`enrichment.rs`）。2026-09-26 起 Gamma 批量
+  刷新约 4 万个市场的 `updatedAt`，目录增量刷新每轮翻 400+ 页、约 85% 整轮失败，创建后
+  几分钟就被 Propose 的体育/电竞短盘来不及进目录（三天 37 个活跃市场的 Propose 没广播，
+  其中 8 个有成交）。新增独立任务 `run_new_market_watch`：每 10 秒（`GAMMA_NEW_MARKET_INTERVAL_SECONDS`）
+  按 id 倒序拉最新市场，只写内存；增量刷新的每页请求失败时重试 3 次。
+- `/healthz`、`/metrics` 新增 `catalog_new_markets_added_total`；刷新失败日志带完整错误链。
+- 热路径不变：新任务在后台，事件处理与广播路径没有新增任何网络请求。
+
 ## v0.10.0（2026-09-17，b4c1b1e）
 - **console 新增"中继"节点角色**（`registry.rs` / `server.rs` / `alerts.rs` / 面板）。
   配合内网化改造：香港只留 `uma-hk-master` 一台连法兰克福 tinyuma，其余 edge 经 VPC
