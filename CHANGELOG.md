@@ -17,6 +17,25 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.12.0（2026-10-01，待补）
+- **新增第三个二进制 `mempool-uma`**（`src/bin/mempool-uma.rs` + `src/mempool/`）：和 rust-uma
+  同一套富化 / 分类 / 编码 / WSS（proto 完全不变），事件来源换成 Polygon 内存池里的 pending
+  交易。部署在 polytest（`0.0.0.0:8013`，不鉴权，同 rust-uma）。
+  - `calldata.rs`：解析 OOv2 的 proposePrice / proposePriceFor / disputePrice / disputePriceFor /
+    multicall，合成与链上 ProposePrice / DisputePrice 等价的日志，交给现有 `Processor::process`。
+    真实主网交易回归：同一笔交易的合成日志与回执里真实日志解码结果逐字段一致（`src/testdata/mempool/`）。
+  - `gate.rs`：推送前过滤，全部查内存：按 (requester, keccak(ancillary), 请求时间戳) 去重
+    （= condition_id + 请求轮次；已上链 / 已争议 / 旧轮次的 pending 不推）、提交地址打分
+    （报价与链上一致率，样本 ≥50 且 95% 下限 ≥98%）、小费门槛（近 1 小时进块 propose 的 5 分位）。
+  - `feed.rs`：pending 从本机 P2P 轻量节点（`tools/p2p-mempool-probe`，`-feed-listen`）读入；
+    链上确认事件（启动回补 3 小时 + WSS 订阅）只用来更新去重状态和打分，不推给下游。
+  - 不写 WAL、不维护 uma.cursor（重启从头开始）；pending 出错不撤回，以 rust-uma 的确认事件为准。
+- rust-uma 本身的行为不变。另附 Polygon P2P 实验工具与测量程序：`tools/p2p-mempool-probe/`
+  （Go 轻量节点、节点席位管理、pending vs rust-uma 对比服务）、`examples/mempool_probe.rs`、
+  `examples/head_race.rs`。
+- **下游注意**：mempool-uma 推的是"尚未上链"的信号，约 1.2 秒早于 rust-uma，但可能被抢先或
+  回滚；同时订阅两路的下游要自己按来源区分，对账以 rust-uma 为准。
+
 ## v0.11.0（2026-09-28，ed8aa63）
 - **修复新建市场富化未命中、事件不广播**（`enrichment.rs`）。2026-09-26 起 Gamma 批量
   刷新约 4 万个市场的 `updatedAt`，目录增量刷新每轮翻 400+ 页、约 85% 整轮失败，创建后

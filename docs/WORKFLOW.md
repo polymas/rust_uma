@@ -87,8 +87,13 @@ src/
 ├── hub.rs          # 事件环 + 预编码帧环
 ├── wire.rs         # Protobuf + Zstd 编码
 ├── storage.rs      # 双 cursor + 紧凑快照 + WAL
-└── api.rs          # HTTP 查询 / 健康检查 / WSS 广播
+├── api.rs          # HTTP 查询 / 健康检查 / WSS 广播
+└── mempool/        # mempool-uma：pending calldata → 合成日志、推送前过滤、链上确认订阅
 ```
+
+`src/bin/` 下三个二进制共用这套库：`uma-edge`、`uma-console`、`mempool-uma`（事件来自内存池，
+部署在 polytest，见 `deploy/mempool-uma.service`；它依赖 `tools/p2p-mempool-probe` 的 Go 轻量节点
+提供 pending 交易）。
 
 新业务字段优先看它属于哪个域，不要在 `pipeline.rs` 里堆解析逻辑，也不要在
 `uma/events/` 里塞富化/存储逻辑。

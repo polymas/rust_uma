@@ -5,6 +5,7 @@ pub mod console;
 pub mod edge;
 pub mod enrichment;
 pub mod hub;
+pub mod mempool;
 pub mod model;
 pub mod net;
 pub mod pipeline;
