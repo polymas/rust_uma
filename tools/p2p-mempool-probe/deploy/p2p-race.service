@@ -1,0 +1,18 @@
+[Unit]
+Description=pending vs rust-uma race/accuracy comparator (truth = on-chain ProposePrice)
+After=p2p-mempool-probe-b.service
+
+[Service]
+Type=simple
+User=ubuntu
+StateDirectory=p2p-race
+ExecStart=/usr/bin/python3 -u /opt/p2p-mempool-probe/race_compare.py --probe /var/lib/p2p-mempool-probe-b/probe.ndjson --uma ws://172.28.0.11:8011/uma/v1/ws --state-dir /var/lib/p2p-race --web 0.0.0.0:8091 --token-file /var/lib/p2p-bayes/web_token --mempool-uma ws://127.0.0.1:8013/uma/v1/ws --seed-senders /opt/p2p-mempool-probe/sender_seed.json
+Restart=on-failure
+RestartSec=5s
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

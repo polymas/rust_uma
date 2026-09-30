@@ -1,0 +1,20 @@
+[Unit]
+Description=Polygon light P2P mempool listener (pruned peers) feeding bayes monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/var/lib/p2p-mempool-probe-b
+StateDirectory=p2p-mempool-probe-b
+ExecStart=/opt/p2p-mempool-probe/p2p-mempool-probe -duration ${PROBE_DURATION} -max-peers 40 -listen :30305 -seats /var/lib/p2p-mempool-probe-b/seats.json -seats-seed /opt/p2p-mempool-probe/seats_seed.txt -deny /opt/p2p-mempool-probe/seats_deny.txt -peers-out /var/lib/p2p-mempool-probe-b/peers.json -observer fra -feed-listen 127.0.0.1:8014 -ext-ip 161.120.222.37 -out /var/lib/p2p-mempool-probe-b/probe.ndjson -nodekey /var/lib/p2p-mempool-probe-b/nodekey
+Environment=PROBE_DURATION=168h
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

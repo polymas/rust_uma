@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pending vs rust-uma 抢达</title>
+<style>
+:root { --bg:#f6f5f1; --panel:#fff; --ink:#1d1f1c; --muted:#6b6a62; --line:#e3e1d8; --good:#2f7d4f; --warn:#a8632a; --bad:#b23b3b; --neutral:#7d8b96; --chip:#eef0ea; --a:#2f6f5e; --b:#a8632a; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141614; --panel:#1c1f1c; --ink:#e8e7e1; --muted:#9a998f; --line:#2d312c; --good:#6fbf85; --warn:#d9a066; --bad:#e08585; --neutral:#9aa8b3; --chip:#262a26; --a:#6fbfa6; --b:#d9a066; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 -apple-system,"PingFang SC","Noto Sans SC","Segoe UI",sans-serif; }
+header { padding:20px 24px 6px; } h1 { font-size:19px; margin:0; font-weight:650; }
+.sub { color:var(--muted); font-size:12.5px; }
+main { padding:0 24px 40px; max-width:1200px; margin:0 auto; }
+.tabs { display:flex; gap:6px; margin:12px 0; } .tab { border:1px solid var(--line); background:transparent; color:var(--ink); padding:4px 12px; border-radius:99px; cursor:pointer; font-size:12.5px; } .tab.on { background:var(--a); color:var(--panel); border-color:var(--a); }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px; margin-bottom:16px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+.card h3 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:500; }
+.big { font-size:28px; font-weight:700; font-variant-numeric:tabular-nums; }
+.line { color:var(--muted); font-size:12.5px; margin-top:4px; }
+section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:16px; }
+section h2 { font-size:15px; margin:0 0 10px; font-weight:650; }
+table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+th { color:var(--muted); font-weight:500; font-size:12px; }
+.badge { display:inline-block; padding:1px 9px; border-radius:99px; font-size:12px; font-weight:600; }
+.g { background:color-mix(in srgb,var(--good) 16%,transparent); color:var(--good); }
+.w { background:color-mix(in srgb,var(--warn) 18%,transparent); color:var(--warn); }
+.b { background:color-mix(in srgb,var(--bad) 15%,transparent); color:var(--bad); }
+.mono { font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:12.5px; }
+.bars { display:flex; align-items:flex-end; gap:3px; height:90px; }
+.bars div { flex:1; background:var(--a); border-radius:3px 3px 0 0; min-height:1px; position:relative; }
+.bars div.none { background:var(--line); }
+.axis { display:flex; justify-content:space-between; color:var(--muted); font-size:11px; margin-top:4px; }
+.scroll { overflow-x:auto; }
+.concl { font-size:15px; margin:0 0 14px; }
+@media (max-width:700px) { header, main { padding-left:16px; padding-right:16px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>mempool pending 信号 vs rust-uma：抢达与正确率</h1>
+  <div class="sub" id="status">正在取数据…</div>
+</header>
+<main>
+  <div class="tabs" id="tabs">
+    <button class="tab" data-w="h1">最近 1 小时</button>
+    <button class="tab on" data-w="h24">最近 24 小时</button>
+    <button class="tab" data-w="all">全部</button>
+  </div>
+  <p class="concl" id="concl"></p>
+  <div class="cards" id="cards"></div>
+
+  <section>
+    <h2>按小时：pending 先到比例 / pending 报价正确率</h2>
+    <div class="bars" id="barsA"></div><div class="axis"><span>48 小时前</span><span>现在</span></div>
+    <div style="height:12px"></div>
+    <div class="bars" id="barsB"></div><div class="axis"><span>48 小时前</span><span>现在</span></div>
+  </section>
+
+  <section>
+    <h2>最近的错误、无真值或迟到的 pending 信号</h2>
+    <div class="scroll"><table id="bad"></table></div>
+  </section>
+
+  <p class="sub">真值 = 链上第一笔成功的 ProposePrice（约 60 个块确认后查回执）。同一请求 = 同一 (requester, identifier, timestamp, ancillary)。
+    "可信地址"= 历史报价与真值一致的样本 ≥ <span id="rn"></span> 条、且一致率 95% 下限 ≥ <span id="rr"></span>（只用信号发出当时的历史，不看未来）。
+    "无真值"= 15 分钟内没找到成功上链的提案：可能是真的假信号，也可能是我们没收到对应的块。</p>
+</main>
+<script>
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const pct = (x, d = 1) => x == null ? "–" : (x * 100).toFixed(d) + "%";
+const ms = x => x == null ? "–" : (x >= 1000 ? (x / 1000).toFixed(2) + " 秒" : x.toFixed(0) + " ms");
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+let data = null, win = "h24";
+const OUT = { 1: "YES", 2: "NO", 3: "平局", 0: "?" };
+const price = p => p == null ? "–" : p === 1e18 || p === 1000000000000000000 ? "YES" : p === 0 ? "NO" : p === 5e17 ? "平局" : "其他";
+
+function card(title, big, lines, cls) {
+  return `<div class="card"><h3>${title}</h3><div class="big">${big}</div>${lines.map(l => `<div class="line">${l}</div>`).join("")}${cls ? `<div class="line"><span class="badge ${cls[0]}">${cls[1]}</span></div>` : ""}</div>`;
+}
+
+function render() {
+  const s = data[win];
+  const r = s.race, pa = s.pending_all, pt = s.pending_trusted, ru = s.rust, cv = s.coverage;
+  const verdict = [];
+  if (r.pending_first != null) verdict.push(`pending 在 <b>${pct(r.pending_first, 0)}</b> 的请求上比 rust-uma 先到，中位领先 <b>${ms(r.lead_ms.p50)}</b>`);
+  if (s.mu && s.mu.correct_rate != null) verdict.push(`mempool-uma 对外推送正确率 <b>${pct(s.mu.correct_rate, 2)}</b>，比 rust-uma 先到 <b>${pct(s.mu.first, 0)}</b>`);
+  if (pt.correct_rate != null) verdict.push(`可信地址的 pending 报价正确率 <b>${pct(pt.correct_rate, 2)}</b>`);
+  if (pa.correct_rate != null) verdict.push(`全部 pending 报价正确率 <b>${pct(pa.correct_rate, 2)}</b>`);
+  document.getElementById("concl").innerHTML = verdict.join("；") + "。";
+  const okCls = x => x == null ? null : x >= 0.999 ? ["g", "可放心用"] : x >= 0.99 ? ["w", "需配合过滤"] : ["b", "不可直接用"];
+  document.getElementById("cards").innerHTML = [
+    card("抢达：pending 先到比例", pct(r.pending_first, 0),
+      [`两边都有信号的请求 ${r.n} 个`, `领先 p10 ${ms(r.lead_ms.p10)} · p50 ${ms(r.lead_ms.p50)} · p90 ${ms(r.lead_ms.p90)}`,
+       `比真值所在块到达还早：${pct(r.pending_before_block, 0)}（中位 ${ms(r.pending_vs_block_ms.p50)}）`]),
+    card("pending 正确率（可信地址）", pct(pt.correct_rate, 2),
+      [`信号 ${pt.n}：正确 ${pt.correct} · 错误 ${pt.wrong} · 无真值 ${pt.no_truth}`, `其中迟到（别人已先上链）${pt.late ?? 0}`, `覆盖真值请求 ${pct(cv.pending_trusted, 0)}`], okCls(pt.correct_rate)),
+    card("pending 正确率（全部地址）", pct(pa.correct_rate, 2),
+      [`信号 ${pa.n}：正确 ${pa.correct} · 错误 ${pa.wrong} · 无真值 ${pa.no_truth}`, `其中迟到（别人已先上链）${pa.late ?? 0}`, `覆盖真值请求 ${pct(cv.pending, 0)}`,
+       `同一请求出现不同报价 ${s.pending_conflict} 次`], okCls(pa.correct_rate)),
+    s.mu && s.mu.n ? card("mempool-uma 对外推送（下游实际收到）", pct(s.mu.correct_rate, 2),
+      [`推送 ${s.mu.n}：正确 ${s.mu.correct} · 错误 ${s.mu.wrong} · 无真值 ${s.mu.no_truth} · 迟到 ${s.mu.late}`,
+       `比 rust-uma 先到 ${pct(s.mu.first, 0)}，中位领先 ${ms(s.mu.lead_ms.p50)}`, `覆盖真值请求 ${pct(s.mu.coverage, 0)}`], okCls(s.mu.correct_rate)) : "",
+    card("rust-uma 正确率", pct(ru.correct_rate, 2),
+      [`信号 ${ru.n}：正确 ${ru.correct} · 错误 ${ru.wrong} · 无真值 ${ru.no_truth}`, `覆盖真值请求 ${pct(cv.rust, 0)}（只推富化命中的市场）`], okCls(ru.correct_rate)),
+  ].join("");
+  const bars = (id, key) => document.getElementById(id).innerHTML = data.hourly.map(h =>
+    h[key] == null ? `<div class="none" title="无数据" style="height:2px"></div>` :
+      `<div title="${new Date(h.t * 1000).toLocaleString("zh-CN")} ${pct(h[key])}（${h.n} 个请求）" style="height:${Math.max(2, h[key] * 90)}px;${key === "pending_correct" ? "background:var(--b)" : ""}"></div>`).join("");
+  bars("barsA", "pending_first"); bars("barsB", "pending_correct");
+  document.getElementById("bad").innerHTML = `<tr><th>时间</th><th>提交地址</th><th>pending 报价</th><th>真值</th><th>可信</th></tr>` +
+    (data.bad.length ? data.bad.map(x => `<tr><td>${new Date(x.t * 1000).toLocaleString("zh-CN")}</td><td class="mono">${esc((x.pending_sender || "").slice(0, 12))}</td>
+      <td>${price(x.pending_price)}</td><td>${x.truth_price == null ? `<span class="badge w">无真值</span>` : x.pending_price !== x.truth_price ? `<span class="badge b">报价错：真值 ${price(x.truth_price)}</span>` : `<span class="badge w">迟到：报价对，但别人已先上链</span>`}</td>
+      <td>${x.pending_trusted ? "是" : "否"}</td></tr>`).join("") : `<tr><td colspan="5" class="sub">暂无</td></tr>`);
+  document.getElementById("rn").textContent = data.trust_rule.min_n;
+  document.getElementById("rr").textContent = pct(data.trust_rule.min_rate, 0);
+  document.getElementById("status").textContent = `更新于 ${new Date(data.t * 1000).toLocaleString("zh-CN")} · 可信地址 ${data.trusted_senders}/${data.senders} · 解析不了报价的包装合约交易 ${data.undecodable} 笔 · 每 30 秒刷新`;
+}
+
+async function load() {
+  try {
+    const r = await fetch(`/api/race?token=${encodeURIComponent(TOKEN)}`);
+    if (r.status === 401) { document.getElementById("status").textContent = "需要在地址后加 ?token=…"; return; }
+    data = await r.json();
+    if (!data.h24) { document.getElementById("status").textContent = "刚启动，数据累计中（真值要等约 2.5 分钟确认）…"; return; }
+    render();
+  } catch (e) { document.getElementById("status").textContent = "加载失败：" + e.message; }
+}
+document.querySelectorAll("#tabs .tab").forEach(b => b.onclick = () => {
+  win = b.dataset.w; document.querySelectorAll("#tabs .tab").forEach(x => x.classList.toggle("on", x === b)); if (data) render();
+});
+load(); setInterval(load, 30000);
+</script>
+</body>
+</html>
