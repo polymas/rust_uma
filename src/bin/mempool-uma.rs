@@ -2,7 +2,8 @@
 //!
 //! 与 `main.rs`（rust-uma）的差异只有三处，其余逐行对应：
 //! 1. 不跑 `run_rpc_loop`（链上日志订阅 + 补拉），改跑 `mempool::feed::run_pending_feed`；
-//! 2. 不读写 WAL、不维护 uma.cursor（决定 D4：纯内存，重启从头开始）；
+//! 2. 不维护 uma.cursor（没有区块游标可言）；WAL 与 rust-uma 一样读写，重启后事件历史、
+//!    `after_sequence` 续传和面板累计数都接得上（2026-10-01 用户改为写 WAL）；
 //! 3. 多跑一个 `run_confirm_feed`，只用链上确认事件更新去重状态和提交地址打分。
 //!
 //! 额外环境变量（其余与 rust-uma 相同，见 `.env.example`）：
@@ -35,10 +36,10 @@ use rust_uma::{
     },
     pipeline::{Processor, run_batcher},
     stats::Stats,
-    storage::Storage,
+    storage::{Storage, run_storage_writer},
 };
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -67,12 +68,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Storage::open(config.data_dir.clone())?;
     let catalog = Arc::new(Catalog::new(storage.load_catalog()?));
     let events = Arc::new(EventHub::new(config.event_ring_capacity));
-    let frames = Arc::new(FrameHub::resuming_after(config.frame_ring_capacity, 0));
+    // WAL 恢复，与 main.rs 相同：读不了就当空历史，不让一个旧文件拖垮启动。
+    let recovered = storage
+        .load_events(config.event_ring_capacity)
+        .unwrap_or_else(|error| {
+            warn!(%error, "event WAL unreadable; starting with empty event history");
+            Vec::new()
+        });
+    let mut initial_sequence = 0;
+    let mut last_broadcast_sequence = 0;
+    for event in recovered {
+        initial_sequence = initial_sequence.max(event.sequence);
+        if event.enrichment.is_some() {
+            last_broadcast_sequence = last_broadcast_sequence.max(event.sequence);
+        }
+        events.insert(event);
+    }
+    let frames = Arc::new(FrameHub::resuming_after(
+        config.frame_ring_capacity,
+        last_broadcast_sequence,
+    ));
     let stats = Arc::new(Stats::default());
+    if let Some(snapshot) = storage.load_enrichment_stats()? {
+        stats
+            .enrichment_hits
+            .store(snapshot.hits, Ordering::Relaxed);
+        stats
+            .enrichment_hits_via_market_id
+            .store(snapshot.hits_via_market_id, Ordering::Relaxed);
+        stats
+            .enrichment_misses
+            .store(snapshot.misses, Ordering::Relaxed);
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (batch_tx, batch_rx) = mpsc::channel(config.live_buffer.max(1));
-    // 决定 D4：不写 WAL。Processor 仍会往这个通道发事件，这里直接丢弃。
-    let (storage_tx, mut storage_rx) = mpsc::channel(config.live_buffer.max(1));
+    let (storage_tx, storage_rx) = mpsc::channel(config.live_buffer.max(1));
     let gamma = GammaClient::new(config.gamma_base_url.clone())?;
 
     let changed = sync_catalog_before_uma(
@@ -116,11 +146,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         batch_tx,
         storage_tx,
         stats.clone(),
-        0,
+        initial_sequence,
     ));
 
     let mut tasks = vec![
-        tokio::spawn(async move { while storage_rx.recv().await.is_some() {} }),
+        tokio::spawn(run_storage_writer(
+            storage.clone(),
+            events.clone(),
+            config.event_ring_capacity,
+            stats.clone(),
+            storage_rx,
+            shutdown_rx.clone(),
+        )),
         tokio::spawn(run_batcher(
             config.clone(),
             frames.clone(),
@@ -205,7 +242,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         catalog,
         stats,
     };
-    info!(address = %config.api_addr, "mempool-uma API listening");
+    info!(address = %config.api_addr, recovered_events = initial_sequence, "mempool-uma API listening");
     tokio::select! {
         result = serve(state, shutdown_rx.clone()) => result?,
         _ = shutdown_signal() => info!("shutdown signal received"),

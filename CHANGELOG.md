@@ -29,7 +29,8 @@
     （报价与链上一致率，样本 ≥50 且 95% 下限 ≥98%）、小费门槛（近 1 小时进块 propose 的 5 分位）。
   - `feed.rs`：pending 从本机 P2P 轻量节点（`tools/p2p-mempool-probe`，`-feed-listen`）读入；
     链上确认事件（启动回补 3 小时 + WSS 订阅）只用来更新去重状态和打分，不推给下游。
-  - 不写 WAL、不维护 uma.cursor（重启从头开始）；pending 出错不撤回，以 rust-uma 的确认事件为准。
+  - 和 rust-uma 一样写 WAL（重启后事件历史与 `after_sequence` 续传接得上），不维护 uma.cursor；
+    pending 出错不撤回，以 rust-uma 的确认事件为准。
 - rust-uma 本身的行为不变。另附 Polygon P2P 实验工具与测量程序：`tools/p2p-mempool-probe/`
   （Go 轻量节点、节点席位管理、pending vs rust-uma 对比服务）、`examples/mempool_probe.rs`、
   `examples/head_race.rs`。
