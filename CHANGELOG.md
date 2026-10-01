@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.12.0（2026-10-01，待补）
+## v0.12.0（2026-10-01，8c991de）
 - **新增第三个二进制 `mempool-uma`**（`src/bin/mempool-uma.rs` + `src/mempool/`）：和 rust-uma
   同一套富化 / 分类 / 编码 / WSS（proto 完全不变），事件来源换成 Polygon 内存池里的 pending
   交易。部署在 polytest（`0.0.0.0:8013`，不鉴权，同 rust-uma）。
