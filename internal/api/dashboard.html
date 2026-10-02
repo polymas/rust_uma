@@ -105,12 +105,36 @@
   td.mono { font-variant-numeric: tabular-nums; }
   td a { color: var(--text); text-decoration: underline; text-decoration-color: var(--dim); }
   td a:hover { color: var(--ok); text-decoration-color: var(--ok); }
+  .forfeit-card {
+    margin-top: 14px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px; flex: 0 0 auto; max-height: 40vh; overflow: auto;
+  }
+  .forfeit-card > h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim);
+    margin: 0 0 8px; display: flex; gap: 10px; align-items: center;
+  }
+  .forfeit-card h2 .hint { text-transform: none; letter-spacing: normal; font-weight: 400; }
+  .forfeit-card details { border-top: 1px dashed var(--border); padding: 6px 0; }
+  .forfeit-card summary { cursor: pointer; color: var(--text); }
+  .forfeit-card summary .dim { color: var(--dim); }
+  .forfeit-card table { margin: 6px 0 4px 14px; width: calc(100% - 14px); }
+  .tag { display: inline-block; padding: 0 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--dim); }
+  .tag.bad { color: var(--bad); border-color: var(--bad); }
+  .tag.warn { color: var(--warn); border-color: var(--warn); }
+  .tag.ok { color: var(--ok); border-color: var(--ok); }
+  tr.hit td { color: var(--bad); }
 </style>
 </head>
 <body>
 <h1>rust-uma 运行监控</h1>
 <div id="meta">加载中…</div>
 <div class="grid" id="grid"></div>
+
+<div class="forfeit-card" id="forfeitCard" style="display:none">
+  <h2><span>电竞弃权排除名单</span><span class="hint" id="forfeitHint"></span></h2>
+  <div id="forfeitBlocked"></div>
+  <div id="forfeitMatches"></div>
+</div>
 
 <div class="events-card">
   <h2>
@@ -590,9 +614,99 @@ async function tick() {
     ["累计下发帧数", data.ws_frames_sent_total],
   ]));
 
+  renderForfeit(data.forfeit);
+
   prev = data;
   prevAt = now;
 }
+
+// ---- 电竞弃权排除名单 ----
+// 数据来自 forfeit-feed（tools/forfeit-feed）：某场比赛任一局被判弃权，这场比赛在
+// Polymarket 上的全部子市场 condition_id 进名单，命中的 UMA 事件不广播。
+const MARKET_TYPE_ZH = {
+  moneyline: "整场胜负", child_moneyline: "单局胜负", totals: "总局数大小",
+  map_handicap: "局数让分", game_handicap: "局数让分",
+  lol_both_teams_baron: "双方都击杀大龙", lol_both_teams_dragon: "双方都击杀小龙",
+  lol_both_teams_inhibitors: "双方都破水晶", lol_quadra_kill: "出现四杀", lol_penta_kill: "出现五杀",
+  lol_odd_even_total_kills: "总击杀单双",
+};
+function marketTypeZh(t) {
+  if (!t) return "—";
+  if (MARKET_TYPE_ZH[t]) return MARKET_TYPE_ZH[t];
+  let m;
+  if ((m = t.match(/^round_handicap_game_(\d+)$/))) return `第${m[1]}图回合让分`;
+  if ((m = t.match(/^round_over_under_game_(\d+)$/))) return `第${m[1]}图回合大小`;
+  return t;
+}
+function fmtDateTime(us) {
+  if (!us) return "—";
+  const d = new Date(us / 1000);
+  return d.toLocaleString(undefined, { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function escHtml(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+let forfeitSig = "";
+const forfeitClosed = new Set();
+function renderForfeit(f) {
+  const cardEl = document.getElementById("forfeitCard");
+  if (!f) return;
+  const feedOk = f.enabled && f.feed_connected;
+  grid.appendChild(card("弃权排除名单 (forfeit)", !f.enabled ? "" : (feedOk ? "ok" : "bad"), f.enabled ? [
+    ["订阅 forfeit-feed", feedOk ? "已连接" : "断开", feedOk ? "ok" : "bad"],
+    ["最后一帧", fmtAgo(f.feed_last_frame_at_us)],
+    ["已同步 seq（本地 / 服务端）", `${f.last_feed_sequence} / ${f.feed_server_last_sequence}`,
+      f.last_feed_sequence >= f.feed_server_last_sequence ? "ok" : "warn"],
+    ["名单比赛数", f.matches.length],
+    ["名单 condition_id 数", f.blocked_condition_ids],
+    ["已拦下的 UMA 事件", f.blocked_events_total, f.blocked_events_total > 0 ? "warn" : ""],
+    ["过期", `${f.ttl_days} 天后移出名单`],
+    ["累计连接次数", f.feed_connects_total, f.feed_connects_total > 1 ? "warn" : ""],
+    ...(f.feed_last_error ? [["最近错误", `${escHtml(f.feed_last_error)}（${fmtAgo(f.feed_last_error_at_us)}）`, "bad"]] : []),
+  ] : [["状态", "未启用（未配置 FORFEIT_FEED_URL）"]]));
+  if (!f.enabled) { cardEl.style.display = "none"; return; }
+  cardEl.style.display = "";
+  document.getElementById("forfeitHint").textContent =
+    `${f.matches.length} 场比赛 · ${f.blocked_condition_ids} 个 condition_id · 拦下 ${f.blocked_events_total} 条 UMA 事件`;
+  const sig = JSON.stringify([f.matches.map(m => [m.pandascore_match_id, m.markets.length, m.blocked_events, m.lookup_status]), f.recent_blocked.length]);
+  if (sig === forfeitSig) return;   // 没变化不重绘，保留展开状态和选中的文本
+  forfeitSig = sig;
+
+  const blocked = f.recent_blocked;
+  document.getElementById("forfeitBlocked").innerHTML = blocked.length ? `
+    <details open data-k="blocked"><summary>最近被拦下的 UMA 事件 <span class="dim">（${blocked.length} 条，未广播给下游）</span></summary>
+    <table><thead><tr><th>拦下时间</th><th>序号</th><th>类型</th><th>比赛</th><th>Market ID</th><th>Condition ID</th><th>交易</th></tr></thead><tbody>
+    ${blocked.map(b => `<tr><td>${fmtDateTime(b.blocked_at_us)}</td><td class="mono">#${b.sequence}</td><td>${b.kind}</td>
+      <td>${escHtml(b.match_name)} <span class="dim">(${b.pandascore_match_id})</span></td><td class="mono">${b.market_id}</td>
+      <td class="mono">${b.condition_id}</td>
+      <td><a href="https://polygonscan.com/tx/${b.transaction_hash}" target="_blank" rel="noopener">${short(b.transaction_hash)}</a></td></tr>`).join("")}
+    </tbody></table></details>` : "";
+
+  document.getElementById("forfeitMatches").innerHTML = f.matches.map(m => {
+    const key = String(m.pandascore_match_id);
+    const games = m.forfeited_games.map(g => g ? "G" + g : "整场").join(" / ");
+    const status = m.lookup_status === "matched"
+      ? `<span class="tag ok">排除 ${m.markets.length} 个市场</span>`
+      : `<span class="tag warn">${m.lookup_status === "not_found" ? "Polymarket 未开盘" : "关联失败，等待 forfeit-feed 重试"}</span>`;
+    const rows = m.markets.map(mk => `<tr class="${mk.is_forfeited_market ? "hit" : ""}">
+        <td>${mk.game_number ? "G" + mk.game_number : "整场"}</td>
+        <td>${marketTypeZh(mk.sports_market_type)}${mk.is_forfeited_market ? " · 弃权局" : ""}</td>
+        <td class="mono">${mk.condition_id}</td>
+        <td>${escHtml(mk.question)}</td></tr>`).join("");
+    return `<details data-k="${key}" ${forfeitClosed.has(key) ? "" : "open"}>
+      <summary><span class="tag">${escHtml(m.game)}</span> ${escHtml(m.team_a)} vs ${escHtml(m.team_b)}
+        <span class="dim">${escHtml(m.league)} · 探测 ${fmtDateTime(m.detect_at_us)}</span>
+        <span class="tag bad">弃权 ${games}</span> ${status}
+        ${m.blocked_events ? `<span class="tag bad">已拦 ${m.blocked_events} 条</span>` : ""}
+        ${m.pm_event_slug ? `<a href="https://polymarket.com/event/${escHtml(m.pm_event_slug)}" target="_blank" rel="noopener" style="color:var(--dim)">${escHtml(m.pm_event_slug)}</a>` : ""}
+      </summary>
+      ${rows ? `<table><thead><tr><th>局</th><th>事件类型</th><th>Condition ID</th><th>市场</th></tr></thead><tbody>${rows}</tbody></table>` : ""}
+    </details>`;
+  }).join("");
+}
+document.addEventListener("toggle", (ev) => {
+  const d = ev.target;
+  if (!d.matches || !d.matches(".forfeit-card details") || !d.dataset.k) return;
+  d.open ? forfeitClosed.delete(d.dataset.k) : forfeitClosed.add(d.dataset.k);
+}, true);
 
 tick();
 setInterval(tick, 2000);

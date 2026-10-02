@@ -83,6 +83,7 @@ src/
 │       ├── propose_price.rs
 │       └── dispute_price.rs
 ├── enrichment.rs   # Gamma 预热缓存（Catalog），market_id 优先解析
+├── forfeit.rs      # 电竞弃权排除名单：订阅 forfeit-feed，命中名单的事件不广播
 ├── pipeline.rs     # 去重、富化、批处理
 ├── hub.rs          # 事件环 + 预编码帧环
 ├── wire.rs         # Protobuf + Zstd 编码

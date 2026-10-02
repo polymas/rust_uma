@@ -17,6 +17,7 @@ flowchart TD
         WSSN["WSS 端点 #N\n(WSS_RPC_LIST)"]
         HTTP["HTTP RPC"]
         GAPI["Gamma API\n/markets/keyset"]
+        FFEED["forfeit-feed WSS\n(电竞弃权, protobuf)"]
     end
 
     subgraph INGEST["uma/rpc.rs · 采集"]
@@ -34,11 +35,13 @@ flowchart TD
         RESOLVE["Catalog::resolve\nmarket_id 优先 → 链上推导兜底"]
         ERING[("EventHub\n事件环")]
         BATCH["run_batcher\n阻塞等第一条 · 非阻塞捎带\n(无定时窗口)"]
+        BLK{"弃权排除名单\nForfeitBlocklist::lookup\n(读锁 + HashMap)"}
         ENC["encode_frame\nProtobuf +（超阈值）Zstd"]
         FRING[("FrameHub\n预编码帧环")]
 
         DEDUP -->|新事件| RESOLVE --> ERING
-        ERING -->|"仅富化命中\n(miss 只落 WAL/HTTPAPI，不广播)"| BATCH --> ENC --> FRING
+        ERING -->|"仅富化命中\n(miss 只落 WAL/HTTPAPI，不广播)"| BLK
+        BLK -->|"不在名单"| BATCH --> ENC --> FRING
     end
 
     subgraph ENRICH["enrichment.rs · 启动前预热"]
@@ -71,6 +74,7 @@ flowchart TD
     DEDUP -->|重复| DROP
 
     GAPI --> SYNC
+    FFEED -->|"forfeit.rs::run_forfeit_feed\n后台订阅 + 落盘 forfeit_blocklist.json"| BLK
     SYNC -.->|落盘后才推进 cursor| SNAP
     SYNC -.-> CUR
     CAT -.->|"O(1) 内存查询\n零网络请求"| RESOLVE
@@ -85,8 +89,8 @@ flowchart TD
     classDef warm fill:#f5e9da,stroke:#a8632a,color:#4a3016;
     classDef sink fill:#efe7f5,stroke:#7c5ba8,color:#33234a;
     classDef void fill:#f0f0ee,stroke:#adaa9e,color:#6b6a5c,stroke-dasharray: 3 2;
-    class WSS1,WSSN,HTTP,GAPI,LW,BF,DEC src;
-    class DEDUP,RESOLVE,ERING,BATCH,ENC,FRING hot;
+    class WSS1,WSSN,HTTP,GAPI,FFEED,LW,BF,DEC src;
+    class DEDUP,RESOLVE,ERING,BLK,BATCH,ENC,FRING hot;
     class SYNC,RECONCILE,CAT,WAL,SNAP,CUR warm;
     class WSAPI,HTTPAPI sink;
     class DROP void;

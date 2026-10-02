@@ -10,6 +10,7 @@ use rust_uma::{
         Catalog, GammaClient, run_catalog_reconcile, run_catalog_sync, run_new_market_watch,
         sync_catalog_before_uma,
     },
+    forfeit::{ForfeitBlocklist, run_forfeit_feed},
     hub::{EventHub, FrameHub},
     pipeline::{Processor, run_batcher},
     stats::Stats,
@@ -41,6 +42,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let catalog_rows = storage.load_catalog()?;
     let catalog = Arc::new(Catalog::new(catalog_rows));
     let events = Arc::new(EventHub::new(config.event_ring_capacity));
+    // 弃权排除名单要在恢复 WAL 之前读回：算续传下限时要知道哪些事件当初被拦下了。
+    let forfeit = Arc::new(ForfeitBlocklist::from_config(&config));
     // A WAL this build can't decode (e.g. a wire schema change since the last
     // run — see docs/WORKFLOW.md "升级") must not be fatal: that turns one
     // stale local file into a full outage via systemd's restart loop, for
@@ -55,11 +58,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut initial_sequence = 0;
     // Only enriched events were ever broadcast (see `Processor::process`), so
     // this — not `initial_sequence` — is the newest cursor a downstream can
-    // legitimately hold from the previous process.
+    // legitimately hold from the previous process. Events the forfeit
+    // blocklist held back weren't broadcast either.
     let mut last_broadcast_sequence = 0;
     for event in recovered {
         initial_sequence = initial_sequence.max(event.sequence);
-        if event.enrichment.is_some() {
+        if event.enrichment.is_some()
+            && !forfeit.blocked_before(
+                &event.resolved_condition_id(),
+                event.event.chain().upstream_received_at_us,
+            )
+        {
             last_broadcast_sequence = last_broadcast_sequence.max(event.sequence);
         }
         events.insert(event);
@@ -118,6 +127,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         batch_tx,
         storage_tx,
         stats.clone(),
+        forfeit.clone(),
         initial_sequence,
     ));
 
@@ -160,6 +170,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             stats.clone(),
             shutdown_rx.clone(),
         )),
+        tokio::spawn(run_forfeit_feed(
+            config.clone(),
+            forfeit.clone(),
+            shutdown_rx.clone(),
+        )),
         tokio::spawn(run_rpc_loop(
             config.clone(),
             storage,
@@ -175,6 +190,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         frames,
         catalog,
         stats,
+        forfeit,
     };
     info!(address=%config.api_addr, recovered_events=initial_sequence, "rust_uma API listening");
     tokio::select! {

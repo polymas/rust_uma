@@ -29,6 +29,7 @@ use rust_uma::{
         Catalog, GammaClient, run_catalog_reconcile, run_catalog_sync, run_new_market_watch,
         sync_catalog_before_uma,
     },
+    forfeit::{ForfeitBlocklist, run_forfeit_feed},
     hub::{EventHub, FrameHub},
     mempool::{
         feed::{run_confirm_feed, run_pending_feed},
@@ -139,6 +140,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let gate = Arc::new(Mutex::new(gate));
 
+    // 与 rust-uma 同一套弃权排除名单（配了 FORFEIT_FEED_URL 才启用）。
+    let forfeit = Arc::new(ForfeitBlocklist::from_config(&config));
     let processor = Arc::new(Processor::new(
         config.clone(),
         catalog.clone(),
@@ -146,10 +149,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         batch_tx,
         storage_tx,
         stats.clone(),
+        forfeit.clone(),
         initial_sequence,
     ));
 
     let mut tasks = vec![
+        tokio::spawn(run_forfeit_feed(
+            config.clone(),
+            forfeit.clone(),
+            shutdown_rx.clone(),
+        )),
         tokio::spawn(run_storage_writer(
             storage.clone(),
             events.clone(),
@@ -241,6 +250,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         frames,
         catalog,
         stats,
+        forfeit: forfeit.clone(),
     };
     info!(address = %config.api_addr, recovered_events = initial_sequence, "mempool-uma API listening");
     tokio::select! {

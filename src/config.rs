@@ -61,6 +61,15 @@ pub struct Config {
     /// `None` (unset) leaves those routes closed — the monitoring panel refuses
     /// to serve rather than default to open on a fresh deploy.
     pub dashboard_token: Option<String>,
+    /// forfeit-feed 的 WSS 地址（`tools/forfeit-feed`）。设置后订阅它维护电竞弃权
+    /// 排除名单，命中名单的事件不广播（见 `forfeit.rs`）；不设则不启用。
+    pub forfeit_feed_url: Option<String>,
+    pub forfeit_feed_token: Option<String>,
+    /// 每次连上让 forfeit-feed 补推的历史条数——名单靠重放整段历史保持完整，
+    /// 要覆盖 TTL 窗口内的全部弃权（实测约 1 场/天）。
+    pub forfeit_feed_backfill: u64,
+    /// 一场比赛进名单多久后移出。
+    pub forfeit_block_ttl: Duration,
 }
 
 #[derive(Debug, Error)]
@@ -105,6 +114,10 @@ pub(crate) fn test_config() -> Config {
         require_market_id: false,
         ws_write_timeout: Duration::from_secs(5),
         dashboard_token: None,
+        forfeit_feed_url: None,
+        forfeit_feed_token: None,
+        forfeit_feed_backfill: 0,
+        forfeit_block_ttl: Duration::ZERO,
     }
 }
 
@@ -200,6 +213,12 @@ impl Config {
             require_market_id: parse_bool("REQUIRE_MARKET_ID", true)?,
             ws_write_timeout: Duration::from_millis(parse("WS_WRITE_TIMEOUT_MS", "5000")?),
             dashboard_token: nonempty("DASHBOARD_TOKEN"),
+            forfeit_feed_url: nonempty("FORFEIT_FEED_URL"),
+            forfeit_feed_token: nonempty("FORFEIT_FEED_TOKEN"),
+            forfeit_feed_backfill: parse("FORFEIT_FEED_BACKFILL", "5000")?,
+            forfeit_block_ttl: Duration::from_secs(
+                parse::<u64>("FORFEIT_BLOCK_TTL_DAYS", "30")?.max(1) * 86_400,
+            ),
         })
     }
 }

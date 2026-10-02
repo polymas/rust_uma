@@ -692,6 +692,7 @@ mod tests {
             batch_tx,
             storage_tx,
             Arc::new(Stats::default()),
+            Arc::new(crate::forfeit::ForfeitBlocklist::disabled()),
             0,
         ));
 

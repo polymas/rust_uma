@@ -215,6 +215,13 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
   为了补救 miss 发起 Gamma 请求，目录由周期性预缓存刷新补充。`ENRICHMENT_STATUS_MISS`
   这个 wire 值本身仍然存在于 schema 里（本地存储会用到），但由于命中不到的
   事件根本不会被广播，实际上不会出现在下游收到的任何一帧里。
+- **电竞弃权排除名单**：配置了 `FORFEIT_FEED_URL` 时，服务订阅 forfeit-feed
+  （PandaScore 弃权信号，协议 `proto/polyuma/forfeit/v1`）。某场电竞比赛任一局被
+  判弃权后，这场比赛在 Polymarket 上的全部子市场（各局胜负、整场胜负、让分、大
+  小、局内道具盘）的 condition_id 进入排除名单，之后这些市场的 propose/dispute
+  **不会经 WSS 广播**（与目录未命中一样只做本地记录）。因此 `sequence` 会出现
+  空洞，属正常现象。名单在 `/dashboard` 的"电竞弃权排除名单"一节可见；
+  forfeit-feed 不可用时不拦截任何新比赛（不影响已在名单里的比赛）。
 - UMA cursor 落后是安全的：重放可能产生重复事件，但不会遗漏事件。
 - 被移除或发生链重组的日志仍会保留，并标记 `removed=true`。
 

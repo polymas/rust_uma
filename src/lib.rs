@@ -4,6 +4,7 @@ pub mod config;
 pub mod console;
 pub mod edge;
 pub mod enrichment;
+pub mod forfeit;
 pub mod hub;
 pub mod mempool;
 pub mod model;

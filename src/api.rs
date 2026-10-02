@@ -21,6 +21,7 @@ use tracing::warn;
 use crate::{
     config::Config,
     enrichment::Catalog,
+    forfeit::{ForfeitBlocklist, ForfeitView},
     hub::{EventHub, FrameHub, FrameReadError},
     stats::Stats,
 };
@@ -34,6 +35,7 @@ pub struct AppState {
     pub frames: Arc<FrameHub>,
     pub catalog: Arc<Catalog>,
     pub stats: Arc<Stats>,
+    pub forfeit: Arc<ForfeitBlocklist>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -89,6 +91,10 @@ struct HealthResponse {
     latest_block: u64,
     event_ring_oldest_sequence: u64,
     event_ring_latest_sequence: u64,
+    forfeit_enabled: bool,
+    forfeit_feed_connected: bool,
+    forfeit_blocked_condition_ids: usize,
+    forfeit_blocked_events_total: u64,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -131,6 +137,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         latest_block: state.stats.latest_block.load(Ordering::Relaxed),
         event_ring_oldest_sequence: oldest,
         event_ring_latest_sequence: latest,
+        forfeit_enabled: state.forfeit.is_enabled(),
+        forfeit_feed_connected: state.forfeit.feed.connected.load(Ordering::Relaxed),
+        forfeit_blocked_condition_ids: state.forfeit.blocked_condition_ids(),
+        forfeit_blocked_events_total: state.forfeit.blocked_events_total(),
     })
 }
 
@@ -213,6 +223,18 @@ async fn metrics(State(state): State<AppState>) -> Response {
         ),
         ("rust_uma_event_ring_oldest_sequence", oldest),
         ("rust_uma_event_ring_latest_sequence", latest),
+        (
+            "rust_uma_forfeit_feed_connected",
+            state.forfeit.feed.connected.load(Ordering::Relaxed) as u64,
+        ),
+        (
+            "rust_uma_forfeit_blocked_condition_ids",
+            state.forfeit.blocked_condition_ids() as u64,
+        ),
+        (
+            "rust_uma_forfeit_blocked_events_total",
+            state.forfeit.blocked_events_total(),
+        ),
     ];
     let body = values
         .into_iter()
@@ -281,6 +303,8 @@ struct DashboardData {
     /// fastest one to actually get stored. See `Stats::source_race`. Sorted by
     /// `source` for a stable dashboard row order across polls.
     rpc_source_race: Vec<SourceRace>,
+    /// 电竞弃权排除名单：订阅状态、名单明细、最近被拦下的事件。
+    forfeit: ForfeitView,
 }
 
 #[derive(Serialize)]
@@ -365,6 +389,7 @@ async fn dashboard_data(
             list.sort_by(|a, b| a.source.cmp(&b.source));
             list
         },
+        forfeit: state.forfeit.view(),
     }))
 }
 
@@ -563,6 +588,7 @@ mod tests {
             frames: Arc::new(frames),
             catalog: Arc::new(Catalog::new(Vec::new())),
             stats: stats.clone(),
+            forfeit: Arc::new(ForfeitBlocklist::disabled()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

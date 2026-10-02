@@ -12,6 +12,7 @@ use tracing::{debug, error, warn};
 use crate::{
     config::Config,
     enrichment::Catalog,
+    forfeit::ForfeitBlocklist,
     hub::{EventHub, FrameHub},
     model::{EventKey, EventKind, EventRecord, PriceOutcome, hex_prefixed},
     stats::Stats,
@@ -33,6 +34,8 @@ pub struct Processor {
     batch_tx: mpsc::Sender<Arc<EventRecord>>,
     storage_tx: mpsc::Sender<StorageCommand>,
     stats: Arc<Stats>,
+    /// 电竞弃权排除名单：命中的事件不广播。未启用时是空名单。
+    forfeit: Arc<ForfeitBlocklist>,
     sequence: AtomicU64,
     /// Ring of the last `RECENT_ENRICHMENT_WINDOW` enrichment outcomes
     /// (true = hit). A plain `Mutex` is fine here: multiple WSS racers can
@@ -51,6 +54,7 @@ impl Processor {
         batch_tx: mpsc::Sender<Arc<EventRecord>>,
         storage_tx: mpsc::Sender<StorageCommand>,
         stats: Arc<Stats>,
+        forfeit: Arc<ForfeitBlocklist>,
         initial_sequence: u64,
     ) -> Self {
         Self {
@@ -60,6 +64,7 @@ impl Processor {
             batch_tx,
             storage_tx,
             stats,
+            forfeit,
             sequence: AtomicU64::new(initial_sequence),
             recent_enrichment: Mutex::new(VecDeque::with_capacity(RECENT_ENRICHMENT_WINDOW)),
         }
@@ -191,7 +196,22 @@ impl Processor {
         // can do with it, so it stops here: dedup ring + WAL + the `warn!`
         // above are its only record, never `batch_tx`/WSS. See the doc
         // comment above the miss branch.
-        if enriched && self.batch_tx.send(record).await.is_err() {
+        if !enriched {
+            return;
+        }
+        // 电竞弃权排除名单：这场比赛有局被判弃权，结果可能因争议反转，不广播。
+        // 和 miss 一样照样进去重环与 WAL；只是一次读锁 + HashMap 查询，不碰网络。
+        if let Some(match_id) = self.forfeit.lookup(&record.resolved_condition_id()) {
+            self.forfeit.record_blocked(&record, match_id);
+            warn!(
+                tx = %raw.transaction_hash,
+                condition_id = %hex_prefixed(&record.resolved_condition_id()),
+                pandascore_match_id = match_id,
+                "forfeit blocklist hit: not broadcasting"
+            );
+            return;
+        }
+        if self.batch_tx.send(record).await.is_err() {
             error!("batch pipeline stopped");
         }
     }
@@ -349,6 +369,17 @@ mod tests {
         mpsc::Receiver<Arc<EventRecord>>,
         mpsc::Receiver<StorageCommand>,
     ) {
+        build_processor_with(catalog, Arc::new(ForfeitBlocklist::disabled()))
+    }
+
+    fn build_processor_with(
+        catalog: Catalog,
+        forfeit: Arc<ForfeitBlocklist>,
+    ) -> (
+        Processor,
+        mpsc::Receiver<Arc<EventRecord>>,
+        mpsc::Receiver<StorageCommand>,
+    ) {
         let (batch_tx, batch_rx) = mpsc::channel(4);
         let (storage_tx, storage_rx) = mpsc::channel(4);
         let processor = Processor::new(
@@ -358,6 +389,7 @@ mod tests {
             batch_tx,
             storage_tx,
             Arc::new(Stats::default()),
+            forfeit,
             0,
         );
         (processor, batch_rx, storage_rx)
@@ -400,6 +432,44 @@ mod tests {
             Ok(StorageCommand::Event(_))
         ));
         assert_eq!(processor.stats.enrichment_hits.load(Ordering::Relaxed), 1);
+    }
+
+    /// 端到端：解码 → Catalog::resolve 命中 → condition_id 在弃权排除名单里 →
+    /// 不进 batcher（不广播），但照样写 WAL、记一条被拦事件。
+    #[tokio::test]
+    async fn forfeit_blocklisted_condition_is_stored_but_never_broadcast() {
+        use crate::forfeit::pb;
+        let market = MarketEnrichment {
+            market_id: 42,
+            condition_id: [9; 32],
+            token_ids: vec![[1; 32], [2; 32]],
+            tag_ids: vec![],
+            category: Category::Unspecified,
+            bet_type: BetType::Unspecified,
+            neg_risk: false,
+        };
+        let forfeit = Arc::new(ForfeitBlocklist::enabled_for_test());
+        forfeit.apply(&pb::ForfeitEvent {
+            sequence: 1,
+            pandascore_match_id: 77,
+            lookup_status: pb::LookupStatus::Matched as i32,
+            condition_ids: vec![vec![9; 32]],
+            ..Default::default()
+        });
+        let (processor, mut batch_rx, mut storage_rx) =
+            build_processor_with(Catalog::new(vec![market]), forfeit.clone());
+
+        processor.process(propose_log(), 1, "test").await;
+
+        assert!(batch_rx.try_recv().is_err());
+        assert!(matches!(
+            storage_rx.try_recv(),
+            Ok(StorageCommand::Event(_))
+        ));
+        assert_eq!(forfeit.blocked_events_total(), 1);
+        let view = forfeit.view();
+        assert_eq!(view.recent_blocked[0].pandascore_match_id, 77);
+        assert_eq!(view.matches[0].blocked_events, 1);
     }
 
     /// Two racers deliver the same log; whichever wins the dedup race (here,

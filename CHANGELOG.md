@@ -17,6 +17,20 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.13.0（2026-10-02）
+- **电竞弃权排除名单**（`src/forfeit.rs`）：配置 `FORFEIT_FEED_URL` 后订阅 forfeit-feed
+  （`tools/forfeit-feed`，协议 `proto/polyuma/forfeit/v1`）。某场电竞比赛任一局被 PandaScore
+  判弃权，这场比赛在 Polymarket 上的全部子市场 condition_id 进名单，之后命中的 propose/dispute
+  **不广播**（同富化 miss：照样进去重环和 WAL，打 `WARN forfeit blocklist hit`）。
+  - 热路径只多一次读锁 + HashMap 查询；订阅、解码、落盘都在后台任务。
+  - 名单维护：forfeit-feed 的事件日志是唯一来源，每次连上带 `backfill` 重放整段历史，按
+    condition_id 取并集（幂等）；落盘 `DATA_DIR/forfeit_blocklist.json`，重启后连上之前就生效；
+    `FORFEIT_BLOCK_TTL_DAYS`（默认 30）天后整场移出；forfeit-feed 不可用时放行（不拦新比赛）。
+  - 重启时算 `FrameHub` 续传下限会排除当初被拦下的事件。
+  - `/dashboard` 新增"电竞弃权排除名单"：订阅状态、按比赛的 condition_id 表、最近被拦事件；
+    `/healthz`、`/metrics` 新增 `forfeit_*` 计数。
+  - 下游可见变化：`sequence` 空洞会多一种来源（见 `/llms.txt`）；wire 协议不变。
+
 ## v0.12.0（2026-10-01，8c991de）
 - **新增第三个二进制 `mempool-uma`**（`src/bin/mempool-uma.rs` + `src/mempool/`）：和 rust-uma
   同一套富化 / 分类 / 编码 / WSS（proto 完全不变），事件来源换成 Polygon 内存池里的 pending

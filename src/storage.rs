@@ -347,7 +347,7 @@ impl Storage {
     }
 }
 
-fn atomic_write(path: &Path, value: &[u8]) -> Result<(), StorageError> {
+pub(crate) fn atomic_write(path: &Path, value: &[u8]) -> Result<(), StorageError> {
     let temp = temporary_path(path);
     let mut file = File::create(&temp)?;
     file.write_all(value)?;
