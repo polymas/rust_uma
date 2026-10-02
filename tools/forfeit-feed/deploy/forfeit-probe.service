@@ -1,0 +1,15 @@
+[Unit]
+Description=forfeit-feed PandaScore 探针（写 result_probe.csv）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=forfeit
+WorkingDirectory=/var/lib/forfeit-feed
+EnvironmentFile=/etc/forfeit-feed/forfeit-feed.env
+ExecStart=/usr/bin/python3 /opt/forfeit-feed/ps_probe.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

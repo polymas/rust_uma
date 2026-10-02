@@ -1,0 +1,15 @@
+[Unit]
+Description=forfeit-feed WebSocket/HTTP 服务（127.0.0.1:8815，外层 Caddy TLS）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=forfeit
+WorkingDirectory=/var/lib/forfeit-feed
+EnvironmentFile=/etc/forfeit-feed/forfeit-feed.env
+ExecStart=/usr/bin/python3 /opt/forfeit-feed/forfeit_ws.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

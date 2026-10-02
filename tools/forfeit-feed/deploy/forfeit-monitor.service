@@ -1,0 +1,15 @@
+[Unit]
+Description=forfeit-feed 订阅监控（订阅公网 wss + 看板 127.0.0.1:8816，Caddy /dash）
+After=network-online.target forfeit-feed.service caddy.service
+Wants=network-online.target
+
+[Service]
+User=forfeit
+WorkingDirectory=/var/lib/forfeit-feed
+EnvironmentFile=/etc/forfeit-feed/forfeit-monitor.env
+ExecStart=/usr/bin/python3 /opt/forfeit-feed/forfeit_monitor.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

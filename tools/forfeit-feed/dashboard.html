@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forfeit 监控</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#fff; --text:#1d2330; --muted:#6b7385; --line:#e3e6ec;
+  --ok:#1a7f4b; --ok-bg:#e3f4ea; --warn:#9a6200; --warn-bg:#fdf1d8; --bad:#b42318; --bad-bg:#fde7e5;
+  --accent:#2f5bd3; --chip:#eef1f6; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0f1218; --panel:#171b23; --text:#e6e9ef; --muted:#8b93a5; --line:#262c38;
+    --ok:#5fd394; --ok-bg:#163525; --warn:#f2c055; --warn-bg:#3a2e12; --bad:#ff8a80; --bad-bg:#3d1b19;
+    --accent:#7aa2ff; --chip:#222837;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif}
+.wrap{max-width:1280px;margin:0 auto;padding:20px 16px 40px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px;margin-bottom:16px}
+h1{font-size:20px;margin:0}
+.sub{color:var(--muted);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.card .k{color:var(--muted);font-size:12px}
+.card .v{font-size:22px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+.card .d{color:var(--muted);font-size:12px;margin-top:2px;word-break:break-all}
+.pill{display:inline-block;white-space:nowrap;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600}
+.ok{color:var(--ok);background:var(--ok-bg)} .warn{color:var(--warn);background:var(--warn-bg)} .bad{color:var(--bad);background:var(--bad-bg)}
+.chip{display:inline-block;white-space:nowrap;padding:0 6px;border-radius:4px;background:var(--chip);font-size:12px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0 10px}
+.bar input,.bar select{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font:inherit}
+.bar label{color:var(--muted);font-size:13px;display:flex;gap:4px;align-items:center}
+.tablewrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:900px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-size:12px;color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--panel)}
+tr.ev{cursor:pointer} tr.ev:hover td{background:var(--chip)}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+.mono{font-family:var(--mono);font-size:12px;word-break:break-all}
+.detail td{background:var(--bg)}
+.kv{display:grid;grid-template-columns:140px 1fr;gap:4px 12px;font-size:13px}
+.kv div:nth-child(odd){color:var(--muted)}
+table.inner{min-width:800px;margin-top:6px;background:var(--panel);border:1px solid var(--line);border-radius:6px}
+table.inner th,table.inner td{padding:4px 8px;font-size:12px}
+button.copy{background:var(--panel);color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
+a{color:var(--accent)}
+details.match{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-bottom:12px;padding:10px 14px}
+details.match summary{cursor:pointer;display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;list-style:none}
+details.match summary::-webkit-details-marker{display:none}
+details.match summary::before{content:"▸";color:var(--muted);transition:transform .15s}
+details.match[open] summary::before{transform:rotate(90deg)}
+.meta{display:flex;flex-wrap:wrap;gap:4px 16px;color:var(--muted);font-size:12px;margin:8px 0 8px 16px;align-items:center}
+details.match .tablewrap{border-radius:8px}
+table.mk{min-width:820px}
+table.mk th,table.mk td{padding:6px 10px;font-size:13px}
+table.mk tr.hit td{background:var(--bad-bg)}
+td.cid{user-select:all;white-space:nowrap;word-break:normal;font-size:12px}
+table.mk .mono.small{white-space:nowrap}
+table.mk{min-width:1000px}
+.section-title{font-size:15px;font-weight:600;margin:20px 0 8px}
+.small{font-size:12px;color:var(--muted)}
+.err{color:var(--bad)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Forfeit 弃权信号监控</h1>
+    <span class="sub" id="sub">加载中…</span>
+  </header>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="section-title">比赛（同一场比赛的全部 Polymarket 市场 = 排除名单）</div>
+  <div class="bar">
+    <select id="fGame"><option value="">全部游戏</option></select>
+    <select id="fMatched">
+      <option value="">全部比赛</option><option value="1">已关联 Polymarket</option><option value="0">未开盘 / 未关联</option>
+    </select>
+    <input id="fText" placeholder="搜索队名 / 联赛 / condition_id / 市场" size="32">
+    <button class="copy" id="toggleAll">全部折叠</button>
+    <span class="small" id="count"></span>
+  </div>
+  <div id="matches"></div>
+
+  <div class="section-title">连接记录</div>
+  <div class="card" id="conninfo"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let DATA = null;
+
+const fmtTime = iso => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return new Date(d.getTime() + 8*3600e3).toISOString().replace("T"," ").slice(0,19);
+};
+const ago = iso => {
+  if (!iso) return null;
+  return (Date.now() - new Date(iso).getTime())/1000;
+};
+const fmtAgo = s => s == null ? "—" : s < 90 ? Math.round(s)+" 秒前" : s < 5400 ? Math.round(s/60)+" 分钟前" : s < 172800 ? (s/3600).toFixed(1)+" 小时前" : (s/86400).toFixed(1)+" 天前";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const pill = (cls, t) => `<span class="pill ${cls}">${esc(t)}</span>`;
+const median = a => { if (!a.length) return null; const s=[...a].sort((x,y)=>x-y); const m=s.length>>1; return s.length%2?s[m]:(s[m-1]+s[m])/2; };
+const fmtLen = s => s == null ? "—" : s < 120 ? s+"s" : Math.floor(s/60)+"m"+String(s%60).padStart(2,"0")+"s";
+
+function card(k, v, d, cls){ return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div>${d?`<div class="d ${cls||""}">${d}</div>`:""}</div>`; }
+
+function renderCards(){
+  const {conn, health, health_error, events, gaps} = DATA;
+  const lastFrame = ago(conn.last_frame_at);
+  let cst = conn.connected ? (lastFrame != null && lastFrame > 90 ? pill("warn","连接无心跳") : pill("ok","已连接")) : pill("bad","断开");
+  const c1 = card("wss 订阅", cst, conn.connected ? `连上于 ${fmtTime(conn.since)}；最后一帧 ${fmtAgo(lastFrame)}` : `${esc(conn.last_error||"")} @ ${fmtTime(conn.last_error_at)}`);
+
+  const p = health && health.probe;
+  let pst, pd;
+  if (health_error && !health){ pst = pill("bad","/health 失败"); pd = esc(health_error); }
+  else if (!p){ pst = pill("warn","无心跳"); pd = "探针未写心跳（可能未启动）"; }
+  else {
+    const a = ago(p.last_ok);
+    pst = a == null ? pill("bad","从未成功") : a < 45 ? pill("ok","正常") : a < 300 ? pill("warn","变慢") : pill("bad","停滞");
+    pd = `最后成功轮询 ${fmtAgo(a)}；进行中比赛 ${p.running_matches}；key ${p.keys_total-p.keys_cooling}/${p.keys_total} 可用` +
+         (p.last_error && ago(p.last_error_at) < 600 ? `<br><span class="err">10 分钟内错误 ${fmtTime(p.last_error_at)}：${esc(p.last_error)}</span>` : "");
+  }
+  const c2 = card("PandaScore 探针", pst, pd);
+
+  const now = Date.now();
+  const inWin = h => events.filter(r => now - new Date(r.event.detect_iso).getTime() < h*3600e3).length;
+  const c3 = card("弃权事件", events.length, `24 小时 ${inWin(24)} · 7 天 ${inWin(168)}`);
+
+  const matched = events.filter(r => r.event.pm_match && r.event.pm_match.matched).length;
+  const c4 = card("关联到 Polymarket", events.length ? `${matched} <span class="small">/ ${events.length}</span>` : "—",
+                  events.length ? `${Math.round(matched*100/events.length)}%（未关联多为冷门赛事未开盘）` : "");
+
+  const lags = events.filter(r => r.via === "live" && r.push_lag_s != null).map(r => r.push_lag_s);
+  const lagM = median(lags);
+  const c5 = card("实时推送延迟（中位）", lagM == null ? "—" : lagM.toFixed(2)+" s",
+                  lags.length ? `探测 → 本机收到，样本 ${lags.length}；最大 ${Math.max(...lags).toFixed(2)} s` : "还没有实时事件（补推的历史不计）");
+
+  const svr = conn.server_last_seq, mine = events.length ? events[0].seq : 0;
+  const c6 = card("seq 完整性", gaps.length ? pill("warn", `缺 ${gaps.length} 条`) : pill("ok","无缺口"),
+                  `服务端 ${svr ?? "—"} · 本地 ${mine}` + (gaps.length ? `<br>缺：${gaps.slice(0,20).join(", ")}` : ""));
+  $("cards").innerHTML = c1 + c2 + c3 + c4 + c5 + c6;
+}
+
+// Gamma sportsMarketType -> 中文事件类型
+const TYPE_ZH = {
+  moneyline: "整场胜负", child_moneyline: "单局胜负", totals: "总局数大小",
+  map_handicap: "局数让分", game_handicap: "局数让分",
+  lol_both_teams_baron: "双方都击杀大龙", lol_both_teams_dragon: "双方都击杀小龙",
+  lol_both_teams_inhibitors: "双方都破水晶", lol_quadra_kill: "出现四杀", lol_penta_kill: "出现五杀",
+  lol_odd_even_total_kills: "总击杀单双", first_blood: "一血",
+};
+function typeZh(t){
+  if (!t) return "未分类";
+  if (TYPE_ZH[t]) return TYPE_ZH[t];
+  let m;
+  if ((m = t.match(/^round_handicap_game_(\d+)$/))) return `第${m[1]}图回合让分`;
+  if ((m = t.match(/^round_over_under_game_(\d+)$/))) return `第${m[1]}图回合大小`;
+  return t;
+}
+
+// 同一场比赛（PandaScore match_id）的多条弃权推送合成一组
+function groupMatches(){
+  const by = new Map();
+  for (const r of DATA.events){
+    const e = r.event, k = e.match_id ?? ("seq" + r.seq);
+    if (!by.has(k)) by.set(k, {key: k, recs: []});
+    by.get(k).recs.push(r);
+  }
+  const out = [];
+  for (const g of by.values()){
+    g.recs.sort((a,b) => a.seq - b.seq);
+    // 名单以最近一次成功关联的推送为准
+    const withPm = [...g.recs].reverse().find(r => r.event.pm_match && r.event.pm_match.matched);
+    g.e = g.recs[g.recs.length-1].event;
+    g.pm = (withPm || g.recs[g.recs.length-1]).event.pm_match || {};
+    g.latest = Math.max(...g.recs.map(r => new Date(r.event.detect_iso).getTime()));
+    g.forfeited = g.recs.map(r => r.event.is_series ? "整场" : "G" + r.event.game_num);
+    out.push(g);
+  }
+  return out.sort((a,b) => b.latest - a.latest);
+}
+
+function filteredMatches(){
+  const g = $("fGame").value, m = $("fMatched").value, t = $("fText").value.trim().toLowerCase();
+  return groupMatches().filter(x => {
+    if (g && x.e.game !== g) return false;
+    if (m === "1" && !x.pm.matched) return false;
+    if (m === "0" && x.pm.matched) return false;
+    if (t){
+      const hay = [x.e.team_a, x.e.team_b, x.e.league, x.e.match_name, x.pm.pm_event_slug,
+                   ...(x.pm.markets||[]).flatMap(mk => [mk.condition_id, mk.question, mk.slug, mk.sports_market_type])]
+                  .join(" ").toLowerCase();
+      if (!hay.includes(t)) return false;
+    }
+    return true;
+  });
+}
+
+function marketTable(pm){
+  const ms = [...(pm.markets||[])].sort((a,b) =>
+    (a.game_number - b.game_number) || ((b.is_forfeited_market?1:0) - (a.is_forfeited_market?1:0)) ||
+    a.sports_market_type.localeCompare(b.sports_market_type) || a.slug.localeCompare(b.slug));
+  const rows = ms.map(m => `<tr class="${m.is_forfeited_market ? "hit" : ""}">
+      <td class="num">${m.game_number ? "G" + m.game_number : "整场"}</td>
+      <td>${esc(typeZh(m.sports_market_type))}${m.is_forfeited_market ? ' <span class="pill bad">弃权局</span>' : ""}<br><span class="small mono">${esc(m.sports_market_type)}</span></td>
+      <td>${esc(m.question)}</td>
+      <td class="mono cid">${esc(m.condition_id)}</td>
+      <td class="small">${m.closed ? "已关闭" : m.accepting_orders ? "交易中" : "—"}</td></tr>`).join("");
+  return `<div class="tablewrap"><table class="mk">
+    <thead><tr><th style="width:56px">局</th><th style="width:170px">事件类型</th><th>市场</th><th style="width:500px">condition_id</th><th style="width:64px">状态</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function matchBlock(x){
+  const e = x.e, pm = x.pm;
+  const recs = x.recs.map(r => `seq ${r.seq}${r.via === "live" ? "（实时" + (r.push_lag_s != null ? " " + r.push_lag_s.toFixed(2) + "s" : "") + "）" : ""}`).join("、");
+  const lens = x.recs.filter(r => r.event.length_s != null).map(r => (r.event.is_series ? "整场" : "G" + r.event.game_num) + " " + fmtLen(r.event.length_s));
+  const head = `<summary>
+      <span class="chip">${esc(e.game)}</span>
+      <b>${esc(e.team_a)} vs ${esc(e.team_b)}</b>
+      <span class="small">${esc(e.league)} · ${esc(e.match_name)}</span>
+      <span class="pill bad">弃权 ${esc(x.forfeited.join(" / "))}</span>
+      ${pm.matched ? `<span class="pill ok">排除 ${(pm.condition_ids||[]).length} 个市场</span>` : `<span class="pill warn">${esc(pm.reason || "未关联")}</span>`}
+    </summary>`;
+  const meta = `<div class="meta">
+      <span>探测 ${fmtTime(new Date(x.latest).toISOString())}</span>
+      <span>胜方 ${esc(e.winner || "—")}</span>
+      ${lens.length ? `<span>时长 ${esc(lens.join("，"))}</span>` : ""}
+      <span>推送 ${esc(recs)}</span>
+      <span>match_id ${esc(e.match_id)}</span>
+      ${pm.matched ? `<a href="${esc(pm.pm_event_url)}" target="_blank" rel="noopener">${esc(pm.pm_event_slug)}</a>
+        <button class="copy" data-key="${esc(x.key)}">复制全部 condition_id</button>` : ""}
+    </div>`;
+  const open = !CLOSED.has(String(x.key));
+  return `<details class="match" data-key="${esc(x.key)}" ${open ? "open" : ""}>${head}${meta}${pm.matched ? marketTable(pm) : ""}</details>`;
+}
+
+let SIG = "", CLOSED = new Set();
+function renderMatches(force){
+  const list = filteredMatches();
+  const sig = [$("fGame").value, $("fMatched").value, $("fText").value,
+               ...list.map(x => x.key + ":" + x.recs.map(r => r.seq).join(",") + ":" + (x.pm.condition_ids||[]).length)].join("|");
+  if (!force && sig === SIG) return;        // 数据没变就不重绘，避免打断选中/复制 condition_id
+  SIG = sig;
+  $("count").textContent = `${list.length} 场比赛 · ${list.reduce((n,x) => n + x.recs.length, 0)} 条推送`;
+  $("matches").innerHTML = list.map(matchBlock).join("") || `<div class="card small">没有比赛</div>`;
+}
+
+function renderConn(){
+  const {conn, disconnects, ws_url, health_at} = DATA;
+  const items = disconnects.slice(0,10).map(d => `<div>${fmtTime(d.at)}</div><div class="mono">${esc(d.error)}</div>`).join("");
+  $("conninfo").innerHTML = `<div class="kv">
+    <div>订阅地址</div><div class="mono">${esc(ws_url)}</div>
+    <div>累计连接 / 断开</div><div>${conn.connects} / ${conn.disconnects}</div>
+    <div>最后 ping</div><div>${fmtTime(conn.last_ping_at)}</div>
+    <div>/health 拉取</div><div>${fmtTime(health_at)}</div>
+    ${items ? `<div style="grid-column:1/-1;margin-top:6px;font-weight:600">最近断线</div>${items}` : ""}
+  </div>`;
+}
+
+function render(){
+  const games = [...new Set(DATA.events.map(r => r.event.game))].sort();
+  const sel = $("fGame"), cur = sel.value;
+  sel.innerHTML = `<option value="">全部游戏</option>` + games.map(g => `<option ${g===cur?"selected":""}>${esc(g)}</option>`).join("");
+  renderCards(); renderMatches(); renderConn();
+  $("sub").textContent = `每 5 秒刷新 · 最近更新 ${fmtTime(DATA.now)}（UTC+8）`;
+}
+
+async function load(){
+  try {
+    const r = await fetch("/dash/api/state", {credentials:"same-origin", cache:"no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    DATA = await r.json();
+    render();
+  } catch (e) {
+    $("sub").innerHTML = `<span class="err">刷新失败：${esc(e.message)}</span>`;
+  }
+}
+
+$("matches").addEventListener("click", ev => {
+  const btn = ev.target.closest("button.copy");
+  if (!btn) return;
+  ev.preventDefault();
+  const x = groupMatches().find(g => String(g.key) === btn.dataset.key);
+  const ids = (x && x.pm.condition_ids || []).join("\n");
+  navigator.clipboard.writeText(ids).then(() => { btn.textContent = "已复制 " + (x.pm.condition_ids||[]).length + " 个"; setTimeout(() => btn.textContent = "复制全部 condition_id", 1500); });
+});
+$("matches").addEventListener("toggle", ev => {
+  const d = ev.target; if (!d.matches || !d.matches("details.match")) return;
+  d.open ? CLOSED.delete(d.dataset.key) : CLOSED.add(d.dataset.key);
+}, true);
+$("toggleAll").addEventListener("click", () => {
+  const ds = [...document.querySelectorAll("details.match")];
+  const close = ds.some(d => d.open);
+  ds.forEach(d => { d.open = !close; close ? CLOSED.add(d.dataset.key) : CLOSED.delete(d.dataset.key); });
+  $("toggleAll").textContent = close ? "全部展开" : "全部折叠";
+});
+["fGame","fMatched"].forEach(id => $(id).addEventListener("change", () => DATA && renderMatches(true)));
+$("fText").addEventListener("input", () => DATA && renderMatches(true));
+load(); setInterval(load, 5000);
+</script>
+</body>
+</html>

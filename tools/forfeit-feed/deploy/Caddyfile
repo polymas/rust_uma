@@ -1,0 +1,11 @@
+# forfeit-feed 对外 TLS 入口
+#   wss://forfeit.chainee.space/ws?token=…      订阅（forfeit_ws.py）
+#   https://forfeit.chainee.space/dash/?token=… 监控看板（forfeit_monitor.py）
+forfeit.chainee.space {
+	handle /dash* {
+		reverse_proxy 127.0.0.1:8816
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8815
+	}
+}
