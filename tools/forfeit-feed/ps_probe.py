@@ -185,7 +185,10 @@ def main():
             HB["last_error"], HB["last_error_at"] = repr(e)[:200], datetime.now(timezone.utc).isoformat()
         if n % PAST_EVERY == 0:                  # 末局常常在 running 里来不及看到
             try:
-                batches.append(api("/matches/past", per_page=50, sort="-end_at"))
+                # 按 modified_at 倒序而不是 end_at：PandaScore 把 end_at 为空的比赛排在
+                # sort=-end_at 最前面，结果 50 条全是早就结束的旧比赛（多为整场弃权/取消），
+                # 最近结束、running 里没赶上的局反而永远拉不到。modified_at 还能捡到事后改判。
+                batches.append(api("/matches/past", per_page=50, sort="-modified_at"))
             except Exception as e:
                 log("/matches/past 失败:", repr(e))
 
