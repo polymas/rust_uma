@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.13.0（2026-10-02）
+## v0.13.0（2026-10-02，6fb0a20）
 - **电竞弃权排除名单**（`src/forfeit.rs`）：配置 `FORFEIT_FEED_URL` 后订阅 forfeit-feed
   （`tools/forfeit-feed`，协议 `proto/polyuma/forfeit/v1`）。某场电竞比赛任一局被 PandaScore
   判弃权，这场比赛在 Polymarket 上的全部子市场 condition_id 进名单，之后命中的 propose/dispute
