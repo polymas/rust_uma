@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.13.2（2026-11-13，待填）
+## v0.13.2（2026-11-13，9303263）
 - **非 Polymarket 请求不再算解码错误**（`src/pipeline.rs`、`src/uma/events/mod.rs`）：同一个 UMA
   合约上有其他项目的请求（如 requester `0x53703dd6…` 每笔交易批量提交 70–110 条 JSON 格式的
   NBA 盘口，condition_id 不在 Gamma 里），ancillary 没有 `market_id`。以前全部计入
