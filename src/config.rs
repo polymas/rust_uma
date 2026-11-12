@@ -26,6 +26,12 @@ pub struct Config {
     pub initial_backfill_days: u64,
     pub backfill_batch_blocks: u64,
     pub live_buffer: usize,
+    /// Stall watchdog for each live WSS subscription (`uma/rpc.rs`): after
+    /// this long without a single log on a session, a background
+    /// `eth_getLogs` checks whether the chain had matching logs that the
+    /// subscription never pushed; only then is the session torn down and
+    /// reconnected. Zero disables the watchdog.
+    pub rpc_idle_check: Duration,
     pub event_ring_capacity: usize,
     pub frame_ring_capacity: usize,
     pub batch_max_events: usize,
@@ -100,6 +106,7 @@ pub(crate) fn test_config() -> Config {
         initial_backfill_days: 0,
         backfill_batch_blocks: 1,
         live_buffer: 16,
+        rpc_idle_check: Duration::ZERO,
         event_ring_capacity: 16,
         frame_ring_capacity: 16,
         batch_max_events: 16,
@@ -184,6 +191,7 @@ impl Config {
             initial_backfill_days: parse("INITIAL_BACKFILL_DAYS", "7")?,
             backfill_batch_blocks: parse("RPC_BACKFILL_BATCH_BLOCKS", "1000")?,
             live_buffer: parse("RPC_LIVE_BUFFER", "8192")?,
+            rpc_idle_check: Duration::from_secs(parse("RPC_IDLE_CHECK_SECONDS", "60")?),
             event_ring_capacity: parse("EVENT_RING_CAPACITY", "10000")?,
             frame_ring_capacity: parse("FRAME_RING_CAPACITY", "2048")?,
             batch_max_events: parse("BATCH_MAX_EVENTS", "64")?,

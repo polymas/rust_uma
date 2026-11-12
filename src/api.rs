@@ -72,6 +72,7 @@ struct HealthResponse {
     rpc_sources_connected: u64,
     rpc_sources_configured: usize,
     rpc_reconnects_total: u64,
+    rpc_stall_reconnects_total: u64,
     rpc_logs_received_total: u64,
     events_decoded_total: u64,
     decode_errors_total: u64,
@@ -106,6 +107,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         rpc_sources_connected: state.stats.rpc_sources_connected.load(Ordering::Relaxed),
         rpc_sources_configured: state.config.wss_rpc_urls.len(),
         rpc_reconnects_total: state.stats.rpc_reconnects.load(Ordering::Relaxed),
+        rpc_stall_reconnects_total: state.stats.rpc_stall_reconnects.load(Ordering::Relaxed),
         rpc_logs_received_total: state.stats.rpc_logs_received.load(Ordering::Relaxed),
         events_decoded_total: state.stats.events_decoded.load(Ordering::Relaxed),
         decode_errors_total: state.stats.decode_errors.load(Ordering::Relaxed),
@@ -162,6 +164,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
         (
             "rust_uma_rpc_reconnects_total",
             state.stats.rpc_reconnects.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_rpc_stall_reconnects_total",
+            state.stats.rpc_stall_reconnects.load(Ordering::Relaxed),
         ),
         (
             "rust_uma_rpc_logs_received_total",

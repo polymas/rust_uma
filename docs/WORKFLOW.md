@@ -113,6 +113,16 @@ src/
   复，但两路同时断（同一 CDN 边缘）时这段窗口以前是永久漏事件（补拉只在启
   动时跑一次）。`rpc_reconnects_total` 涨了之后，看日志
   `gap-fill after reconnect complete` 确认补拉跑了。
+- **订阅“假活”看门狗**（`run_live_session` + `check_for_stall`）：2026-11-12 生产上
+  getblock 的 WSS 连接没断、Ping 照回，但服务端不再推订阅日志，读循环一直等，13 小时
+  零广播（`rpc_connected` 一直是 true）。现在每路会话连续 `RPC_IDLE_CHECK_SECONDS`
+  （默认 60，0 关闭）没收到日志，就 **spawn** 一个后台任务：`eth_blockNumber` +
+  `eth_getLogs`（本会话已覆盖的区块之后、链头减 5 块，窗口不超过
+  `RPC_BACKFILL_BATCH_BLOCKS`）。链上有、本路没推 → 断开重连（走上面的 gap-fill
+  补缺口），`rpc_stall_reconnects_total` +1，日志 `subscription stalled`；链上也没有
+  → 继续等。只看空闲不核对不行：7 天实测 Polygon 上 ≥120s 没有任何 UMA 日志的空档
+  每天约 78 次。核对请求不在读循环里 await，HTTP 挂了只打 `stall check failed`，不会
+  因此断开订阅。
 - **catalog 落盘不占 tokio worker**（`enrichment.rs::persist_catalog`）：
   `Catalog::snapshot()` 只克隆 `Arc`（持读锁几毫秒），排序/序列化/fsync/游标
   写入整体放 `spawn_blocking`。生产只有 2 个 worker，以前每分钟一次几百毫秒

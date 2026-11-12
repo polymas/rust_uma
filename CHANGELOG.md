@@ -17,6 +17,15 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.13.1（2026-11-12，待补）
+- **修复 WSS 订阅“假活”导致长时间不广播**（`src/uma/rpc.rs`）：2026-11-12 getblock 的订阅连接
+  没断但不再推日志，rust-uma 13 小时零广播（`/healthz` 仍显示 `rpc_connected=true`）。
+  新增看门狗：某路连续 `RPC_IDLE_CHECK_SECONDS`（默认 60，0 关闭）没收到日志，后台用
+  `eth_getLogs` 核对链上；链上有而本路没推才断开重连，gap-fill 补回缺口。
+  - 核对在后台任务里跑，不碰热路径；链上真安静（7 天实测 ≥120s 空档每天约 78 次）不会误重连。
+  - `/healthz`、`/metrics` 新增 `rpc_stall_reconnects_total`。
+  - 下游无感知：wire 协议不变。
+
 ## v0.13.0（2026-10-02，6fb0a20）
 - **电竞弃权排除名单**（`src/forfeit.rs`）：配置 `FORFEIT_FEED_URL` 后订阅 forfeit-feed
   （`tools/forfeit-feed`，协议 `proto/polyuma/forfeit/v1`）。某场电竞比赛任一局被 PandaScore

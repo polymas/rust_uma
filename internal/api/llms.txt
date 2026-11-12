@@ -298,6 +298,7 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 
 - `rpc_connected`
 - `rpc_reconnects_total`
+- `rpc_stall_reconnects_total`（其中由假活看门狗触发的重连：连接没断但不再推链上已有的日志）
 - `rpc_logs_received_total`
 - `events_decoded_total`
 - `decode_errors_total`

@@ -37,6 +37,9 @@ pub struct EnrichmentStatsSnapshot {
 pub struct Stats {
     pub rpc_connected: AtomicBool,
     pub rpc_reconnects: AtomicU64,
+    /// Subset of `rpc_reconnects` forced by the stall watchdog: a session
+    /// that stayed open but stopped pushing logs the chain did have.
+    pub rpc_stall_reconnects: AtomicU64,
     /// Count of currently-connected WSS racers (0..=wss_rpc_urls.len()).
     /// Useful to confirm multi-source racing is actually up in production.
     pub rpc_sources_connected: AtomicU64,

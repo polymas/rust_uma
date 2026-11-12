@@ -40,6 +40,15 @@ pub enum RpcError {
     Closed,
     #[error("invalid RPC number")]
     Number,
+    #[error(
+        "subscription silent for {idle_s}s while the chain had {logs} matching logs in blocks {from}..={to}"
+    )]
+    Stalled {
+        idle_s: u64,
+        from: u64,
+        to: u64,
+        logs: usize,
+    },
 }
 
 /// Runs the live WSS racers and the one-shot HTTP backfill.
@@ -172,12 +181,18 @@ async fn live_worker(
             processor: processor.clone(),
             stats: stats.clone(),
         });
+        let watchdog = StallWatchdog {
+            idle: config.rpc_idle_check,
+            http: http.clone(),
+            max_window: config.backfill_batch_blocks.max(1),
+        };
         match run_live_session(
             &source,
             &url,
             config.live_buffer,
             &processor,
             &stats,
+            &watchdog,
             &any_connected,
             gap_fill,
             shutdown.clone(),
@@ -186,6 +201,10 @@ async fn live_worker(
         {
             Ok(()) if *shutdown.borrow() => break,
             Ok(()) => warn!(source, "Polygon live subscription ended; reconnecting"),
+            Err(error @ RpcError::Stalled { .. }) => {
+                Stats::increment(&stats.rpc_stall_reconnects);
+                warn!(%error, source, "Polygon live subscription stalled; reconnecting");
+            }
             Err(error) => warn!(%error, source, "Polygon live subscription failed; reconnecting"),
         }
         sessions += 1;
@@ -266,6 +285,7 @@ async fn run_live_session(
     live_buffer: usize,
     processor: &Arc<Processor>,
     stats: &Arc<Stats>,
+    watchdog: &StallWatchdog,
     any_connected: &watch::Sender<bool>,
     gap_fill: Option<GapFill>,
     mut shutdown: watch::Receiver<bool>,
@@ -281,23 +301,130 @@ async fn run_live_session(
         gap_fill.spawn();
     }
 
-    loop {
+    // Stall watchdog state. `verified` is the highest block this session is
+    // known to have covered: the newest log it delivered, or the upper end
+    // of a window a check proved empty. `None` until either happens.
+    let mut verified: Option<u64> = None;
+    let mut received = 0_u64;
+    let mut idle_since = tokio::time::Instant::now();
+    let (check_tx, mut check_rx) = mpsc::channel::<(u64, Result<StallCheck, RpcError>)>(1);
+    let mut checking = false;
+
+    let result = loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+                if *shutdown.borrow() { break Ok(()); }
             }
             message = live.recv() => {
-                let Some(log) = message else { return Err(RpcError::Closed); };
+                let Some(log) = message else { break Err(RpcError::Closed); };
                 let block = parse_hex_u64(&log.block_number, "blockNumber").unwrap_or_default();
                 processor.process(log, now_us(), source).await;
                 if block > 0 {
                     processor.checkpoint(block);
+                    verified = Some(verified.map_or(block, |seen| seen.max(block)));
+                }
+                received += 1;
+                idle_since = tokio::time::Instant::now();
+            }
+            // Never awaited inline: the check is spawned so the live reader
+            // keeps draining while the HTTP round trips run.
+            _ = tokio::time::sleep_until(idle_since + watchdog.idle),
+                if !watchdog.idle.is_zero() && !checking =>
+            {
+                checking = true;
+                let http = watchdog.http.clone();
+                let tx = check_tx.clone();
+                let max_window = watchdog.max_window;
+                let snapshot = received;
+                tokio::spawn(async move {
+                    let outcome = check_for_stall(&http, verified, max_window).await;
+                    let _ = tx.send((snapshot, outcome)).await;
+                });
+            }
+            Some((snapshot, outcome)) = check_rx.recv() => {
+                checking = false;
+                idle_since = tokio::time::Instant::now();
+                if snapshot != received {
+                    // A log arrived while the check was in flight: alive.
+                    continue;
+                }
+                match outcome {
+                    Ok(StallCheck::Quiet { to }) => {
+                        verified = Some(verified.map_or(to, |seen| seen.max(to)));
+                    }
+                    Ok(StallCheck::Missed { from, to, logs }) => {
+                        break Err(RpcError::Stalled {
+                            idle_s: watchdog.idle.as_secs(),
+                            from,
+                            to,
+                            logs,
+                        });
+                    }
+                    // The HTTP side being down says nothing about this
+                    // subscription; keep it and try again next idle period.
+                    Err(error) => warn!(%error, source, "stall check failed"),
                 }
             }
         }
-    }
+    };
     reader.abort();
-    Ok(())
+    result
+}
+
+/// Per-session settings for the "connected but silent" watchdog. A WSS
+/// subscription can stay open (pings answered) while the provider has
+/// silently dropped it server-side; the reader then waits forever. Polygon
+/// regularly goes several minutes without a single UMA log, so silence alone
+/// is not proof — the check asks the chain over HTTP before reconnecting.
+struct StallWatchdog {
+    idle: Duration,
+    http: Arc<HttpRpc>,
+    max_window: u64,
+}
+
+/// Blocks a log must be behind the head before its absence from the
+/// subscription counts against it — absorbs push latency and the HTTP and
+/// WSS backends sitting on slightly different heads.
+const STALL_CONFIRM_LAG_BLOCKS: u64 = 5;
+
+#[derive(Debug, PartialEq, Eq)]
+enum StallCheck {
+    /// Nothing the session should have delivered: it covered up to `to`.
+    Quiet { to: u64 },
+    /// The chain has `logs` matching logs in `from..=to` that the session
+    /// never pushed.
+    Missed { from: u64, to: u64, logs: usize },
+}
+
+/// One stall probe. Runs in a spawned task, never on the live reader.
+///
+/// With no `verified` block yet (fresh session, quiet chain) there is no
+/// lower bound to compare against, so the first probe only records the
+/// current head; the next idle period checks from there.
+async fn check_for_stall(
+    http: &HttpRpc,
+    verified: Option<u64>,
+    max_window: u64,
+) -> Result<StallCheck, RpcError> {
+    let to = http
+        .latest_block()
+        .await?
+        .saturating_sub(STALL_CONFIRM_LAG_BLOCKS);
+    let Some(verified) = verified else {
+        return Ok(StallCheck::Quiet { to });
+    };
+    if to <= verified {
+        return Ok(StallCheck::Quiet { to: verified });
+    }
+    let from = verified
+        .saturating_add(1)
+        .max(to.saturating_sub(max_window.max(1) - 1));
+    let logs = http.get_logs(from, to).await?.len();
+    Ok(if logs == 0 {
+        StallCheck::Quiet { to }
+    } else {
+        StallCheck::Missed { from, to, logs }
+    })
 }
 
 fn mark_source_connected(stats: &Stats) {
@@ -710,5 +837,212 @@ mod tests {
         }
         assert_eq!(checkpoints, vec![109, 119, 125]);
         server.abort();
+    }
+
+    /// Mock HTTP RPC for the stall watchdog: a head starting at `head` and
+    /// advancing by `step` per `eth_blockNumber`, and `logs` copies of a
+    /// minimal log for every `eth_getLogs`. Records each `eth_getLogs` window.
+    type Calls = Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+
+    async fn stall_rpc(
+        head: u64,
+        step: u64,
+        logs: usize,
+    ) -> (String, Calls, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+
+        #[derive(Clone)]
+        struct Mock {
+            head: Arc<std::sync::atomic::AtomicU64>,
+            step: u64,
+            logs: usize,
+            calls: Calls,
+        }
+        async fn rpc(State(mock): State<Mock>, Json(request): Json<Value>) -> Json<Value> {
+            let result = match request["method"].as_str().unwrap() {
+                "eth_blockNumber" => {
+                    let head = mock.head.fetch_add(mock.step, Ordering::Relaxed);
+                    json!(format!("0x{head:x}"))
+                }
+                "eth_getLogs" => {
+                    let hex = |key: &str| {
+                        u64::from_str_radix(
+                            request["params"][0][key]
+                                .as_str()
+                                .unwrap()
+                                .trim_start_matches("0x"),
+                            16,
+                        )
+                        .unwrap()
+                    };
+                    mock.calls
+                        .lock()
+                        .unwrap()
+                        .push((hex("fromBlock"), hex("toBlock")));
+                    let log = json!({
+                        "address": "0x0000000000000000000000000000000000000001",
+                        "topics": [TOPIC_PROPOSE_PRICE],
+                        "data": "0x",
+                        "blockNumber": "0x1",
+                        "transactionHash": format!("0x{:064x}", 1),
+                        "logIndex": "0x0"
+                    });
+                    json!(vec![log; mock.logs])
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+        }
+
+        let calls: Calls = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(rpc)).with_state(Mock {
+            head: Arc::new(head.into()),
+            step,
+            logs,
+            calls: calls.clone(),
+        });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), calls, server)
+    }
+
+    #[tokio::test]
+    async fn stall_check_first_probe_only_records_the_head() {
+        let (url, calls, server) = stall_rpc(1000, 0, 3).await;
+        let http = HttpRpc::new(url).unwrap();
+        assert_eq!(
+            check_for_stall(&http, None, 1000).await.unwrap(),
+            StallCheck::Quiet {
+                to: 1000 - STALL_CONFIRM_LAG_BLOCKS
+            }
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no eth_getLogs without a lower bound"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stall_check_flags_logs_the_session_never_pushed() {
+        let (url, calls, server) = stall_rpc(1000, 0, 2).await;
+        let http = HttpRpc::new(url).unwrap();
+        assert_eq!(
+            check_for_stall(&http, Some(900), 1000).await.unwrap(),
+            StallCheck::Missed {
+                from: 901,
+                to: 995,
+                logs: 2
+            }
+        );
+        // The window is capped so a long-dead session costs one bounded call.
+        check_for_stall(&http, Some(10), 100).await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![(901, 995), (896, 995)]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stall_check_quiet_chain_advances_the_verified_block() {
+        let (url, _calls, server) = stall_rpc(1000, 0, 0).await;
+        let http = HttpRpc::new(url).unwrap();
+        assert_eq!(
+            check_for_stall(&http, Some(900), 1000).await.unwrap(),
+            StallCheck::Quiet { to: 995 }
+        );
+        // Already covered past the confirmed head: nothing to ask.
+        assert_eq!(
+            check_for_stall(&http, Some(999), 1000).await.unwrap(),
+            StallCheck::Quiet { to: 999 }
+        );
+        server.abort();
+    }
+
+    /// A WSS endpoint that acknowledges `eth_subscribe` and then never
+    /// pushes anything, while answering pings — the "connected but silent"
+    /// failure seen in production on 2026-11-12.
+    async fn silent_wss() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(message)) = ws.next().await {
+                        if let Message::Text(_) = message {
+                            let ack = json!({"jsonrpc": "2.0", "id": 1, "result": "0xsub"});
+                            let _ = ws.send(Message::Text(ack.to_string().into())).await;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("ws://{address}"), server)
+    }
+
+    async fn run_silent_session(logs_on_chain: usize) -> (Result<(), RpcError>, Arc<Stats>) {
+        use crate::{config::test_config, enrichment::Catalog, hub::EventHub};
+
+        let (wss, wss_server) = silent_wss().await;
+        let (http_url, _calls, http_server) = stall_rpc(1000, 10, logs_on_chain).await;
+        let stats = Arc::new(Stats::default());
+        let (batch_tx, _batch_rx) = mpsc::channel(4);
+        let (storage_tx, _storage_rx) = mpsc::channel(16);
+        let processor = Arc::new(Processor::new(
+            Arc::new(test_config()),
+            Arc::new(Catalog::new(Vec::new())),
+            Arc::new(EventHub::new(16)),
+            batch_tx,
+            storage_tx,
+            stats.clone(),
+            Arc::new(crate::forfeit::ForfeitBlocklist::disabled()),
+            0,
+        ));
+        let watchdog = StallWatchdog {
+            idle: Duration::from_millis(50),
+            http: Arc::new(HttpRpc::new(http_url).unwrap()),
+            max_window: 1000,
+        };
+        let (any_connected, _) = watch::channel(false);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(1500),
+            run_live_session(
+                "wss[0]",
+                &wss,
+                16,
+                &processor,
+                &stats,
+                &watchdog,
+                &any_connected,
+                None,
+                shutdown,
+            ),
+        )
+        .await;
+        wss_server.abort();
+        http_server.abort();
+        // Timing out means the session was (correctly) kept alive.
+        (result.unwrap_or(Ok(())), stats)
+    }
+
+    #[tokio::test]
+    async fn silent_session_with_logs_on_chain_is_torn_down_as_stalled() {
+        let (result, _) = run_silent_session(1).await;
+        assert!(
+            matches!(result, Err(RpcError::Stalled { logs: 1, .. })),
+            "expected a stall, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_session_on_a_quiet_chain_is_kept() {
+        let (result, _) = run_silent_session(0).await;
+        assert!(
+            result.is_ok(),
+            "quiet chain must not force a reconnect: {result:?}"
+        );
     }
 }
