@@ -50,8 +50,15 @@ pub enum DecodeError {
     DynamicOffset,
     #[error("ancillary data is not UTF-8")]
     AncillaryUtf8,
-    #[error("Polymarket market_id is absent")]
-    MissingMarketId,
+    /// The log decoded fine but its ancillary data carries no `market_id`,
+    /// so it cannot be a Polymarket market request. Other projects share the
+    /// same UMA oracle contract (e.g. requester 0x53703dd6… posts JSON
+    /// ancillary player props in batches of 70–110 per tx). This is a normal
+    /// skip, not a decode failure: the pipeline counts it separately
+    /// (`foreign_requests_skipped_total`) so `decode_errors_total` keeps
+    /// meaning "the log itself was malformed".
+    #[error("Polymarket market_id is absent (requester 0x{})", hex::encode(.requester))]
+    MissingMarketId { requester: [u8; 20] },
 }
 
 /// Collection (WSS subscribe / HTTP backfill) filters by event topic only,
@@ -80,7 +87,9 @@ pub fn decode_signal_log(
         _ => return Err(DecodeError::Topic),
     };
     if require_market_id && event.market_id() == 0 {
-        return Err(DecodeError::MissingMarketId);
+        return Err(DecodeError::MissingMarketId {
+            requester: event.request().requester,
+        });
     }
     Ok(event)
 }
@@ -348,5 +357,37 @@ mod tests {
         // produces a different value than Gamma's real condition_id. This is why
         // enrichment resolution (Catalog::resolve) tries market_id first.
         assert_ne!(request.condition_id, gamma_condition_id);
+    }
+
+    /// Real Polygon logs captured via eth_getTransactionReceipt on 2026-11-12
+    /// from the two biggest non-Polymarket requesters seen in production
+    /// (tx 0x0638d16f… from 0x53703dd6…, JSON ancillary, and tx 0xe0c452c1…
+    /// from 0x69c47de9…, text ancillary without market_id). The 0x53703dd6
+    /// requests mirror Polymarket NBA prop titles but their condition_id is
+    /// not in Gamma; the real Polymarket markets resolve via adapter
+    /// 0x65070BE9…. Both must be classified as `MissingMarketId` carrying the
+    /// requester, never as a hard decode failure.
+    #[test]
+    fn real_foreign_requests_are_classified_as_missing_market_id() {
+        let logs: Vec<RpcLog> =
+            serde_json::from_str(include_str!("testdata/foreign_requests.json")).unwrap();
+        let expected = [
+            "53703dd6129d723066b6362510e5ae2fecd48218",
+            "69c47de9d4d3dad79590d61b9e05918e03775f24",
+        ];
+        assert_eq!(logs.len(), expected.len());
+        for (raw, requester) in logs.iter().zip(expected) {
+            let error = decode_signal_log(raw, 1, &[], true).unwrap_err();
+            assert_eq!(
+                error,
+                DecodeError::MissingMarketId {
+                    requester: decode_fixed::<20>(requester, "requester").unwrap()
+                }
+            );
+            // With the check off they still decode into a full event — the
+            // ABI itself is well-formed.
+            let event = decode_signal_log(raw, 1, &[], false).unwrap();
+            assert_eq!(event.market_id(), 0);
+        }
     }
 }

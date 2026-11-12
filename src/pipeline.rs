@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -7,7 +7,7 @@ use std::{
 };
 
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::Config,
@@ -17,7 +17,7 @@ use crate::{
     model::{EventKey, EventKind, EventRecord, PriceOutcome, hex_prefixed},
     stats::Stats,
     storage::StorageCommand,
-    uma::events::{RpcLog, decode_signal_log},
+    uma::events::{DecodeError, RpcLog, decode_signal_log},
     wire::{WireConfig, encode_frame, encoded_event_len, now_us},
 };
 
@@ -43,6 +43,12 @@ pub struct Processor {
     /// nowhere near the hot-path cost of the network calls this project
     /// actually needs to keep off the hot path.
     recent_enrichment: Mutex<VecDeque<bool>>,
+    /// Non-Polymarket requesters already logged once. Each new one gets a
+    /// single `info!` (so a future Polymarket adapter that somehow lacks
+    /// `market_id` still shows up in the journal), repeats stay silent —
+    /// one requester posts 70–110 requests per tx. Only touched on the skip
+    /// path, never for events we broadcast.
+    seen_foreign_requesters: Mutex<HashSet<[u8; 20]>>,
 }
 
 impl Processor {
@@ -67,6 +73,7 @@ impl Processor {
             forfeit,
             sequence: AtomicU64::new(initial_sequence),
             recent_enrichment: Mutex::new(VecDeque::with_capacity(RECENT_ENRICHMENT_WINDOW)),
+            seen_foreign_requesters: Mutex::new(HashSet::new()),
         }
     }
 
@@ -86,6 +93,22 @@ impl Processor {
             self.config.require_market_id,
         ) {
             Ok(event) => event,
+            Err(DecodeError::MissingMarketId { requester }) => {
+                Stats::increment(&self.stats.foreign_requests_skipped);
+                let first = self
+                    .seen_foreign_requesters
+                    .lock()
+                    .map(|mut seen| seen.insert(requester))
+                    .unwrap_or(false);
+                if first {
+                    info!(
+                        requester = %hex_prefixed(&requester),
+                        tx = %raw.transaction_hash,
+                        "skipping UMA requests without market_id from new requester (not Polymarket); further ones are only counted"
+                    );
+                }
+                return;
+            }
             Err(error) => {
                 Stats::increment(&self.stats.decode_errors);
                 // `warn!` (not `debug!`) deliberately: production runs at the
@@ -393,6 +416,51 @@ mod tests {
             0,
         );
         (processor, batch_rx, storage_rx)
+    }
+
+    /// Real non-Polymarket requests (see the fixture's doc in
+    /// `uma::events::tests`) are skipped and counted as foreign, never as
+    /// decode errors, and nothing reaches storage or the batcher. A batch of
+    /// them must not inflate `decode_errors_total` — that is what kept the
+    /// console's "decode errors surging" alert firing.
+    #[tokio::test]
+    async fn foreign_requests_are_counted_apart_from_decode_errors() {
+        let mut config = test_config();
+        config.require_market_id = true;
+        let (batch_tx, mut batch_rx) = mpsc::channel(4);
+        let (storage_tx, mut storage_rx) = mpsc::channel(4);
+        let processor = Processor::new(
+            Arc::new(config),
+            Arc::new(Catalog::new(Vec::new())),
+            Arc::new(EventHub::new(16)),
+            batch_tx,
+            storage_tx,
+            Arc::new(Stats::default()),
+            Arc::new(ForfeitBlocklist::disabled()),
+            0,
+        );
+        let logs: Vec<RpcLog> =
+            serde_json::from_str(include_str!("uma/events/testdata/foreign_requests.json"))
+                .unwrap();
+        for raw in &logs {
+            processor.process(raw.clone(), 1, "test").await;
+            processor.process(raw.clone(), 2, "test").await;
+        }
+        let mut broken = propose_log();
+        broken.data = "0x00".into();
+        processor.process(broken, 3, "test").await;
+
+        assert_eq!(
+            processor
+                .stats
+                .foreign_requests_skipped
+                .load(Ordering::Relaxed),
+            (logs.len() * 2) as u64
+        );
+        assert_eq!(processor.stats.decode_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(processor.seen_foreign_requesters.lock().unwrap().len(), 2);
+        assert!(batch_rx.try_recv().is_err());
+        assert!(storage_rx.try_recv().is_err());
     }
 
     #[tokio::test]

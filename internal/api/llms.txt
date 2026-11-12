@@ -301,7 +301,8 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 - `rpc_stall_reconnects_total`（其中由假活看门狗触发的重连：连接没断但不再推链上已有的日志）
 - `rpc_logs_received_total`
 - `events_decoded_total`
-- `decode_errors_total`
+- `decode_errors_total`（日志本身格式错误：hex/ABI/topic/UTF-8 解析失败）
+- `foreign_requests_skipped_total`（格式正常但 ancillary 没有 `market_id` 的请求：其他项目共用同一个 UMA 合约，按设计跳过，不算错误）
 - `duplicates_total`
 - `enrichment_hits_total`
 - `enrichment_misses_total`

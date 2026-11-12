@@ -45,7 +45,14 @@ pub struct Stats {
     pub rpc_sources_connected: AtomicU64,
     pub rpc_logs_received: AtomicU64,
     pub events_decoded: AtomicU64,
+    /// Logs that were malformed (bad hex/ABI/topic/UTF-8). Requests from
+    /// other projects on the same oracle are NOT counted here — see
+    /// `foreign_requests_skipped`.
     pub decode_errors: AtomicU64,
+    /// Well-formed ProposePrice/DisputePrice logs whose ancillary data has no
+    /// `market_id`, i.e. requests from non-Polymarket requesters sharing the
+    /// UMA oracle. Skipped by design; counted only for visibility.
+    pub foreign_requests_skipped: AtomicU64,
     pub duplicates: AtomicU64,
     pub enrichment_hits: AtomicU64,
     /// Subset of enrichment_hits resolved via market_id (covers both standard

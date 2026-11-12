@@ -17,6 +17,17 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.13.2（2026-11-13，待填）
+- **非 Polymarket 请求不再算解码错误**（`src/pipeline.rs`、`src/uma/events/mod.rs`）：同一个 UMA
+  合约上有其他项目的请求（如 requester `0x53703dd6…` 每笔交易批量提交 70–110 条 JSON 格式的
+  NBA 盘口，condition_id 不在 Gamma 里），ancillary 没有 `market_id`。以前全部计入
+  `decode_errors_total` 并逐条打 WARN，约 75 次/小时，持续触发 uma-console 的“解码失败激增”
+  告警（阈值 30/h），淹没了真告警。
+  - 改为计入新计数 `foreign_requests_skipped_total`（`/healthz`、`/metrics`），照旧跳过不广播。
+  - 每个新 requester 只打一条 INFO，之后只计数。
+  - `decode_errors_total` 只统计日志本身格式错误。用真实链上日志做了回归测试。
+  - 下游无感知：wire 协议不变。
+
 ## v0.13.1（2026-11-12，44c3bb9）
 - **修复 WSS 订阅“假活”导致长时间不广播**（`src/uma/rpc.rs`）：2026-11-12 getblock 的订阅连接
   没断但不再推日志，rust-uma 13 小时零广播（`/healthz` 仍显示 `rpc_connected=true`）。

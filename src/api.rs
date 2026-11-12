@@ -76,6 +76,7 @@ struct HealthResponse {
     rpc_logs_received_total: u64,
     events_decoded_total: u64,
     decode_errors_total: u64,
+    foreign_requests_skipped_total: u64,
     duplicates_total: u64,
     enrichment_hits_total: u64,
     enrichment_hits_via_market_id_total: u64,
@@ -111,6 +112,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         rpc_logs_received_total: state.stats.rpc_logs_received.load(Ordering::Relaxed),
         events_decoded_total: state.stats.events_decoded.load(Ordering::Relaxed),
         decode_errors_total: state.stats.decode_errors.load(Ordering::Relaxed),
+        foreign_requests_skipped_total: state
+            .stats
+            .foreign_requests_skipped
+            .load(Ordering::Relaxed),
         duplicates_total: state.stats.duplicates.load(Ordering::Relaxed),
         enrichment_hits_total: state.stats.enrichment_hits.load(Ordering::Relaxed),
         enrichment_hits_via_market_id_total: state
@@ -180,6 +185,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
         (
             "rust_uma_decode_errors_total",
             state.stats.decode_errors.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_foreign_requests_skipped_total",
+            state.stats.foreign_requests_skipped.load(Ordering::Relaxed),
         ),
         (
             "rust_uma_duplicates_total",
@@ -282,6 +291,7 @@ struct DashboardData {
     rpc_bytes_sent_total: u64,
     events_decoded_total: u64,
     decode_errors_total: u64,
+    foreign_requests_skipped_total: u64,
     duplicates_total: u64,
     enrichment_hits_total: u64,
     enrichment_hits_via_market_id_total: u64,
@@ -350,6 +360,10 @@ async fn dashboard_data(
         rpc_bytes_sent_total: state.stats.rpc_bytes_sent.load(Ordering::Relaxed),
         events_decoded_total: state.stats.events_decoded.load(Ordering::Relaxed),
         decode_errors_total: state.stats.decode_errors.load(Ordering::Relaxed),
+        foreign_requests_skipped_total: state
+            .stats
+            .foreign_requests_skipped
+            .load(Ordering::Relaxed),
         duplicates_total: state.stats.duplicates.load(Ordering::Relaxed),
         enrichment_hits_total: state.stats.enrichment_hits.load(Ordering::Relaxed),
         enrichment_hits_via_market_id_total: state
