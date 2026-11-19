@@ -10,8 +10,8 @@ Protobuf WSS。HTTP 只提供健康检查、指标和一个 token 鉴权的只�
 Protobuf 路径，避免两套格式并存。其实时热路径仅执行以下操作：
 
 1. 按 topic 订阅 `ProposePrice` 和 `DisputePrice` 日志（不按地址过滤，
-   `UMA_CONTRACT_ADDRESSES` 默认留空即接受任意发送方；仅当显式配置非空列表时
-   才启用更严格的 emitter 白名单校验）；
+   `UMA_CONTRACT_ADDRESSES` 留空即接受任意发送方；生产配置了 emitter 白名单，
+   名单外合约的事件不广播）；
 2. 解码 ABI 载荷；
 3. 关联驻留内存的 Polymarket 身份目录；
 4. 向所有 WebSocket 客户端发布同一份预编码二进制批次；
@@ -196,10 +196,10 @@ GET /uma/v1/dashboard-data?token=<DASHBOARD_TOKEN>
 ## 默认值与运行语义
 
 - API 监听地址：`127.0.0.1:8011`。
-- RPC 采集仅按事件 topic 过滤；`UMA_CONTRACT_ADDRESSES` 默认留空，解析阶段不
-  再按发送方过滤——Oracle 合约地址可能升级/迁移，锁死列表有静默漏事件的风险。
-  仅当显式配置该变量（例如已知的新旧 Polygon UMA Oracle 地址）时才启用更严格
-  的 emitter 白名单校验。
+- RPC 采集仅按事件 topic 过滤；`UMA_CONTRACT_ADDRESSES` 是解析阶段的 emitter
+  白名单，代码默认留空（接受任意发送方），生产配置为 Polymarket 当前使用的
+  Oracle 合约。名单外合约的事件不广播，`/healthz` 的 `off_list_emitters` 按合约
+  列出事件数和目录命中数。
 - `.cache` 包含三个独立水位：`enrichment.cursor`（活跃市场）与
   `enrichment_closed.cursor`（最近关闭市场，窗口由 `CLOSED_MARKET_LOOKBACK_DAYS`
   控制）均为 Gamma 的 `(updatedAt, market_id)` 增量水位，`uma.cursor` 为已完成

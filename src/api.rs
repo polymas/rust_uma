@@ -84,6 +84,12 @@ struct HealthResponse {
     catalog_markets: u64,
     catalog_reconcile_gaps_closed_total: u64,
     catalog_new_markets_added_total: u64,
+    catalog_markets_evicted_total: u64,
+    /// Number of addresses in `UMA_CONTRACT_ADDRESSES`; 0 = allowlist off.
+    emitter_allowlist_size: usize,
+    off_list_events_total: u64,
+    off_list_catalog_hits_total: u64,
+    off_list_emitters: Vec<OffListEmitterView>,
     last_upstream_received_at_us: u64,
     last_broadcast_at_us: u64,
     subscribers: u64,
@@ -132,6 +138,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
             .stats
             .catalog_new_markets_added
             .load(Ordering::Relaxed),
+        catalog_markets_evicted_total: state.stats.catalog_markets_evicted.load(Ordering::Relaxed),
+        emitter_allowlist_size: state.config.contract_address_bytes.len(),
+        off_list_events_total: state.stats.off_list_events.load(Ordering::Relaxed),
+        off_list_catalog_hits_total: state.stats.off_list_catalog_hits.load(Ordering::Relaxed),
+        off_list_emitters: off_list_emitters(&state.stats),
         last_upstream_received_at_us: state
             .stats
             .last_upstream_received_at_us
@@ -223,6 +234,18 @@ async fn metrics(State(state): State<AppState>) -> Response {
                 .stats
                 .catalog_new_markets_added
                 .load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_catalog_markets_evicted_total",
+            state.stats.catalog_markets_evicted.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_off_list_events_total",
+            state.stats.off_list_events.load(Ordering::Relaxed),
+        ),
+        (
+            "rust_uma_off_list_catalog_hits_total",
+            state.stats.off_list_catalog_hits.load(Ordering::Relaxed),
         ),
         (
             "rust_uma_subscribers",
@@ -319,8 +342,48 @@ struct DashboardData {
     /// fastest one to actually get stored. See `Stats::source_race`. Sorted by
     /// `source` for a stable dashboard row order across polls.
     rpc_source_race: Vec<SourceRace>,
+    /// Number of addresses in `UMA_CONTRACT_ADDRESSES`; 0 = allowlist off.
+    emitter_allowlist_size: usize,
+    off_list_events_total: u64,
+    off_list_catalog_hits_total: u64,
+    off_list_emitters: Vec<OffListEmitterView>,
     /// 电竞弃权排除名单：订阅状态、名单明细、最近被拦下的事件。
     forfeit: ForfeitView,
+}
+
+/// One row of `Stats::off_list_emitters` (see `stats::OffListEmitter`).
+#[derive(Serialize)]
+struct OffListEmitterView {
+    emitter: String,
+    last_requester: String,
+    events_total: u64,
+    catalog_hits_total: u64,
+    first_seen_at_us: u64,
+    last_seen_at_us: u64,
+    last_hit_market_id: u64,
+    last_hit_tx: String,
+}
+
+fn off_list_emitters(stats: &crate::stats::Stats) -> Vec<OffListEmitterView> {
+    let map = stats
+        .off_list_emitters
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut list: Vec<OffListEmitterView> = map
+        .iter()
+        .map(|(emitter, tally)| OffListEmitterView {
+            emitter: format!("0x{}", hex::encode(emitter)),
+            last_requester: format!("0x{}", hex::encode(tally.last_requester)),
+            events_total: tally.events,
+            catalog_hits_total: tally.catalog_hits,
+            first_seen_at_us: tally.first_seen_us,
+            last_seen_at_us: tally.last_seen_us,
+            last_hit_market_id: tally.last_hit_market_id,
+            last_hit_tx: tally.last_hit_tx.clone(),
+        })
+        .collect();
+    list.sort_by(|a, b| a.emitter.cmp(&b.emitter));
+    list
 }
 
 #[derive(Serialize)]
@@ -392,6 +455,10 @@ async fn dashboard_data(
         latest_block: state.stats.latest_block.load(Ordering::Relaxed),
         event_ring_oldest_sequence: oldest,
         event_ring_latest_sequence: latest,
+        emitter_allowlist_size: state.config.contract_address_bytes.len(),
+        off_list_events_total: state.stats.off_list_events.load(Ordering::Relaxed),
+        off_list_catalog_hits_total: state.stats.off_list_catalog_hits.load(Ordering::Relaxed),
+        off_list_emitters: off_list_emitters(&state.stats),
         rpc_source_race: {
             let map = state
                 .stats

@@ -18,9 +18,16 @@ use crate::{
     storage::{Storage, StorageError},
 };
 
+struct CatalogEntry {
+    market: Arc<MarketEnrichment>,
+    /// Day (since the Unix epoch) Gamma last listed this market in any sync
+    /// pass — what `Catalog::evict_unseen` keys on.
+    seen_day: u32,
+}
+
 #[derive(Default)]
 struct CatalogIndexes {
-    by_condition: HashMap<[u8; 32], Arc<MarketEnrichment>>,
+    by_condition: HashMap<[u8; 32], CatalogEntry>,
     market_to_condition: HashMap<u64, [u8; 32]>,
     /// Highest Gamma market id ever upserted — the stop point for
     /// `sync_newest_markets` (Gamma ids are assigned in creation order).
@@ -31,13 +38,75 @@ pub struct Catalog {
     indexes: RwLock<CatalogIndexes>,
 }
 
+/// Rows loaded from a `catalog.bin` without last-seen days (written before
+/// eviction existed) expire this many days after the upgrade unless Gamma
+/// lists them again. Two days is ~8 full reconciliation walks at the default
+/// 6h interval: enough that a live market is not lost to one walk Gamma's
+/// pagination happened to drop it from, short enough that the backlog (3.1M
+/// rows / 409 MB in production on 2026-11-18, ~85% of them long closed) is
+/// gone within days instead of a full retention period.
+const LEGACY_GRACE_DAYS: u64 = 2;
+
+/// Removals per write-lock hold in `Catalog::evict_unseen`. The hot path's
+/// `resolve()` waits on that lock, so the purge is cut into sub-millisecond
+/// slices instead of one hold over millions of rows.
+const EVICT_CHUNK: usize = 2048;
+
+/// Days since the Unix epoch (UTC).
+pub fn today_day() -> u32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    (secs / 86_400) as u32
+}
+
+/// What one `Catalog::evict_unseen` call did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Eviction {
+    /// Rows removed.
+    pub evicted: usize,
+    /// Rows Gamma listed on or after `fresh_day` — the size of the set the
+    /// walk that just finished confirmed.
+    pub fresh: usize,
+    /// True when stale rows existed but `fresh` was below the caller's floor,
+    /// so nothing was removed.
+    pub skipped: bool,
+}
+
 impl Catalog {
+    /// Every market counts as seen today. For tests and callers without
+    /// stored last-seen days; production startup uses `from_stored`.
     pub fn new(markets: Vec<MarketEnrichment>) -> Self {
         let catalog = Self {
             indexes: RwLock::new(CatalogIndexes::default()),
         };
+        let today = today_day();
         for market in markets {
-            catalog.upsert(market);
+            catalog.upsert_seen(market, today);
+        }
+        catalog
+    }
+
+    /// Builds the catalog from `Storage::load_catalog_rows`. Rows without a
+    /// stored last-seen day get one that expires `LEGACY_GRACE_DAYS` from now
+    /// under `retention_days` (see that constant).
+    pub fn from_stored(rows: Vec<(MarketEnrichment, Option<u32>)>, retention_days: u64) -> Self {
+        let today = today_day();
+        let legacy_day =
+            today.saturating_sub(retention_days.saturating_sub(LEGACY_GRACE_DAYS) as u32);
+        let catalog = Self {
+            indexes: RwLock::new(CatalogIndexes::default()),
+        };
+        {
+            let mut indexes = catalog.indexes.write().unwrap_or_else(|e| e.into_inner());
+            indexes.by_condition.reserve(rows.len());
+            indexes.market_to_condition.reserve(rows.len());
+        }
+        for (market, seen_day) in rows {
+            // `.min(today)`: a day from the future (clock stepped back since
+            // the file was written) must not make a row immortal.
+            catalog.upsert_seen(market, seen_day.unwrap_or(legacy_day).min(today));
         }
         catalog
     }
@@ -48,7 +117,7 @@ impl Catalog {
             .unwrap_or_else(|e| e.into_inner())
             .by_condition
             .get(condition_id)
-            .cloned()
+            .map(|entry| entry.market.clone())
     }
 
     pub fn get_by_market_id(&self, market_id: u64) -> Option<Arc<MarketEnrichment>> {
@@ -57,7 +126,7 @@ impl Catalog {
             .market_to_condition
             .get(&market_id)
             .and_then(|condition_id| indexes.by_condition.get(condition_id))
-            .cloned()
+            .map(|entry| entry.market.clone())
     }
 
     /// Resolves enrichment for a decoded UMA event, preferring `market_id`.
@@ -78,13 +147,19 @@ impl Catalog {
             .or_else(|| self.get(derived_condition_id))
     }
 
+    /// Inserts or updates a market Gamma just listed, and records today as
+    /// its last-seen day. Returns whether the market's content changed
+    /// (a last-seen refresh alone is not a change).
     pub fn upsert(&self, market: MarketEnrichment) -> bool {
+        self.upsert_seen(market, today_day())
+    }
+
+    fn upsert_seen(&self, market: MarketEnrichment, seen_day: u32) -> bool {
         let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-        if indexes
-            .by_condition
-            .get(&market.condition_id)
-            .is_some_and(|existing| existing.as_ref() == &market)
+        if let Some(existing) = indexes.by_condition.get_mut(&market.condition_id)
+            && existing.market.as_ref() == &market
         {
+            existing.seen_day = existing.seen_day.max(seen_day);
             return false;
         }
         indexes.max_market_id = indexes.max_market_id.max(market.market_id);
@@ -95,10 +170,128 @@ impl Catalog {
         {
             indexes.by_condition.remove(&previous);
         }
-        indexes
-            .by_condition
-            .insert(market.condition_id, Arc::new(market));
+        indexes.by_condition.insert(
+            market.condition_id,
+            CatalogEntry {
+                market: Arc::new(market),
+                seen_day,
+            },
+        );
         true
+    }
+
+    /// Removes every market Gamma has not listed since `cutoff_day`
+    /// (`seen_day < cutoff_day`).
+    ///
+    /// The catalog only ever grew before this existed: a market enters while
+    /// active or recently closed and nothing took it out again, so production
+    /// went from ~350k rows (2026-09) to 3.1M rows / 409 MB (2026-11-18) on a
+    /// 2 GB host. Long-closed markets cannot produce another ProposePrice /
+    /// DisputePrice, and a bigger catalog also raises the odds that a foreign
+    /// contract's unrelated `market_id` collides with a row.
+    ///
+    /// Only call this right after a from-scratch walk (`reconcile_full`) that
+    /// started on `fresh_day`: that walk re-stamps every market Gamma still
+    /// lists, so what is left unstamped for a whole retention period is
+    /// neither active nor recently closed. `min_fresh` is the safety catch
+    /// for a walk Gamma cut short — if fewer rows than that were stamped on
+    /// or after `fresh_day`, nothing is removed.
+    ///
+    /// Blocking CPU work over the whole catalog: run it via `spawn_blocking`.
+    /// Victims are picked under the read lock and removed in `EVICT_CHUNK`
+    /// slices so `resolve()` on the hot path never waits behind one long
+    /// write-lock hold.
+    pub fn evict_unseen(&self, cutoff_day: u32, fresh_day: u32, min_fresh: usize) -> Eviction {
+        let mut victims = Vec::new();
+        let mut fresh = 0;
+        {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            for (condition_id, entry) in &indexes.by_condition {
+                if entry.seen_day < cutoff_day {
+                    victims.push(*condition_id);
+                } else if entry.seen_day >= fresh_day {
+                    fresh += 1;
+                }
+            }
+        }
+        if victims.is_empty() {
+            return Eviction {
+                evicted: 0,
+                fresh,
+                skipped: false,
+            };
+        }
+        if fresh < min_fresh {
+            return Eviction {
+                evicted: 0,
+                fresh,
+                skipped: true,
+            };
+        }
+
+        let mut evicted = 0;
+        let mut dropped = Vec::with_capacity(EVICT_CHUNK);
+        for chunk in victims.chunks(EVICT_CHUNK) {
+            {
+                let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+                for condition_id in chunk {
+                    // Re-check: a sync pass may have listed it again since
+                    // the scan above.
+                    if indexes
+                        .by_condition
+                        .get(condition_id)
+                        .is_none_or(|entry| entry.seen_day >= cutoff_day)
+                    {
+                        continue;
+                    }
+                    if let Some(entry) = indexes.by_condition.remove(condition_id) {
+                        if indexes.market_to_condition.get(&entry.market.market_id)
+                            == Some(condition_id)
+                        {
+                            indexes.market_to_condition.remove(&entry.market.market_id);
+                        }
+                        dropped.push(entry);
+                    }
+                }
+            }
+            // Free the rows (two `Vec`s each) after the lock is released.
+            evicted += dropped.len();
+            dropped.clear();
+            // Let waiting readers in before taking the write lock again;
+            // re-locking straight away can starve them across many slices.
+            std::thread::yield_now();
+        }
+
+        // A purge that removed most of the table (the first one after the
+        // upgrade) leaves the maps sized for the old row count. Give that
+        // back. `shrink_to_fit` rehashes the survivors under the write lock:
+        // replaying the production catalog of 2026-11-18 (3.1M rows, 2.6M
+        // evicted) on a dev machine, `resolve()` waited ~44 ms exactly once
+        // during the whole purge, and that wait is this step. So only do it
+        // when it frees a lot (in practice: the first purge after the
+        // upgrade), and one map per hold.
+        let oversized = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes.by_condition.capacity() > indexes.by_condition.len().saturating_mul(4) + 1024
+        };
+        if oversized {
+            self.indexes
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .by_condition
+                .shrink_to_fit();
+            self.indexes
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .market_to_condition
+                .shrink_to_fit();
+        }
+
+        Eviction {
+            evicted,
+            fresh,
+            skipped: false,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -127,13 +320,15 @@ impl Catalog {
     /// writer is queued, so a long snapshot with a concurrent `upsert`
     /// (the reconcile task) waiting behind it stalls the hot path's
     /// `resolve()` for the whole hold.
-    pub fn snapshot(&self) -> Vec<Arc<MarketEnrichment>> {
+    ///
+    /// Each row comes with its last-seen day, for `Storage::save_catalog_seen`.
+    pub fn snapshot(&self) -> Vec<(Arc<MarketEnrichment>, u32)> {
         self.indexes
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .by_condition
             .values()
-            .cloned()
+            .map(|entry| (entry.market.clone(), entry.seen_day))
             .collect()
     }
 }
@@ -358,7 +553,7 @@ async fn persist_catalog(
     let storage = storage.clone();
     let started = Instant::now();
     tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-        storage.save_catalog(&snapshot)?;
+        storage.save_catalog_seen(&snapshot)?;
         if let Some(value) = active_cursor {
             storage.save_enrichment_cursor(&value)?;
         }
@@ -514,7 +709,9 @@ pub async fn run_catalog_sync(
 /// can. Deliberately does not touch the persisted incremental cursors (it
 /// discards the `next` cursor `sync_incremental` would have returned), so it
 /// can never regress or race the fast path's own progress; it purely adds
-/// whatever the fast path missed. Runs as its own task (not a branch in
+/// whatever the fast path missed. Because the walk also re-stamps every
+/// market Gamma still lists, it is the one safe point to evict the ones it
+/// no longer does (`evict_after_reconcile`). Runs as its own task (not a branch in
 /// `run_catalog_sync`'s select loop) so a multi-minute full walk never
 /// delays the 60s-scale incremental refresh.
 pub async fn run_catalog_reconcile(
@@ -528,31 +725,103 @@ pub async fn run_catalog_reconcile(
     let mut interval = tokio::time::interval(config.catalog_reconcile_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await; // consume the immediate first tick; reconcile only after a full interval
+    let mut last_fresh = 0;
     loop {
         tokio::select! {
             _ = shutdown.changed() => if *shutdown.borrow() { break; },
             _ = interval.tick() => {
+                // Taken before the walk: everything the walk lists is stamped
+                // with this day or a later one.
+                let walk_day = today_day();
                 match reconcile_full(&gamma, &catalog, config.closed_market_lookback_days).await {
-                    Ok(changed) if changed > 0 => {
-                        // Never writes the incremental cursors — see the doc comment above.
-                        match persist_catalog(&storage, &catalog, None, None).await {
-                            Ok(timings) => info!(
-                                snapshot_ms = timings.snapshot.as_millis(),
-                                save_ms = timings.save.as_millis(),
-                                "catalog persisted after reconciliation"
-                            ),
-                            Err(error) => warn!(%error, "persist catalog after reconciliation"),
+                    Ok(changed) => {
+                        let eviction = evict_after_reconcile(
+                            &catalog,
+                            config.catalog_retention_days,
+                            walk_day,
+                            &mut last_fresh,
+                        )
+                        .await;
+                        if changed > 0 || eviction.evicted > 0 {
+                            // Never writes the incremental cursors — see the doc comment above.
+                            match persist_catalog(&storage, &catalog, None, None).await {
+                                Ok(timings) => info!(
+                                    snapshot_ms = timings.snapshot.as_millis(),
+                                    save_ms = timings.save.as_millis(),
+                                    "catalog persisted after reconciliation"
+                                ),
+                                Err(error) => warn!(%error, "persist catalog after reconciliation"),
+                            }
+                            stats.catalog_markets.store(catalog.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         }
-                        stats.catalog_markets.store(catalog.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        stats.catalog_reconcile_gaps_closed.fetch_add(changed as u64, std::sync::atomic::Ordering::Relaxed);
-                        info!(changed, markets = catalog.len(), "Gamma full catalog reconciliation closed a coverage gap");
+                        if eviction.evicted > 0 {
+                            stats.catalog_markets_evicted.fetch_add(eviction.evicted as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if changed > 0 {
+                            stats.catalog_reconcile_gaps_closed.fetch_add(changed as u64, std::sync::atomic::Ordering::Relaxed);
+                            info!(changed, markets = catalog.len(), "Gamma full catalog reconciliation closed a coverage gap");
+                        } else {
+                            info!("Gamma full catalog reconciliation found no gap");
+                        }
                     }
-                    Ok(_) => info!("Gamma full catalog reconciliation found no gap"),
                     Err(error) => warn!(error = %ErrorChain(&error), "Gamma full catalog reconciliation failed"),
                 }
             }
         }
     }
+}
+
+/// Runs `Catalog::evict_unseen` after a successful from-scratch walk.
+///
+/// `last_fresh` is how many rows the previous walk confirmed; a walk that
+/// confirms fewer than half of that is treated as cut short by Gamma (an
+/// early empty `next_cursor` looks exactly like a normal end of listing) and
+/// evicts nothing. `retention_days == 0` turns eviction off.
+async fn evict_after_reconcile(
+    catalog: &Arc<Catalog>,
+    retention_days: u64,
+    walk_day: u32,
+    last_fresh: &mut usize,
+) -> Eviction {
+    if retention_days == 0 {
+        return Eviction::default();
+    }
+    let cutoff_day = today_day().saturating_sub(retention_days.min(u32::MAX as u64) as u32);
+    let min_fresh = (*last_fresh / 2).max(1);
+    let task = {
+        let catalog = catalog.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let eviction = catalog.evict_unseen(cutoff_day, walk_day, min_fresh);
+            (eviction, started.elapsed())
+        })
+    };
+    let (eviction, elapsed) = match task.await {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(%error, "catalog eviction task failed");
+            return Eviction::default();
+        }
+    };
+    if eviction.skipped {
+        warn!(
+            fresh = eviction.fresh,
+            min_fresh,
+            "catalog eviction skipped: the reconciliation walk confirmed too few markets"
+        );
+        return eviction;
+    }
+    *last_fresh = eviction.fresh;
+    if eviction.evicted > 0 {
+        info!(
+            evicted = eviction.evicted,
+            markets = catalog.len(),
+            retention_days,
+            elapsed_ms = elapsed.as_millis(),
+            "catalog evicted markets Gamma no longer lists"
+        );
+    }
+    eviction
 }
 
 async fn reconcile_full(
@@ -954,6 +1223,184 @@ mod tests {
         // thing available for standard binary markets missing market_id.
         assert!(catalog.resolve(None, &wrong_derived_condition_id).is_none());
         assert!(catalog.resolve(None, &gamma_condition_id).is_some());
+    }
+
+    fn row(market_id: u64) -> MarketEnrichment {
+        MarketEnrichment {
+            market_id,
+            condition_id: [market_id as u8; 32],
+            token_ids: vec![[market_id as u8; 32]],
+            tag_ids: vec![1],
+            category: crate::model::Category::Unspecified,
+            bet_type: crate::model::BetType::Unspecified,
+            neg_risk: false,
+        }
+    }
+
+    #[test]
+    fn eviction_removes_only_markets_gamma_stopped_listing() {
+        let today = today_day();
+        let catalog = Catalog::from_stored(
+            vec![
+                (row(1), Some(today - 30)), // closed long ago
+                (row(2), Some(today - 30)), // quiet but still listed: re-stamped below
+                (row(3), Some(today - 13)), // inside the retention window
+                (row(4), Some(today)),
+            ],
+            14,
+        );
+        // The reconciliation walk lists market 2 again, unchanged: that is
+        // not a content change, but it must refresh the last-seen day.
+        assert!(!catalog.upsert(row(2)));
+
+        let eviction = catalog.evict_unseen(today - 14, today, 1);
+        assert_eq!(
+            eviction,
+            Eviction {
+                evicted: 1,
+                fresh: 2,
+                skipped: false
+            }
+        );
+        assert!(catalog.get_by_market_id(1).is_none());
+        assert!(catalog.get(&[1; 32]).is_none());
+        for id in [2, 3, 4] {
+            assert!(catalog.get_by_market_id(id).is_some(), "market {id}");
+        }
+        assert_eq!(catalog.len(), 3);
+        // The highest id is the new-market watch's stop point; eviction must
+        // not move it.
+        assert_eq!(catalog.max_market_id(), 4);
+        // Nothing left to evict.
+        assert_eq!(catalog.evict_unseen(today - 14, today, 1).evicted, 0);
+    }
+
+    /// A walk Gamma cut short stamps almost nothing. Evicting on the back of
+    /// it would drop live markets, so the purge must refuse.
+    #[test]
+    fn eviction_is_skipped_when_the_walk_confirmed_too_few_markets() {
+        let today = today_day();
+        let catalog = Catalog::from_stored(
+            vec![
+                (row(1), Some(today - 30)),
+                (row(2), Some(today - 30)),
+                (row(3), Some(today)),
+            ],
+            14,
+        );
+        let eviction = catalog.evict_unseen(today - 14, today, 2);
+        assert_eq!(
+            eviction,
+            Eviction {
+                evicted: 0,
+                fresh: 1,
+                skipped: true
+            }
+        );
+        assert_eq!(catalog.len(), 3);
+    }
+
+    /// Rows from a catalog.bin written before eviction existed carry no
+    /// last-seen day. They must outlive the first walks after the upgrade
+    /// (grace period) and go once the grace period is over.
+    #[test]
+    fn rows_without_a_last_seen_day_expire_after_the_grace_period() {
+        let today = today_day();
+        let catalog = Catalog::from_stored(vec![(row(1), None), (row(2), Some(today))], 14);
+        let grace = LEGACY_GRACE_DAYS as u32;
+        for day in today..=today + grace {
+            assert_eq!(
+                catalog.evict_unseen(day - 14, today, 1).evicted,
+                0,
+                "day +{}",
+                day - today
+            );
+        }
+        assert_eq!(
+            catalog
+                .evict_unseen(today + grace + 1 - 14, today, 1)
+                .evicted,
+            1
+        );
+        assert!(catalog.get_by_market_id(1).is_none());
+        assert!(catalog.get_by_market_id(2).is_some());
+
+        // A stored day from the future must not make a row immortal.
+        let catalog = Catalog::from_stored(vec![(row(1), Some(today + 1000))], 14);
+        assert_eq!(catalog.snapshot()[0].1, today);
+    }
+
+    /// End to end through the reconcile task's own helpers: a full walk
+    /// against a Gamma stand-in, then eviction, then persistence.
+    #[tokio::test]
+    async fn reconcile_then_evict_drops_stale_rows_and_persists_last_seen_days() {
+        fn market(id: u64) -> Value {
+            json!({
+                "id": id.to_string(),
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "conditionId": format!("0x{}", format!("{id:02x}").repeat(32)),
+                "clobTokenIds": [id.to_string()],
+                "tags": [],
+                "events": []
+            })
+        }
+        async fn list_markets(State(markets): State<Arc<RwLock<Vec<Value>>>>) -> Json<Value> {
+            Json(json!({ "markets": markets.read().unwrap().clone(), "next_cursor": "" }))
+        }
+        let listed = Arc::new(RwLock::new(vec![market(10)]));
+        let app = Router::new()
+            .route("/markets/keyset", get(list_markets))
+            .with_state(listed.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let gamma = GammaClient::new(format!("http://{address}")).unwrap();
+
+        // Market 10 as Gamma describes it, last seen long ago; market 99 is
+        // one Gamma no longer lists at all.
+        let known: GammaMarket = serde_json::from_value(market(10)).unwrap();
+        let today = today_day();
+        let catalog = Arc::new(Catalog::from_stored(
+            vec![
+                (compact_market(known).unwrap(), Some(today - 40)),
+                (row(99), Some(today - 40)),
+            ],
+            14,
+        ));
+
+        let walk_day = today_day();
+        assert_eq!(reconcile_full(&gamma, &catalog, 0).await.unwrap(), 0);
+        let mut last_fresh = 0;
+        let eviction = evict_after_reconcile(&catalog, 14, walk_day, &mut last_fresh).await;
+        assert_eq!(eviction.evicted, 1);
+        assert_eq!(last_fresh, 1);
+        assert!(catalog.get_by_market_id(10).is_some());
+        assert!(catalog.get_by_market_id(99).is_none());
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        persist_catalog(&storage, &catalog, None, None)
+            .await
+            .unwrap();
+        let rows = storage.load_catalog_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.market_id, 10);
+        assert_eq!(rows[0].1, Some(today));
+
+        // The next walk comes back empty (Gamma cut it short): the guard
+        // keeps market 10 even once it looks stale.
+        listed.write().unwrap().clear();
+        assert_eq!(reconcile_full(&gamma, &catalog, 0).await.unwrap(), 0);
+        let eviction = catalog.evict_unseen(today + 1, today + 1, (last_fresh / 2).max(1));
+        assert!(eviction.skipped);
+        assert!(catalog.get_by_market_id(10).is_some());
+
+        // Retention 0 turns eviction off.
+        assert_eq!(
+            evict_after_reconcile(&catalog, 0, walk_day, &mut last_fresh).await,
+            Eviction::default()
+        );
+        server.abort();
     }
 
     #[test]

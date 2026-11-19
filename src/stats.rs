@@ -82,6 +82,9 @@ pub struct Stats {
     /// Markets `enrichment::run_new_market_watch` added ahead of the regular
     /// `updatedAt` refresh — how often the new-market fast path mattered.
     pub catalog_new_markets_added: AtomicU64,
+    /// Markets removed by `enrichment::Catalog::evict_unseen` because Gamma
+    /// has not listed them for `CATALOG_RETENTION_DAYS`.
+    pub catalog_markets_evicted: AtomicU64,
     pub last_upstream_received_at_us: AtomicU64,
     pub last_broadcast_at_us: AtomicU64,
     pub subscribers: AtomicU64,
@@ -114,6 +117,39 @@ pub struct Stats {
     /// `Mutex<HashMap>` rather than fixed `AtomicU64` fields. Each hold is O(1)
     /// with no I/O, same pattern as `Processor::recent_enrichment`.
     pub source_race: Mutex<HashMap<String, SourceRaceStats>>,
+    /// ProposePrice/DisputePrice logs dropped because their emitter is not in
+    /// `UMA_CONTRACT_ADDRESSES` (only counted while that allowlist is set).
+    pub off_list_events: AtomicU64,
+    /// The subset of `off_list_events` that would have resolved in the
+    /// catalog, i.e. would have been broadcast without the allowlist.
+    pub off_list_catalog_hits: AtomicU64,
+    /// The same two tallies per emitter — see `OffListEmitter`.
+    pub off_list_emitters: Mutex<HashMap<[u8; 20], OffListEmitter>>,
+}
+
+/// Emitters tracked individually in `Stats::off_list_emitters`. Anyone can
+/// deploy a contract that emits these topics, so the table is capped; past
+/// the cap only the two global counters keep counting.
+pub const OFF_LIST_EMITTERS_MAX: usize = 64;
+
+/// What one emitter outside `UMA_CONTRACT_ADDRESSES` has sent.
+///
+/// The point is the ratio. A contract Polymarket has migrated to resolves in
+/// the catalog almost every time; an unrelated project that happens to use
+/// the same ancillary layout with its own id numbering resolves only when an
+/// id collides (2 of 85 for 0x57827d48… over 22 hours, 2026-11-18).
+/// uma-console alerts on a high ratio (`console::alerts`, rule
+/// `off_list_emitter`), which is how a stale allowlist gets noticed instead
+/// of silently dropping every real event.
+#[derive(Debug, Clone, Default)]
+pub struct OffListEmitter {
+    pub events: u64,
+    pub catalog_hits: u64,
+    pub first_seen_us: u64,
+    pub last_seen_us: u64,
+    pub last_requester: [u8; 20],
+    pub last_hit_market_id: u64,
+    pub last_hit_tx: String,
 }
 
 impl Stats {
@@ -143,6 +179,43 @@ impl Stats {
         if won {
             entry.won += 1;
         }
+    }
+
+    /// Tallies one log from an emitter outside the allowlist. `hit` carries
+    /// `(market_id, tx)` when the event would have resolved in the catalog.
+    /// Returns whether this emitter was seen for the first time.
+    pub fn record_off_list(
+        &self,
+        emitter: [u8; 20],
+        requester: [u8; 20],
+        now_us: u64,
+        hit: Option<(u64, &str)>,
+    ) -> bool {
+        Self::increment(&self.off_list_events);
+        if hit.is_some() {
+            Self::increment(&self.off_list_catalog_hits);
+        }
+        let mut map = self
+            .off_list_emitters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let first = !map.contains_key(&emitter);
+        if first && map.len() >= OFF_LIST_EMITTERS_MAX {
+            return false;
+        }
+        let entry = map.entry(emitter).or_insert_with(|| OffListEmitter {
+            first_seen_us: now_us,
+            ..Default::default()
+        });
+        entry.events += 1;
+        entry.last_seen_us = now_us;
+        entry.last_requester = requester;
+        if let Some((market_id, tx)) = hit {
+            entry.catalog_hits += 1;
+            entry.last_hit_market_id = market_id;
+            entry.last_hit_tx = tx.to_owned();
+        }
+        first
     }
 
     pub fn set_max(value: &AtomicU64, candidate: u64) {

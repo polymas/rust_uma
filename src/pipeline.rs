@@ -17,7 +17,7 @@ use crate::{
     model::{EventKey, EventKind, EventRecord, PriceOutcome, hex_prefixed},
     stats::Stats,
     storage::StorageCommand,
-    uma::events::{DecodeError, RpcLog, decode_signal_log},
+    uma::events::{DecodeError, RpcLog, decode_fixed, decode_signal_log},
     wire::{WireConfig, encode_frame, encoded_event_len, now_us},
 };
 
@@ -49,7 +49,18 @@ pub struct Processor {
     /// one requester posts 70–110 requests per tx. Only touched on the skip
     /// path, never for events we broadcast.
     seen_foreign_requesters: Mutex<HashSet<[u8; 20]>>,
+    /// `(tx, log_index)` of the off-allowlist logs tallied most recently, so
+    /// the copies every WSS racer and each backfill deliver count once.
+    /// Bounded by `OFF_LIST_RECENT`.
+    off_list_recent: Mutex<RecentLogs>,
 }
+
+/// `(transaction hash, log index)` as the RPC sent them.
+type LogId = (String, String);
+/// Membership set plus insertion order, for a bounded "seen recently" window.
+type RecentLogs = (HashSet<LogId>, VecDeque<LogId>);
+
+const OFF_LIST_RECENT: usize = 4096;
 
 impl Processor {
     #[allow(clippy::too_many_arguments)]
@@ -74,6 +85,81 @@ impl Processor {
             sequence: AtomicU64::new(initial_sequence),
             recent_enrichment: Mutex::new(VecDeque::with_capacity(RECENT_ENRICHMENT_WINDOW)),
             seen_foreign_requesters: Mutex::new(HashSet::new()),
+            off_list_recent: Mutex::new((HashSet::new(), VecDeque::new())),
+        }
+    }
+
+    /// A log whose emitter is not in `UMA_CONTRACT_ADDRESSES`. It is never
+    /// broadcast, never enters the dedup ring and never reaches the WAL — a
+    /// ring entry would make the dedup check swallow the event later, when
+    /// the emitter has been added to the allowlist and a backfill redelivers
+    /// it. What it does get is a tally of how it *would* have fared: decoded
+    /// with the allowlist off and looked up in the catalog (see
+    /// `stats::OffListEmitter` for why that ratio matters).
+    ///
+    /// Off the broadcast path by construction: the log is already rejected.
+    fn note_off_list(&self, raw: &RpcLog, received_at_us: u64) {
+        {
+            let mut recent = self
+                .off_list_recent
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let key = (raw.transaction_hash.clone(), raw.log_index.clone());
+            if !recent.0.insert(key.clone()) {
+                return;
+            }
+            recent.1.push_back(key);
+            if recent.1.len() > OFF_LIST_RECENT
+                && let Some(oldest) = recent.1.pop_front()
+            {
+                recent.0.remove(&oldest);
+            }
+        }
+        let Ok(emitter) = decode_fixed::<20>(&raw.address, "address") else {
+            return;
+        };
+        // Same decode as the main path minus the allowlist; a log that is
+        // malformed or has no market_id simply cannot be a hit.
+        let decoded = decode_signal_log(raw, received_at_us, &[], self.config.require_market_id);
+        let (requester, hit) = match &decoded {
+            Ok(event) => {
+                let request = event.request();
+                let market_id = request.ancillary.market_id;
+                let hit = self
+                    .catalog
+                    .resolve(market_id, &request.condition_id)
+                    .map(|market| market.market_id);
+                (request.requester, hit)
+            }
+            Err(DecodeError::MissingMarketId { requester }) => (*requester, None),
+            Err(_) => ([0; 20], None),
+        };
+        let first = self.stats.record_off_list(
+            emitter,
+            requester,
+            received_at_us,
+            hit.map(|market_id| (market_id, raw.transaction_hash.as_str())),
+        );
+        if first {
+            info!(
+                emitter = %hex_prefixed(&emitter),
+                requester = %hex_prefixed(&requester),
+                tx = %raw.transaction_hash,
+                "UMA event from an emitter outside UMA_CONTRACT_ADDRESSES: not broadcasting; further ones are only counted"
+            );
+        }
+        if let Some(market_id) = hit {
+            // Every would-be broadcast is logged: this line (with the block)
+            // is what a backfill starts from if the emitter turns out to be
+            // a contract Polymarket moved to.
+            warn!(
+                emitter = %hex_prefixed(&emitter),
+                requester = %hex_prefixed(&requester),
+                market_id,
+                tx = %raw.transaction_hash,
+                block = %raw.block_number,
+                "off-allowlist UMA event resolves in the catalog: not broadcast"
+            );
         }
     }
 
@@ -107,6 +193,10 @@ impl Processor {
                         "skipping UMA requests without market_id from new requester (not Polymarket); further ones are only counted"
                     );
                 }
+                return;
+            }
+            Err(DecodeError::Emitter) => {
+                self.note_off_list(&raw, received_at_us);
                 return;
             }
             Err(error) => {
@@ -461,6 +551,111 @@ mod tests {
         assert_eq!(processor.seen_foreign_requesters.lock().unwrap().len(), 2);
         assert!(batch_rx.try_recv().is_err());
         assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// Real log, unmodified: tx 0xc7aa7075…34df, log 1304 (fetched with
+    /// `eth_getTransactionReceipt` on 2026-11-19). Emitter 0x57827d48… is not
+    /// a Polymarket oracle; its ancillary reads "Bitcoin Up or Down - Nov 17,
+    /// 9:15PM-9:30PM ET" with `market_id: 1076131`, an id from that project's
+    /// own numbering. Gamma's market 1076131 is "Will Pudgy Penguins floor
+    /// price reach 10 ETH before 2027?", so with the allowlist off this
+    /// propose was broadcast on 2026-11-17 as a signal for that still-open
+    /// market.
+    const OFF_LIST_PROPOSE: &str = include_str!("uma/events/testdata/offlist_emitter_propose.json");
+
+    fn colliding_market() -> MarketEnrichment {
+        MarketEnrichment {
+            market_id: 1_076_131,
+            condition_id: [0x77; 32],
+            token_ids: vec![[1; 32], [2; 32]],
+            tag_ids: vec![1],
+            category: crate::model::Category::Unspecified,
+            bet_type: crate::model::BetType::Unspecified,
+            neg_risk: false,
+        }
+    }
+
+    fn processor_with_allowlist(
+        allowlist: Vec<[u8; 20]>,
+    ) -> (
+        Processor,
+        mpsc::Receiver<Arc<EventRecord>>,
+        mpsc::Receiver<StorageCommand>,
+    ) {
+        let mut config = test_config();
+        config.require_market_id = true;
+        config.contract_address_bytes = allowlist;
+        let (batch_tx, batch_rx) = mpsc::channel(4);
+        let (storage_tx, storage_rx) = mpsc::channel(4);
+        let processor = Processor::new(
+            Arc::new(config),
+            Arc::new(Catalog::new(vec![colliding_market()])),
+            Arc::new(EventHub::new(16)),
+            batch_tx,
+            storage_tx,
+            Arc::new(Stats::default()),
+            Arc::new(ForfeitBlocklist::disabled()),
+            0,
+        );
+        (processor, batch_rx, storage_rx)
+    }
+
+    /// The bug this guards against, reproduced: without the allowlist the
+    /// foreign propose resolves by id collision and goes out.
+    #[tokio::test]
+    async fn without_the_allowlist_a_foreign_emitter_colliding_id_is_broadcast() {
+        let raw: RpcLog = serde_json::from_str(OFF_LIST_PROPOSE).unwrap();
+        let (processor, mut batch_rx, _storage_rx) = processor_with_allowlist(Vec::new());
+        processor.process(raw, 1, "test").await;
+        let sent = batch_rx.try_recv().expect("broadcast (the 2026-11-17 bug)");
+        assert_eq!(sent.enrichment.as_ref().unwrap().market_id, 1_076_131);
+    }
+
+    #[tokio::test]
+    async fn off_allowlist_emitter_is_tallied_with_its_catalog_hit_but_never_broadcast() {
+        let raw: RpcLog = serde_json::from_str(OFF_LIST_PROPOSE).unwrap();
+        let polymarket_oracle =
+            decode_fixed::<20>("0x2c0367a9db231ddebd88a94b4f6461a6e47c58b1", "address").unwrap();
+        let (processor, mut batch_rx, mut storage_rx) =
+            processor_with_allowlist(vec![polymarket_oracle]);
+
+        // Two deliveries of the same log (WSS racer + backfill) count once.
+        processor.process(raw.clone(), 10, "wss[0]").await;
+        processor.process(raw.clone(), 11, "backfill").await;
+
+        assert!(batch_rx.try_recv().is_err(), "must not be broadcast");
+        assert!(storage_rx.try_recv().is_err(), "must not reach the WAL");
+        assert!(
+            processor.events.snapshot().is_empty(),
+            "must not enter the dedup ring: a later backfill has to be able to deliver it"
+        );
+        let stats = &processor.stats;
+        assert_eq!(stats.off_list_events.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.off_list_catalog_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.decode_errors.load(Ordering::Relaxed), 0);
+        let emitters = stats.off_list_emitters.lock().unwrap();
+        let emitter =
+            decode_fixed::<20>("0x57827d48da09ba227afda89c083b4e35972aa741", "address").unwrap();
+        let tally = emitters.get(&emitter).expect("tracked per emitter");
+        assert_eq!((tally.events, tally.catalog_hits), (1, 1));
+        assert_eq!(tally.last_hit_market_id, 1_076_131);
+        assert_eq!(
+            tally.last_requester,
+            decode_fixed::<20>("0xc97c5aa5180731c7bb741fc9b3c293272ca8d33d", "requester").unwrap()
+        );
+        assert_eq!(tally.first_seen_us, 10);
+    }
+
+    /// The other half: the same event from an emitter that *is* on the list
+    /// still goes out, i.e. the allowlist is the only thing that changed.
+    #[tokio::test]
+    async fn allowlisted_emitter_is_still_broadcast() {
+        let raw: RpcLog = serde_json::from_str(OFF_LIST_PROPOSE).unwrap();
+        let emitter = decode_fixed::<20>(&raw.address, "address").unwrap();
+        let (processor, mut batch_rx, _storage_rx) = processor_with_allowlist(vec![emitter]);
+        processor.process(raw, 1, "test").await;
+        assert!(batch_rx.try_recv().is_ok());
+        assert_eq!(processor.stats.off_list_events.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

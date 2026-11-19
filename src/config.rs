@@ -3,12 +3,15 @@ use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use thiserror::Error;
 use url::Url;
 
-/// Known official Polygon UMA Optimistic Oracle addresses, kept here for
-/// reference only. Not applied by default — see the `UMA_CONTRACT_ADDRESSES`
-/// doc comment on `Config::from_env` for why decode no longer filters by
-/// emitter address unless explicitly configured to.
+/// The Polygon oracle contracts Polymarket's requests were emitted from as of
+/// 2026-11-19 (a 7-day `eth_getLogs` scan: the only two emitters whose events
+/// matched Gamma). Reference only, not a default — production sets
+/// `UMA_CONTRACT_ADDRESSES` to this in its env file. The list this constant
+/// held before (0xCB18…5130, 0xeE3A…7c24) had gone stale within weeks: by
+/// then 99% of events came from 0x2c0367a9…, which is why a stale allowlist
+/// must be loud (see `stats::OffListEmitter`).
 pub const KNOWN_UMA_ORACLE_ADDRESSES: &str =
-    "0xCB1822859cEF82Cd2Eb4E6276C7916e692995130,0xeE3Afe347D5C74317041E2618C49534dAf887c24";
+    "0x2c0367a9db231ddebd88a94b4f6461a6e47c58b1,0xeE3Afe347D5C74317041E2618C49534dAf887c24";
 
 #[derive(Clone)]
 pub struct Config {
@@ -61,6 +64,11 @@ pub struct Config {
     /// an independent background task so it never delays the incremental
     /// sync or the hot path.
     pub catalog_reconcile_interval: Duration,
+    /// Days a market stays in the catalog after Gamma last listed it (active,
+    /// or closed within `closed_market_lookback_days`). Without this the
+    /// catalog only grew — 3.1M rows / 409 MB in production by 2026-11-18.
+    /// Eviction runs after each successful reconciliation walk; 0 disables it.
+    pub catalog_retention_days: u64,
     pub require_market_id: bool,
     pub ws_write_timeout: Duration,
     /// Shared-secret query token gating `/dashboard` and `/uma/v1/dashboard-data`.
@@ -118,6 +126,7 @@ pub(crate) fn test_config() -> Config {
         gamma_new_market_interval: Duration::from_secs(10),
         closed_market_lookback_days: 0,
         catalog_reconcile_interval: Duration::from_secs(3600),
+        catalog_retention_days: 14,
         require_market_id: false,
         ws_write_timeout: Duration::from_secs(5),
         dashboard_token: None,
@@ -161,12 +170,13 @@ impl Config {
             Some(value) => value,
             None => derive_http_url(&polygon_wss_url)?,
         };
-        // Empty (the default) means "accept ProposePrice/DisputePrice from any
-        // emitter" — collection has always filtered by topic only, never by
-        // address (an oracle contract can be upgraded/rotated), and pinning
-        // decode to a fixed address list risks silently dropping real
-        // Polymarket events the moment that list goes stale. Set this
-        // explicitly only to deliberately re-enable the stricter allowlist.
+        // Empty means "accept ProposePrice/DisputePrice from any emitter".
+        // That was the production setting until 2026-11: it avoids dropping
+        // real events when the oracle contract is rotated, but it also let a
+        // foreign project's events through whenever their market_id collided
+        // with the catalog. Production now sets the list; events from other
+        // emitters are tallied, not broadcast (`Processor::note_off_list`),
+        // and a high catalog hit ratio there raises an alert.
         let contract_addresses = nonempty("UMA_CONTRACT_ADDRESSES")
             .unwrap_or_default()
             .split(',')
@@ -218,6 +228,7 @@ impl Config {
             catalog_reconcile_interval: Duration::from_secs(
                 parse::<u64>("CATALOG_RECONCILE_INTERVAL_HOURS", "6")?.max(1) * 3600,
             ),
+            catalog_retention_days: parse("CATALOG_RETENTION_DAYS", "14")?,
             require_market_id: parse_bool("REQUIRE_MARKET_ID", true)?,
             ws_write_timeout: Duration::from_millis(parse("WS_WRITE_TIMEOUT_MS", "5000")?),
             dashboard_token: nonempty("DASHBOARD_TOKEN"),

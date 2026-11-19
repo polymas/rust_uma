@@ -28,6 +28,17 @@ const CATALOG_MAGIC: &[u8; 8] = b"UMACAT3\0";
 // can self-heal from (full Gamma re-sync), not one that needs a hard error.
 const CATALOG_MAGIC_V1: &[u8; 8] = b"UMACAT1\0"; // no category/bet_type bytes per record
 const CATALOG_MAGIC_V2: &[u8; 8] = b"UMACAT2\0"; // no neg_risk byte per record
+/// Optional trailer after the last catalog record: this magic, then one
+/// big-endian `u32` per record (same order) holding the day the market was
+/// last listed by Gamma (days since the Unix epoch) — what catalog eviction
+/// keys on (see `enrichment::Catalog::evict_unseen`).
+///
+/// A trailer rather than a new `UMACAT4` record layout on purpose: the loader
+/// before this change reads exactly `count` records and never looks at what
+/// follows, so a binary rolled back with `deploy/rollback.sh` still boots
+/// from this file. A new magic would make the rolled-back binary refuse to
+/// start until someone deleted the cache by hand.
+const CATALOG_SEEN_MAGIC: &[u8; 8] = b"UMASEEN1";
 const WAL_MAGIC: &[u8; 8] = b"UMAWAL1\0";
 const MAX_WAL_RECORD: usize = 1 << 20;
 
@@ -78,6 +89,17 @@ impl Storage {
     }
 
     pub fn load_catalog(&self) -> Result<Vec<MarketEnrichment>, StorageError> {
+        Ok(self
+            .load_catalog_rows()?
+            .into_iter()
+            .map(|(market, _)| market)
+            .collect())
+    }
+
+    /// Catalog rows plus, when the file carries the `UMASEEN1` trailer, the
+    /// day each market was last listed by Gamma. `None` means the file was
+    /// written before the trailer existed (or by `save_catalog`).
+    pub fn load_catalog_rows(&self) -> Result<Vec<(MarketEnrichment, Option<u32>)>, StorageError> {
         let path = self.catalog_path();
         if !path.exists() {
             return Ok(Vec::new());
@@ -86,10 +108,12 @@ impl Storage {
         let mut magic = [0_u8; 8];
         reader.read_exact(&mut magic)?;
         if magic == *CATALOG_MAGIC_V1 {
-            return self.discard_stale_catalog("pre-category/bet_type", CATALOG_MAGIC_V1);
+            self.discard_stale_catalog("pre-category/bet_type", CATALOG_MAGIC_V1)?;
+            return Ok(Vec::new());
         }
         if magic == *CATALOG_MAGIC_V2 {
-            return self.discard_stale_catalog("pre-neg_risk", CATALOG_MAGIC_V2);
+            self.discard_stale_catalog("pre-neg_risk", CATALOG_MAGIC_V2)?;
+            return Ok(Vec::new());
         }
         if magic != *CATALOG_MAGIC {
             return Err(StorageError::Format("catalog magic"));
@@ -118,15 +142,31 @@ impl Storage {
             // this doesn't fit in one byte.
             let bet_type = BetType::from_proto(read_i32(&mut reader)?);
             let neg_risk = read_u8(&mut reader)? != 0;
-            markets.push(MarketEnrichment {
-                market_id,
-                condition_id,
-                token_ids,
-                tag_ids,
-                category,
-                bet_type,
-                neg_risk,
-            });
+            markets.push((
+                MarketEnrichment {
+                    market_id,
+                    condition_id,
+                    token_ids,
+                    tag_ids,
+                    category,
+                    bet_type,
+                    neg_risk,
+                },
+                None,
+            ));
+        }
+        match read_seen_trailer(&mut reader, count) {
+            Ok(Some(days)) => {
+                for ((_, seen_day), day) in markets.iter_mut().zip(days) {
+                    *seen_day = Some(day);
+                }
+            }
+            Ok(None) => {}
+            // The records above are complete and valid; only the eviction
+            // bookkeeping is unreadable. Treat it like a file without a
+            // trailer (rows get the legacy grace period) instead of refusing
+            // to start.
+            Err(error) => warn!(%error, "catalog.bin last-seen trailer unreadable; ignoring it"),
         }
         Ok(markets)
     }
@@ -150,11 +190,7 @@ impl Storage {
     /// and the cursors that describe its sync progress fail together, so
     /// the very next `sync_catalog_before_uma` does a genuine full walk, the
     /// way "discarding it and re-syncing" is supposed to read.
-    fn discard_stale_catalog(
-        &self,
-        reason: &str,
-        magic: &[u8; 8],
-    ) -> Result<Vec<MarketEnrichment>, StorageError> {
+    fn discard_stale_catalog(&self, reason: &str, magic: &[u8; 8]) -> Result<(), StorageError> {
         warn!(
             "catalog.bin is the {reason} format ({:?}); discarding it and its \
              incremental sync cursors so the next sync does a full Gamma \
@@ -172,7 +208,7 @@ impl Storage {
                 return Err(error.into());
             }
         }
-        Ok(Vec::new())
+        Ok(())
     }
 
     /// Blocking: sorts, serializes, fsyncs and renames. Generic over the
@@ -185,18 +221,39 @@ impl Storage {
         &self,
         markets: &[M],
     ) -> Result<(), StorageError> {
+        let ordered = markets
+            .iter()
+            .map(|market| (market.borrow(), 0))
+            .collect::<Vec<_>>();
+        self.write_catalog(ordered, false)
+    }
+
+    /// `save_catalog` plus the last-seen trailer (see `CATALOG_SEEN_MAGIC`).
+    /// Blocking, same as `save_catalog`.
+    pub fn save_catalog_seen<M: Borrow<MarketEnrichment>>(
+        &self,
+        markets: &[(M, u32)],
+    ) -> Result<(), StorageError> {
+        let ordered = markets
+            .iter()
+            .map(|(market, seen_day)| (market.borrow(), *seen_day))
+            .collect::<Vec<_>>();
+        self.write_catalog(ordered, true)
+    }
+
+    fn write_catalog(
+        &self,
+        mut ordered: Vec<(&MarketEnrichment, u32)>,
+        with_seen: bool,
+    ) -> Result<(), StorageError> {
         let path = self.catalog_path();
         let temp = temporary_path(&path);
-        let mut ordered = markets
-            .iter()
-            .map(Borrow::borrow)
-            .collect::<Vec<&MarketEnrichment>>();
-        ordered.sort_unstable_by_key(|market| market.market_id);
+        ordered.sort_unstable_by_key(|(market, _)| market.market_id);
         let file = File::create(&temp)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(CATALOG_MAGIC)?;
         writer.write_all(&(ordered.len() as u32).to_be_bytes())?;
-        for market in ordered {
+        for (market, _) in &ordered {
             let token_count: u16 = market
                 .token_ids
                 .len()
@@ -220,6 +277,12 @@ impl Storage {
             writer.write_all(&[market.category.to_proto() as u8])?;
             writer.write_all(&market.bet_type.to_proto().to_be_bytes())?;
             writer.write_all(&[market.neg_risk as u8])?;
+        }
+        if with_seen {
+            writer.write_all(CATALOG_SEEN_MAGIC)?;
+            for (_, seen_day) in &ordered {
+                writer.write_all(&seen_day.to_be_bytes())?;
+            }
         }
         writer.flush()?;
         writer.get_ref().sync_all()?;
@@ -345,6 +408,33 @@ impl Storage {
             serde_json::to_vec(snapshot).map_err(|_| StorageError::Format("enrichment stats"))?;
         atomic_write(&self.enrichment_stats_path(), &bytes)
     }
+}
+
+/// Reads the optional last-seen trailer. `Ok(None)`: the file ends right
+/// after the records (no trailer).
+fn read_seen_trailer(
+    reader: &mut impl Read,
+    count: usize,
+) -> Result<Option<Vec<u32>>, StorageError> {
+    let mut magic = [0_u8; 8];
+    let mut filled = 0;
+    while filled < magic.len() {
+        match reader.read(&mut magic[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    if filled == 0 {
+        return Ok(None);
+    }
+    if filled < magic.len() || magic != *CATALOG_SEEN_MAGIC {
+        return Err(StorageError::Format("catalog last-seen trailer magic"));
+    }
+    let mut days = Vec::with_capacity(count);
+    for _ in 0..count {
+        days.push(read_u32(reader)?);
+    }
+    Ok(Some(days))
 }
 
 pub(crate) fn atomic_write(path: &Path, value: &[u8]) -> Result<(), StorageError> {
@@ -586,6 +676,122 @@ mod tests {
         };
         storage.save_catalog(std::slice::from_ref(&market)).unwrap();
         assert_eq!(storage.load_catalog().unwrap(), vec![market]);
+    }
+
+    fn sample_market(market_id: u64) -> MarketEnrichment {
+        MarketEnrichment {
+            market_id,
+            condition_id: [market_id as u8; 32],
+            token_ids: vec![[2; 32], [3; 32]],
+            tag_ids: vec![1, 64],
+            category: Category::Sports,
+            bet_type: BetType::Moneyline,
+            neg_risk: false,
+        }
+    }
+
+    #[test]
+    fn catalog_last_seen_trailer_round_trips_and_is_optional() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        // Out of id order on purpose: the trailer must follow the sorted
+        // record order, not the caller's.
+        let rows = vec![(sample_market(9), 20_700_u32), (sample_market(4), 20_650)];
+        storage.save_catalog_seen(&rows).unwrap();
+        assert_eq!(
+            storage.load_catalog_rows().unwrap(),
+            vec![
+                (sample_market(4), Some(20_650)),
+                (sample_market(9), Some(20_700)),
+            ]
+        );
+
+        // A file without the trailer (what every build before eviction
+        // wrote) loads with no last-seen days.
+        storage
+            .save_catalog(&[sample_market(4), sample_market(9)])
+            .unwrap();
+        assert_eq!(
+            storage.load_catalog_rows().unwrap(),
+            vec![(sample_market(4), None), (sample_market(9), None)]
+        );
+    }
+
+    /// Rollback safety: the record section of a file with the trailer is
+    /// byte-identical to the file the previous build wrote, and that build's
+    /// loader stops after `count` records. So `deploy/rollback.sh` leaves a
+    /// binary that still boots from the new file.
+    #[test]
+    fn catalog_with_trailer_keeps_the_previous_record_layout_as_a_prefix() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage
+            .save_catalog(&[sample_market(4), sample_market(9)])
+            .unwrap();
+        let without = fs::read(dir.path().join("catalog.bin")).unwrap();
+        storage
+            .save_catalog_seen(&[(sample_market(4), 1_u32), (sample_market(9), 2)])
+            .unwrap();
+        let with = fs::read(dir.path().join("catalog.bin")).unwrap();
+        assert_eq!(&with[..without.len()], without.as_slice());
+        assert_eq!(with.len(), without.len() + 8 + 2 * 4);
+    }
+
+    #[test]
+    fn damaged_last_seen_trailer_does_not_cost_the_catalog() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage
+            .save_catalog_seen(&[(sample_market(4), 1_u32), (sample_market(9), 2)])
+            .unwrap();
+        let path = dir.path().join("catalog.bin");
+        let bytes = fs::read(&path).unwrap();
+        // Cut inside the trailer: the records are intact, the days are not.
+        fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();
+        assert_eq!(
+            storage.load_catalog_rows().unwrap(),
+            vec![(sample_market(4), None), (sample_market(9), None)]
+        );
+    }
+
+    /// docs/WORKFLOW.md section 5: a storage format change must be checked
+    /// against a real production `catalog.bin`. Run with
+    /// `RUST_UMA_PROD_CATALOG=/path/to/catalog.bin cargo test --release
+    /// production_catalog -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a production catalog.bin copy (RUST_UMA_PROD_CATALOG)"]
+    fn production_catalog_loads_and_survives_a_trailer_rewrite() {
+        let source = std::env::var("RUST_UMA_PROD_CATALOG").expect("RUST_UMA_PROD_CATALOG");
+        let original = fs::read(&source).unwrap();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("catalog.bin"), &original).unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        let rows = storage.load_catalog_rows().unwrap();
+        assert!(!rows.is_empty());
+        let had_trailer = rows.iter().all(|(_, seen)| seen.is_some());
+        println!("rows={} had_trailer={had_trailer}", rows.len());
+
+        let stamped = rows
+            .iter()
+            .map(|(market, seen)| (market, seen.unwrap_or(20_775)))
+            .collect::<Vec<_>>();
+        storage.save_catalog_seen(&stamped).unwrap();
+        let rewritten = fs::read(dir.path().join("catalog.bin")).unwrap();
+        let record_bytes = rewritten.len() - 8 - 4 * rows.len();
+        assert_eq!(
+            &rewritten[..record_bytes],
+            &original[..record_bytes],
+            "record section must stay readable by the previous build"
+        );
+        let reloaded = storage.load_catalog_rows().unwrap();
+        assert_eq!(reloaded.len(), rows.len());
+        assert!(
+            reloaded
+                .iter()
+                .zip(&rows)
+                .all(|((a, seen), (b, _))| a == b && seen.is_some())
+        );
     }
 
     #[test]

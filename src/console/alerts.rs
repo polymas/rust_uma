@@ -50,6 +50,11 @@ pub struct AlertRules {
     pub cursor_rejected_per_10m: u64,
     pub storage_dropped_per_10m: u64,
     pub catalog_min_markets: u64,
+    /// 名单外合约（不在 tinyuma 的 `UMA_CONTRACT_ADDRESSES` 里）近 1h 能命中目录的
+    /// 事件数达到这个值，且命中率不低于 `off_list_hit_min_pct`，就告警。
+    /// 真的 Polymarket 合约命中率接近 100%；别的平台靠编号碰撞，约 2%。
+    pub off_list_hits_per_1h: u64,
+    pub off_list_hit_min_pct: u64,
     pub min_serving_nodes: u64,
     pub edge_stale_s: u64,
     pub edge_upstream_down_s: u64,
@@ -84,6 +89,8 @@ impl Default for AlertRules {
             cursor_rejected_per_10m: 10,
             storage_dropped_per_10m: 1,
             catalog_min_markets: 200_000,
+            off_list_hits_per_1h: 5,
+            off_list_hit_min_pct: 50,
             min_serving_nodes: 1,
             edge_stale_s: 30,
             edge_upstream_down_s: 60,
@@ -367,6 +374,7 @@ impl Engine {
                 "cursor_rejected",
                 "storage_dropped",
                 "catalog_small",
+                "off_list_emitter",
             ]);
             if data.get("rpc_connected").and_then(Value::as_bool) == Some(false) {
                 push(
@@ -554,6 +562,46 @@ impl Engine {
                     format!("缓存 {markets} 个市场（阈值 {}）", r.catalog_min_markets),
                     300,
                 );
+            }
+            // tinyuma 开了 emitter 白名单后，名单外合约的事件不广播。Polymarket 换
+            // Oracle 合约时，新合约的事件会全部落到这里——不告警就是静默漏事件。
+            for item in data
+                .get("off_list_emitters")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(emitter) = item.get("emitter").and_then(Value::as_str) else {
+                    continue;
+                };
+                let events = self.counter(
+                    format!("up:off_list:{emitter}:events"),
+                    num(item, "events_total"),
+                    now,
+                    HOUR_MS,
+                );
+                let hits = self.counter(
+                    format!("up:off_list:{emitter}:hits"),
+                    num(item, "catalog_hits_total"),
+                    now,
+                    HOUR_MS,
+                );
+                if let (Some(events), Some(hits)) = (events, hits)
+                    && hits >= r.off_list_hits_per_1h
+                    && hits * 100 >= events * r.off_list_hit_min_pct
+                {
+                    push(
+                        &mut out,
+                        "off_list_emitter",
+                        "名单外合约的事件大量命中目录（疑似 Oracle 合约迁移，这些事件没有广播）",
+                        Severity::Critical,
+                        emitter,
+                        format!(
+                            "近 1h {events} 条事件里 {hits} 条能命中目录。核对后把该合约加进 tinyuma 的 UMA_CONTRACT_ADDRESSES 并重启，再用 START_BLOCK 补拉"
+                        ),
+                        0,
+                    );
+                }
             }
         }
 
@@ -1144,6 +1192,43 @@ mod tests {
         );
         engine.mark_sent(&n, t);
         assert!(engine.views().is_empty());
+    }
+
+    /// tinyuma 开白名单后的两种名单外合约：别的平台（偶尔撞上编号）不能告警，
+    /// Polymarket 迁移到的新合约（几乎全部命中）必须告警。
+    #[test]
+    fn off_list_emitter_alerts_on_a_high_catalog_hit_ratio_only() {
+        let foreign = "0x57827d48da09ba227afda89c083b4e35972aa741";
+        let migrated = "0x00000000000000000000000000000000000000aa";
+        let sample = |at: u64, foreign_events: u64, foreign_hits: u64, new_events: u64| {
+            let mut data = healthy(at);
+            data["off_list_emitters"] = json!([
+                {"emitter": foreign, "events_total": foreign_events, "catalog_hits_total": foreign_hits},
+                {"emitter": migrated, "events_total": new_events, "catalog_hits_total": new_events},
+            ]);
+            inputs(data, vec![node("a", Status::Serving, 0, at)], at)
+        };
+        let mut engine = Engine::new(AlertRules::default());
+
+        // 只有别的平台在发：22 小时 85 条命中 2 条那种比例。
+        engine.observe(T0, &sample(T0, 100, 2, 0));
+        let t = T0 + 30 * MINUTE_MS;
+        engine.observe(t, &sample(t, 400, 8, 0));
+        assert!(
+            engine.pending_message(t, None).is_none(),
+            "2% 命中率是编号碰撞，不是迁移"
+        );
+
+        // 新合约开始发，几乎每条都命中。
+        let t = t + MINUTE_MS;
+        engine.observe(t, &sample(t, 404, 8, 3));
+        assert!(engine.pending_message(t, None).is_none(), "还没到 5 条");
+        let t = t + MINUTE_MS;
+        engine.observe(t, &sample(t, 408, 8, 40));
+        let n = engine.pending_message(t, None).expect("fires");
+        assert!(n.text.contains("名单外合约"), "{}", n.text);
+        assert!(n.text.contains(migrated), "{}", n.text);
+        assert!(!n.text.contains(foreign), "{}", n.text);
     }
 
     #[test]

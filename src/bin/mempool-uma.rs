@@ -67,7 +67,10 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::from_env()?);
     let storage = Storage::open(config.data_dir.clone())?;
-    let catalog = Arc::new(Catalog::new(storage.load_catalog()?));
+    let catalog = Arc::new(Catalog::from_stored(
+        storage.load_catalog_rows()?,
+        config.catalog_retention_days,
+    ));
     let events = Arc::new(EventHub::new(config.event_ring_capacity));
     // WAL 恢复，与 main.rs 相同：读不了就当空历史，不让一个旧文件拖垮启动。
     let recovered = storage

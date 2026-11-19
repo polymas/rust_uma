@@ -47,7 +47,7 @@ flowchart TD
     subgraph ENRICH["enrichment.rs · 启动前预热"]
         direction LR
         SYNC["sync_both：活跃(closed=false)\n+ 最近关闭(滚动窗口)\nsync_catalog_before_uma / run_catalog_sync"]
-        RECONCILE["run_catalog_reconcile\n独立任务, 每 N 小时全量重扫\n忽略游标, 只增量合并, 不写回 cursor"]
+        RECONCILE["run_catalog_reconcile\n独立任务, 每 N 小时全量重扫\n忽略游标, 只增量合并, 不写回 cursor\n重扫成功后淘汰超期未见的市场"]
         CAT[("Catalog\nby_condition_id\nmarket_to_condition")]
         SYNC --> CAT
         RECONCILE -.->|"自愈 keyset 翻页漏项"| CAT

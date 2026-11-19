@@ -7,9 +7,11 @@
 - 对外实时数据仅提供 Protobuf WSS（`uma.pb.v1`）
 - 只解析 `ProposePrice`、`DisputePrice`
 - RPC 订阅和历史补拉只按事件 topic 过滤，不按地址；解析后的 emitter 白名单
-  （`UMA_CONTRACT_ADDRESSES`）默认留空即接受任意发送方——Oracle 合约地址可能升
-  级/迁移，锁死地址列表有静默漏事件的风险，代价是可能混入少量非 Polymarket
-  的同 ABI 事件（会在富化阶段自然表现为 miss，不会被当成正确数据广播）
+  （`UMA_CONTRACT_ADDRESSES`）代码默认留空即接受任意发送方，**生产必须配置**：
+  2026-11 实测到别的平台用相同 ancillary 格式、另一套 `market_id` 编号发事件，
+  编号撞上目录就会被广播成错误信号。配置后名单外合约的事件不广播，只统计它们
+  能不能命中目录；命中率高说明 Oracle 合约迁移了，uma-console 会告警
+  （见 docs/WORKFLOW.md 第 0 节）
 - 两类事件使用独立业务解析器，并通过公共链上元数据和价格请求结构组合复用
 - `ancillaryData` 只解析出 question ID（用于标准 Adapter 的链上 condition_id
   推导兜底）和可选 market ID；question 原文、resolution p1-p4、initializer

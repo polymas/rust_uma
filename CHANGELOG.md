@@ -17,6 +17,39 @@
 
 <!-- 新条目加在这行下面 -->
 
+## v0.14.0（2026-11-19，待补）
+- **生产启用 emitter 白名单，并给名单外合约加命中率统计和告警**（`src/pipeline.rs`、
+  `src/stats.rs`、`src/console/alerts.rs`）：白名单留空期间，合约 `0x57827d48…a741`（不是
+  Polymarket）用相同的 ancillary 格式和另一套 `market_id` 编号发 ProposePrice，编号撞上目录的
+  事件被广播成另一个市场的信号。实测 2 条（2026-11-17），例如交易 `0xc7aa7075…34df` 的
+  “Bitcoin Up or Down 9:15PM-9:30PM ET”被广播成 Gamma 1076131（Pudgy Penguins 地板价）。
+  - 生产 env 设 `UMA_CONTRACT_ADDRESSES=0x2c0367a9…58b1,0xee3afe34…7c24`。依据是 7 天链上扫描：
+    只有这两个合约的事件对得上 Gamma。
+  - 名单外合约的事件不广播、不进去重环和 WAL，不再计入 `decode_errors_total`；改为按合约统计
+    事件数和目录命中数（`/healthz`、面板数据的 `off_list_emitters`、
+    `off_list_events_total`、`off_list_catalog_hits_total`、`emitter_allowlist_size`）。
+  - uma-console 新规则 `off_list_emitter`（严重）：名单外合约近 1h 命中目录 ≥5 条且命中率 ≥50%。
+    这是 Polymarket 换 Oracle 合约时的特征，防止白名单过期后静默漏事件。阈值
+    `off_list_hits_per_1h`、`off_list_hit_min_pct` 可在 `alerts.json` 改。
+  - 用那条真实链上日志做了回归测试。下游：wire 协议不变；不会再收到上述错误信号。
+- **富化目录按“最近一次被 Gamma 列出的日期”淘汰**（`src/enrichment.rs`、`src/storage.rs`）：目录以前
+  只增不减，市场关闭后永远留在里面。生产从 9 月的约 35 万条涨到 2026-11-18 的 311 万条，
+  `catalog.bin` 409 MB，进程常驻 983 MB 并用到 swap（主机 2 GB），每 2~3 分钟整写一次。
+  - 每次同步见到一个市场就记下当天日期。全量对账（`run_catalog_reconcile`）成功后，淘汰连续
+    `CATALOG_RETENTION_DAYS`（默认 14，0 关闭）没有被 Gamma 列出的市场。全量对账会重新见到所有
+    活跃市场和最近关闭的市场，所以被淘汰的只有关闭很久的市场。
+  - 保护：一次对账见到的市场数少于上一次的一半时，本次不淘汰（防 Gamma 翻页提前结束）。
+  - 升级前写的 `catalog.bin` 没有日期，这些行有 2 天宽限期（约 8 次全量对账），之后没有再被
+    列出就淘汰。用生产副本回放：311 万条淘汰约 265 万条后剩约 47 万条，文件约 64 MB。
+  - 存储格式：`catalog.bin` 在原有记录之后追加 `UMASEEN1` 尾部，记录区字节不变。旧版本只读记录
+    区，所以 `deploy/rollback.sh` 回滚后旧二进制仍能启动（已用生产 `catalog.bin` 副本验证）。
+  - `/healthz`、`/metrics` 新增 `catalog_markets_evicted_total`。下游无感知：wire 协议不变。
+- **修复 uma-edge 上游连接的两个问题**（`src/edge/upstream.rs`）：
+  - “60 秒无消息判死”从未生效：超时写在 `select!` 里，每 20 秒被 Ping 分支重建一次。上游静默
+    断线时 edge 要等内核 TCP 超时（约 15 分钟）才重连。现在按最后一次收到消息的时刻计时。
+  - 收到一次 1013 后 `cursor_rejected` 不复位，之后每次重连都不带游标，断线期间的帧全部丢失。
+    现在收到带序号的帧就复位。
+
 ## v0.13.2（2026-11-13，9303263）
 - **非 Polymarket 请求不再算解码错误**（`src/pipeline.rs`、`src/uma/events/mod.rs`）：同一个 UMA
   合约上有其他项目的请求（如 requester `0x53703dd6…` 每笔交易批量提交 70–110 条 JSON 格式的

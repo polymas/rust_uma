@@ -39,8 +39,10 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::from_env()?);
     let storage = Storage::open(config.data_dir.clone())?;
-    let catalog_rows = storage.load_catalog()?;
-    let catalog = Arc::new(Catalog::new(catalog_rows));
+    let catalog = Arc::new(Catalog::from_stored(
+        storage.load_catalog_rows()?,
+        config.catalog_retention_days,
+    ));
     let events = Arc::new(EventHub::new(config.event_ring_capacity));
     // 弃权排除名单要在恢复 WAL 之前读回：算续传下限时要知道哪些事件当初被拦下了。
     let forfeit = Arc::new(ForfeitBlocklist::from_config(&config));

@@ -21,12 +21,20 @@
 - 数据目录：服务器上是 `/var/lib/rust-uma`（`enrichment.cursor` /
   `enrichment_closed.cursor` / `uma.cursor` / `catalog.bin` / `events.wal`），
   本地开发默认是 `./.cache`。
-- `UMA_CONTRACT_ADDRESSES` 默认留空：解码阶段不按 emitter 地址过滤，只按
-  `ProposePrice`/`DisputePrice` topic 收——这是明确的既定决策（Oracle 合约地
-  址可能升级/迁移，锁死地址列表有静默漏真实事件的风险），代价是可能混入少量
-  非 Polymarket 的同 ABI 事件，这些会在 market_id/富化阶段自然表现为 miss，
-  不会被当成正确数据广播出去。要收紧回严格校验，显式设置该变量即可（非空列
-  表才启用白名单）。
+- `UMA_CONTRACT_ADDRESSES`（emitter 白名单）**生产必须配置**，2026-11-19 的值是
+  `0x2c0367a9db231ddebd88a94b4f6461a6e47c58b1,0xee3afe347d5c74317041e2618c49534daf887c24`。
+  - 历史：2026-09-02 起生产留空（只按 topic 收），理由是 Oracle 合约会迁移、写死地址会
+    静默漏事件，并假设别的项目的事件会在富化阶段 miss。2026-11 这个假设被打破：合约
+    `0x57827d48…a741` 用相同的 ancillary 格式和另一套 `market_id` 编号发事件，编号撞上目录
+    就被广播成另一个 Polymarket 市场的信号（实测 22 小时 2 条）。
+  - 现在的做法：名单外合约的事件不广播、不进去重环、不进 WAL，但照常解码并查目录，按合约
+    统计事件数和命中数（`/healthz` 的 `off_list_emitters`）。命中的每一条打 WARN
+    `off-allowlist UMA event resolves in the catalog`，带 tx 和区块。
+  - 防漏：真的 Polymarket 合约命中率接近 100%，别的平台约 2%。uma-console 规则
+    `off_list_emitter`：某个名单外合约近 1h 命中 ≥5 条且命中率 ≥50% 就发严重告警。收到后核对
+    合约，加进名单重启，再用 `START_BLOCK` 从 WARN 日志里最早的区块补拉。
+  - 不要改回留空。要换名单先扫一遍链上数据（方法见知识库
+    `运维/rust_uma-emitter白名单始末与遗漏评估-2026-11-19.md`）。
 
 ## 1. 开发
 
@@ -172,6 +180,14 @@ src/
   新市场，拉到目录已知的最大 id 就停，只写内存不落盘（落盘交给下一轮常规刷新）。
   `catalog_new_markets_added_total` 是它提前收录的市场数；刷新失败日志现在带完整的
   error source 链。
+- **目录必须有出口，不能只进不出**：`Catalog` 以前只有 `upsert`，市场关闭后永远留在目录里。
+  生产从 2026-09 的约 35 万条涨到 2026-11-18 的 311 万条（`catalog.bin` 409 MB，2 GB 主机用到
+  swap）。现在每次同步见到一个市场就记当天日期，`run_catalog_reconcile` 每次全量对账成功后调
+  `Catalog::evict_unseen`，淘汰连续 `CATALOG_RETENTION_DAYS`（默认 14，0 关闭）没被 Gamma 列出
+  的市场。只在全量对账之后淘汰：只有全量对账会重新见到全部活跃市场，增量刷新见不到“活跃但
+  很久没更新”的市场。对账见到的市场数不到上一次的一半时不淘汰。日期存在 `catalog.bin` 记录区
+  之后的 `UMASEEN1` 尾部，记录区格式不变，旧二进制仍能读。`catalog_markets_evicted_total` 是
+  累计淘汰数；`catalog_markets` 应稳定在几十万。
 - **任何 `tokio::time::interval` 的周期都不能来自未夹紧的用户配置**：验证这
   条自愈任务时，临时把 `CATALOG_RECONCILE_INTERVAL_HOURS` 设成 `0` 想让它立
   刻触发，结果 `tokio::time::interval(Duration::ZERO)` 直接 panic——而
@@ -356,8 +372,9 @@ brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
   `catalog_reconcile_gaps_closed_total` 长期趋势（应该趋向 0，非零说明还在
   查漏补缺）；`decode_errors_total` 涨得快是正常的——UMA 的
   `ProposePrice`/`DisputePrice` topic 是全 Polygon 共用的，非 Polymarket 的
-  UMA 请求也会先收到，解析/富化阶段自然过滤掉，这部分误差不代表故障（emitter
-  白名单默认关闭，见上）。
+  UMA 请求也会先收到，解析/富化阶段自然过滤掉，这部分误差不代表故障。
+  `emitter_allowlist_size` 应为 2（白名单生效）；`off_list_emitters` 里出现命中率高的
+  合约说明 Oracle 合约迁移了（见第 0 节）。
 - 富化 miss 的事件**不会经 WSS 广播下去**（`pipeline.rs::Processor::process`
   里 `batch_tx.send` 只在 `enriched` 为真时才调用）——没有 token_ids，下游
   拿到也没法用，广播出去只是噪音。它仍然会入 `EventHub` 去重环、写进本地
