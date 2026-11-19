@@ -17,7 +17,7 @@
 
 <!-- 新条目加在这行下面 -->
 
-## v0.14.0（2026-11-19，待补）
+## v0.14.0（2026-11-19，63805a5）
 - **生产启用 emitter 白名单，并给名单外合约加命中率统计和告警**（`src/pipeline.rs`、
   `src/stats.rs`、`src/console/alerts.rs`）：白名单留空期间，合约 `0x57827d48…a741`（不是
   Polymarket）用相同的 ancillary 格式和另一套 `market_id` 编号发 ProposePrice，编号撞上目录的
