@@ -113,15 +113,21 @@ async fn get_json(state: &SharedState, url: &str) -> Result<Value, String> {
         .timeout(Duration::from_secs(5))
         .send()
         .await
-        .map_err(|e| format!("{}: {e}", redact(url)))?;
+        .map_err(|e| describe(url, e))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("{}: HTTP {status}", redact(url)));
     }
-    response
-        .json()
-        .await
-        .map_err(|e| format!("{}: {e}", redact(url)))
+    response.json().await.map_err(|e| describe(url, e))
+}
+
+/// Error text for the panel, the journal and Feishu alerts. reqwest prints
+/// the full request URL in its own errors, so redacting only the prefix was
+/// not enough: `?token=<DASHBOARD_TOKEN>` came back through `{e}` every time
+/// tinyuma was unreachable, and that text is what the
+/// "console 抓不到 tinyuma" alert pushes to the Feishu group.
+fn describe(url: &str, error: reqwest::Error) -> String {
+    format!("{}: {}", redact(url), error.without_url())
 }
 
 /// Keeps the dashboard token out of logs.
@@ -185,4 +191,29 @@ pub async fn llms_text(state: &SharedState, cluster: &str) -> String {
         }
     };
     format!("{cluster}\n\n---\n\n{upstream}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact failure that leaked: tinyuma unreachable while the console
+    /// polls `dashboard-data?token=…`.
+    #[tokio::test]
+    async fn fetch_error_text_never_contains_the_dashboard_token() {
+        // Nothing listens on port 1.
+        let url = "http://127.0.0.1:1/uma/v1/dashboard-data?token=SECRET-DASHBOARD-TOKEN";
+        let error = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect_err("connection must be refused");
+        assert!(
+            error.to_string().contains("SECRET-DASHBOARD-TOKEN"),
+            "sanity: reqwest's own text carries the URL: {error}"
+        );
+        let text = describe(url, error);
+        assert!(!text.contains("SECRET-DASHBOARD-TOKEN"), "{text}");
+        assert!(text.starts_with("http://127.0.0.1:1/uma/v1/dashboard-data: "));
+    }
 }

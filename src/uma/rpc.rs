@@ -40,6 +40,8 @@ pub enum RpcError {
     Closed,
     #[error("invalid RPC number")]
     Number,
+    #[error("timed out {0}")]
+    Timeout(&'static str),
     #[error(
         "subscription silent for {idle_s}s while the chain had {logs} matching logs in blocks {from}..={to}"
     )]
@@ -144,12 +146,16 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(30);
 /// into a permanent 30s outage per drop (which, with the racers behind a
 /// shared edge, is a permanent event gap when both drop together).
 fn reconnect_backoff(current: Duration, session_lasted: Duration) -> (Duration, Duration) {
-    let delay = if session_lasted >= HEALTHY_SESSION {
-        RECONNECT_BACKOFF_INITIAL
-    } else {
-        current
-    };
-    (delay, (delay * 2).min(RECONNECT_BACKOFF_MAX))
+    if session_lasted >= HEALTHY_SESSION {
+        // A healthy session that just dropped (the provider's routine
+        // connection rotation, about once a day in production) reconnects
+        // at once. Every event during the wait is only delivered late by the
+        // gap-fill, and with a single racer nothing else covers that second.
+        // A failed attempt is a short session, so the climb below still
+        // starts at the initial delay — this cannot spin.
+        return (Duration::ZERO, RECONNECT_BACKOFF_INITIAL);
+    }
+    (current, (current * 2).min(RECONNECT_BACKOFF_MAX))
 }
 
 /// One racer's forever-reconnecting live subscription.
@@ -239,42 +245,79 @@ impl GapFill {
     /// precisely the case that used to be a permanent hole: backfill ran
     /// once at startup and nothing ever re-walked a live outage.
     fn spawn(self) {
-        let from = self
-            .stats
-            .latest_block
-            .load(Ordering::Relaxed)
-            .saturating_add(1);
-        if from <= 1 {
+        let Some(from) = gap_fill_start(self.stats.latest_block.load(Ordering::Relaxed)) else {
             return; // nothing observed yet; the startup backfill owns the range
-        }
+        };
         let source = format!("gapfill[{}]", self.index);
         tokio::spawn(async move {
-            let head = match self.http.latest_block().await {
-                Ok(head) => head,
-                Err(error) => {
-                    warn!(%error, source, "gap-fill after reconnect: cannot read head");
-                    return;
-                }
-            };
-            if from > head {
-                return;
-            }
-            match backfill_range(
+            match gap_fill(
                 &self.http,
                 &self.processor,
                 from,
-                head,
                 self.config.backfill_batch_blocks,
                 &source,
+                &GAP_FILL_RETRY_DELAYS,
             )
             .await
             {
-                Ok(()) => info!(from, to = head, source, "gap-fill after reconnect complete"),
+                Ok(head) => info!(from, to = head, source, "gap-fill after reconnect complete"),
                 Err(error) => {
-                    warn!(%error, from, to = head, source, "gap-fill after reconnect failed")
+                    warn!(%error, from, source, "gap-fill after reconnect failed; giving up")
                 }
             }
         });
+    }
+}
+
+/// Waits between gap-fill attempts; its length is the retry count. The HTTP
+/// endpoint is usually the same provider as the WSS that just dropped, so a
+/// failure right after a reconnect is likely and short-lived. Without a
+/// retry one failed `eth_getLogs` left the outage window unfilled for good.
+const GAP_FILL_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+/// First block a gap-fill must re-read, given the newest block any log was
+/// seen in. That block itself is included: the connection can drop between
+/// two logs of one block, and `latest_block + 1` would skip the rest of it
+/// for good. Re-read logs are absorbed by `EventHub` dedup. `None` before
+/// any log was seen.
+fn gap_fill_start(latest_block: u64) -> Option<u64> {
+    (latest_block > 0).then_some(latest_block)
+}
+
+/// Re-reads `from..=head` over HTTP, retrying the whole pass after each of
+/// `retry_delays`. Returns the head it filled up to.
+async fn gap_fill(
+    http: &HttpRpc,
+    processor: &Arc<Processor>,
+    from: u64,
+    batch_blocks: u64,
+    source: &str,
+    retry_delays: &[Duration],
+) -> Result<u64, RpcError> {
+    let mut attempt = 0;
+    loop {
+        let pass = async {
+            let head = http.latest_block().await?;
+            if from <= head {
+                backfill_range(http, processor, from, head, batch_blocks, source).await?;
+            }
+            Ok::<u64, RpcError>(head)
+        };
+        match pass.await {
+            Ok(head) => return Ok(head),
+            Err(error) if attempt < retry_delays.len() => {
+                warn!(%error, from, source, attempt, "gap-fill after reconnect failed; retrying");
+                tokio::time::sleep(retry_delays[attempt]).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -290,8 +333,14 @@ async fn run_live_session(
     gap_fill: Option<GapFill>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), RpcError> {
-    let (mut live, reader) =
-        subscribe_live(url, live_buffer, stats.clone(), shutdown.clone()).await?;
+    let (mut live, reader) = subscribe_live(
+        url,
+        live_buffer,
+        stats.clone(),
+        shutdown.clone(),
+        SUBSCRIBE_STEP_TIMEOUT,
+    )
+    .await?;
     mark_source_connected(stats);
     any_connected.send_replace(true);
     info!(source, "Polygon signal subscription connected");
@@ -451,7 +500,10 @@ async fn run_backfill(
     let subscribed_head = http.latest_block().await?;
     let checkpoint = storage.load_uma_cursor().ok().flatten();
     let from = if let Some(checkpoint) = checkpoint {
-        Some(checkpoint.saturating_add(1))
+        // The checkpoint block itself is re-read, not skipped: the live path
+        // checkpoints the block of each log as it arrives, so a stop between
+        // two logs of one block leaves that block only partly processed.
+        Some(checkpoint)
     } else if let Some(start) = config.start_block {
         Some(start)
     } else {
@@ -521,13 +573,24 @@ async fn backfill_range(
     Ok(())
 }
 
+/// Limit for each of the two steps of opening a subscription: the
+/// TCP/TLS/WebSocket handshake, and the `eth_subscribe` acknowledgement.
+/// Neither had one. An endpoint that accepted the connection and then went
+/// quiet parked that racer in `connect_async` or the ack loop with no retry —
+/// the stall watchdog only starts once a session exists — and with a single
+/// racer that is a full outage with nothing in the journal.
+const SUBSCRIBE_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn subscribe_live(
     url: &str,
     live_buffer: usize,
     stats: Arc<Stats>,
     mut shutdown: watch::Receiver<bool>,
+    step_timeout: Duration,
 ) -> Result<(mpsc::Receiver<RpcLog>, JoinHandle<()>), RpcError> {
-    let (mut socket, _) = connect_async(url).await?;
+    let (mut socket, _) = tokio::time::timeout(step_timeout, connect_async(url))
+        .await
+        .map_err(|_| RpcError::Timeout("connecting to the WSS endpoint"))??;
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -540,30 +603,35 @@ async fn subscribe_live(
     stats
         .rpc_bytes_sent
         .fetch_add(request_text.len() as u64, Ordering::Relaxed);
-    socket.send(Message::Text(request_text.into())).await?;
-    loop {
-        let message = socket.next().await.ok_or(RpcError::Closed)??;
-        match message {
-            Message::Text(text) => {
-                stats
-                    .rpc_bytes_received
-                    .fetch_add(text.len() as u64, Ordering::Relaxed);
-                let response: WsResponse = serde_json::from_str(text.as_ref())?;
-                if let Some(error) = response.error {
-                    return Err(RpcError::Remote {
-                        code: error.code,
-                        message: error.message,
-                    });
+    let acknowledged = async {
+        socket.send(Message::Text(request_text.into())).await?;
+        loop {
+            let message = socket.next().await.ok_or(RpcError::Closed)??;
+            match message {
+                Message::Text(text) => {
+                    stats
+                        .rpc_bytes_received
+                        .fetch_add(text.len() as u64, Ordering::Relaxed);
+                    let response: WsResponse = serde_json::from_str(text.as_ref())?;
+                    if let Some(error) = response.error {
+                        return Err(RpcError::Remote {
+                            code: error.code,
+                            message: error.message,
+                        });
+                    }
+                    if response.id == Some(1) && response.result.is_some() {
+                        return Ok(());
+                    }
                 }
-                if response.id == Some(1) && response.result.is_some() {
-                    break;
-                }
+                Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+                Message::Close(_) => return Err(RpcError::Closed),
+                _ => {}
             }
-            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
-            Message::Close(_) => return Err(RpcError::Closed),
-            _ => {}
         }
-    }
+    };
+    tokio::time::timeout(step_timeout, acknowledged)
+        .await
+        .map_err(|_| RpcError::Timeout("waiting for the eth_subscribe acknowledgement"))??;
 
     let (tx, rx) = mpsc::channel(live_buffer.max(1));
     let task = tokio::spawn(async move {
@@ -665,8 +733,12 @@ impl HttpRpc {
             .post(&self.url)
             .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
             .send()
-            .await?;
-        let body: RpcResponse<T> = response.json().await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        // `without_url`: reqwest prints the request URL in its errors, and
+        // the provider's API key is part of this URL — it must not reach the
+        // journal through a `warn!(%error)`.
+        let body: RpcResponse<T> = response.json().await.map_err(reqwest::Error::without_url)?;
         if let Some(error) = body.error {
             return Err(RpcError::Remote {
                 code: error.code,
@@ -758,9 +830,13 @@ mod tests {
         // Keeps climbing but caps.
         let (_, capped) = (0..10).fold((d3, next), |(_, n), _| reconnect_backoff(n, quick));
         assert_eq!(capped, RECONNECT_BACKOFF_MAX);
-        // A long healthy session drops straight back to the initial delay,
-        // regardless of how high the climb had gotten.
+        // A long healthy session reconnects at once, regardless of how high
+        // the climb had gotten; if that attempt fails quickly the climb
+        // starts over at the initial delay.
         let (delay, next) = reconnect_backoff(capped, HEALTHY_SESSION);
+        assert_eq!(delay, Duration::ZERO);
+        assert_eq!(next, RECONNECT_BACKOFF_INITIAL);
+        let (delay, next) = reconnect_backoff(next, quick);
         assert_eq!(delay, RECONNECT_BACKOFF_INITIAL);
         assert_eq!(next, RECONNECT_BACKOFF_INITIAL * 2);
     }
@@ -1026,6 +1102,182 @@ mod tests {
         http_server.abort();
         // Timing out means the session was (correctly) kept alive.
         (result.unwrap_or(Ok(())), stats)
+    }
+
+    /// An endpoint that accepts the TCP connection and never answers the
+    /// WebSocket handshake, and one that completes the handshake but never
+    /// acknowledges `eth_subscribe`. Both used to park the racer forever.
+    #[tokio::test]
+    async fn subscribe_times_out_on_a_mute_endpoint() {
+        let step = Duration::from_millis(150);
+        let (_tx, shutdown) = watch::channel(false);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mute_tcp = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // keep it open, say nothing
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            subscribe_live(
+                &format!("ws://{address}"),
+                16,
+                Arc::new(Stats::default()),
+                shutdown.clone(),
+                step,
+            ),
+        )
+        .await
+        .expect("must not hang in the handshake");
+        assert!(
+            matches!(&result, Err(RpcError::Timeout(what)) if what.contains("connecting")),
+            "{:?}",
+            result.err()
+        );
+        mute_tcp.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mute_ws = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while ws.next().await.is_some() {} // read, never acknowledge
+                });
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            subscribe_live(
+                &format!("ws://{address}"),
+                16,
+                Arc::new(Stats::default()),
+                shutdown,
+                step,
+            ),
+        )
+        .await
+        .expect("must not hang waiting for the acknowledgement");
+        assert!(
+            matches!(&result, Err(RpcError::Timeout(what)) if what.contains("acknowledgement")),
+            "{:?}",
+            result.err()
+        );
+        mute_ws.abort();
+    }
+
+    #[test]
+    fn gap_fill_rereads_the_last_seen_block() {
+        assert_eq!(gap_fill_start(0), None);
+        assert_eq!(gap_fill_start(100), Some(100));
+    }
+
+    /// The HTTP side fails right after the reconnect (same provider as the
+    /// WSS that just dropped), then recovers. The gap must still be filled,
+    /// starting at the last seen block itself.
+    #[tokio::test]
+    async fn gap_fill_retries_until_the_http_side_recovers() {
+        use axum::extract::State;
+        use std::sync::atomic::AtomicUsize;
+
+        use crate::{config::test_config, enrichment::Catalog, hub::EventHub};
+
+        #[derive(Clone, Default)]
+        struct Mock {
+            requests: Arc<AtomicUsize>,
+            windows: Calls,
+        }
+        async fn rpc(
+            State(mock): State<Mock>,
+            Json(request): Json<Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            // First two requests fail: one at the transport level, one as an
+            // RPC error body.
+            match mock.requests.fetch_add(1, Ordering::SeqCst) {
+                0 => return axum::http::StatusCode::BAD_GATEWAY.into_response(),
+                1 => {
+                    return Json(
+                        json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"busy"}}),
+                    )
+                    .into_response();
+                }
+                _ => {}
+            }
+            let result = match request["method"].as_str().unwrap() {
+                "eth_blockNumber" => json!("0x78"), // 120
+                "eth_getLogs" => {
+                    let hex = |key: &str| {
+                        u64::from_str_radix(
+                            request["params"][0][key]
+                                .as_str()
+                                .unwrap()
+                                .trim_start_matches("0x"),
+                            16,
+                        )
+                        .unwrap()
+                    };
+                    mock.windows
+                        .lock()
+                        .unwrap()
+                        .push((hex("fromBlock"), hex("toBlock")));
+                    json!([])
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": result})).into_response()
+        }
+
+        let mock = Mock::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(rpc)).with_state(mock.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let http = HttpRpc::new(format!("http://{address}")).unwrap();
+        let (batch_tx, _batch_rx) = mpsc::channel(4);
+        let (storage_tx, _storage_rx) = mpsc::channel(16);
+        let processor = Arc::new(Processor::new(
+            Arc::new(test_config()),
+            Arc::new(Catalog::new(Vec::new())),
+            Arc::new(EventHub::new(16)),
+            batch_tx,
+            storage_tx,
+            Arc::new(Stats::default()),
+            Arc::new(crate::forfeit::ForfeitBlocklist::disabled()),
+            0,
+        ));
+        let delays = [Duration::from_millis(5); 3];
+
+        let head = gap_fill(&http, &processor, 100, 1000, "gapfill[0]", &delays)
+            .await
+            .expect("recovers within the retries");
+        assert_eq!(head, 120);
+        assert_eq!(*mock.windows.lock().unwrap(), vec![(100, 120)]);
+
+        // Out of retries: the error is reported, not swallowed.
+        mock.requests.store(0, Ordering::SeqCst);
+        assert!(
+            gap_fill(&http, &processor, 100, 1000, "gapfill[0]", &delays[..1])
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
+    /// The provider's API key is part of the HTTP RPC URL; a transport error
+    /// must not carry the URL into the journal.
+    #[tokio::test]
+    async fn http_errors_do_not_leak_the_rpc_url() {
+        // Nothing listens on port 1.
+        let http = HttpRpc::new("http://127.0.0.1:1/SECRET-API-KEY".into()).unwrap();
+        let error = http.latest_block().await.unwrap_err();
+        let text = format!("{error} / {error:?}");
+        assert!(!text.contains("SECRET-API-KEY"), "{text}");
     }
 
     #[tokio::test]

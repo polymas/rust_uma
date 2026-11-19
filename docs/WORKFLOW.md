@@ -18,6 +18,8 @@
   （云安全组放行 `TCP:8000-8100`），服务本身没有认证 —— 这是当前的既定状态，
   不是遗漏；如果以后要收紧访问，需要显式决定（IP 白名单 / API Key / 换回
   127.0.0.1 + 反向代理），不要自作主张改回。
+- 日志：`journalctl -u rust-uma.service`（2026-11-19 起落在磁盘 `/var/log/journal`；之前 journald
+  只写内存盘，约 2 天就滚掉）。更早的看 `/var/log/syslog*`（rsyslog 转存，按周轮转留 4 份）。
 - 数据目录：服务器上是 `/var/lib/rust-uma`（`enrichment.cursor` /
   `enrichment_closed.cursor` / `uma.cursor` / `catalog.bin` / `events.wal`），
   本地开发默认是 `./.cache`。

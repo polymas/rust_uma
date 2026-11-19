@@ -2,6 +2,10 @@
 Description=mempool-uma: rust-uma pipeline fed by Polygon mempool pending propose/dispute
 After=network-online.target p2p-mempool-probe-b.service
 Wants=network-online.target
+# Never stop restarting. With systemd's default (5 starts in 10s) a short
+# crash loop — e.g. a bad env value with RestartSec=2s — leaves the unit
+# "failed" for good and nothing brings it back until someone logs in.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
